@@ -75,13 +75,21 @@ TRADING_MODE          = paper
 VNC_SERVER_PASSWORD   = any_password_you_want
 ```
 
-5. Go to **Settings** → **Networking** → expose port `4002` (paper) and `4001` (live)
-
 > **Note**: The very first time IB Gateway starts, it may require 2FA approval on your IBKR Mobile app. After the first login, it should auto-reconnect.
 
-### 2.5 Link IB Gateway hostname to Bot
+### 2.5 Link IB Gateway to Bot (Internal Networking — No Port Exposure Needed)
 
-- In the Bot service Variables: set `IB_HOST` to the **private hostname** Railway provides for the `ib-gateway` service (found under Networking → Private networking). It will look like `ib-gateway.railway.internal`.
+Railway services in the same project communicate privately and automatically — **you do NOT need to expose ports 4001/4002 publicly**.
+
+In your **Bot service → Variables**, set:
+
+```
+IB_HOST = ib-gateway.railway.internal
+```
+
+Railway's internal DNS resolves this automatically. The bot connects to `ib-gateway.railway.internal:4002` (paper) or `:4001` (live) entirely within Railway's private network.
+
+> **Optional — External debug access only**: If you ever need to connect to the IB Gateway from your local PC, go to the `ib-gateway` service → **Settings** → **Networking** → **Add TCP Proxy** → enter port `4002`. Railway will give you a public `tcp.railway.app:XXXXX` address. Leave this **off** in normal production use.
 
 ---
 
