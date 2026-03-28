@@ -1,5 +1,6 @@
 import os
 import time
+import asyncio
 import logging
 from datetime import datetime, timezone
 from ib_insync import IB, Stock, MarketOrder, util
@@ -29,6 +30,16 @@ class IBKRClient:
 
     def connect(self, retries: int = 5, delay: int = 10) -> bool:
         """Connect to IB Gateway with retry logic."""
+        # FastAPI sync route handlers run in AnyIO worker threads which have no
+        # asyncio event loop. ib_insync requires one, so we create and set one.
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                raise RuntimeError("closed")
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
         for attempt in range(retries):
             try:
                 if self.ib.isConnected():
