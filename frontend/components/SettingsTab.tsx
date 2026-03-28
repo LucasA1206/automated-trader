@@ -204,7 +204,7 @@ export default function SettingsTab({ onModeChange }: Props) {
             <input
               id="range-budget"
               type="range"
-              min={1}
+              min={5}
               max={100}
               step={5}
               value={budgetPct}
