@@ -1,6 +1,6 @@
 /** @type {import('next').NextConfig} */
 
-// Ensure the API URL always has a protocol prefix (guards against missing https://)
+// Ensure the API URL always has a protocol prefix
 function sanitizeApiUrl(raw: string | undefined): string {
   const url = raw || 'http://localhost:8000';
   if (url.startsWith('http://') || url.startsWith('https://')) return url;
@@ -13,14 +13,18 @@ const nextConfig = {
   env: {
     NEXT_PUBLIC_API_URL: API_URL,
   },
-  async rewrites() {
-    return [
-      {
-        source: '/api/:path*',
-        destination: `${API_URL}/api/:path*`,
-      },
-    ];
-  },
+  // Rewrites for local development only — production uses vercel.json
+  ...(process.env.NODE_ENV !== 'production' && {
+    async rewrites() {
+      return [
+        {
+          source: '/api/:path*',
+          destination: `${API_URL}/api/:path*`,
+        },
+      ];
+    },
+  }),
 };
 
 export default nextConfig;
+
