@@ -2,9 +2,9 @@ import type { Metadata } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'Blitz Trader — Automated NASDAQ Day Trader',
+  title: 'Automated Trader',
   description:
-    'Blitz Trader is an AI-powered automated day trading system for NASDAQ stocks using IBKR.',
+    'Automated Trader is an AI-powered automated day trading system for NASDAQ stocks using IBKR.',
 };
 
 export default function RootLayout({
