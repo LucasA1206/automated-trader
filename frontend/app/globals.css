@@ -153,10 +153,13 @@ html, body {
   cursor: pointer;
   transition: all 0.15s ease;
   color: var(--text-secondary);
+  background: transparent;
   text-decoration: none;
   font-size: 13.5px;
   font-weight: 500;
   border: 1px solid transparent;
+  width: 100%;
+  text-align: left;
 }
 
 .nav-item:hover {
