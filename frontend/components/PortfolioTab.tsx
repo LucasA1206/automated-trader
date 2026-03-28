@@ -100,13 +100,36 @@ export default function PortfolioTab() {
         </div>
       </div>
 
-      {/* Connection error */}
+      {/* Connection status banner */}
       {data && !data.connected && (
-        <div className="warning-card" style={{ marginBottom: 20 }}>
-          <span className="icon">⚠️</span>
-          <div className="text">
-            <strong>IB Gateway Disconnected</strong>
-            {data.error || 'Cannot reach IBKR. Ensure IB Gateway is running.'}
+        <div style={{
+          display: 'flex',
+          alignItems: 'flex-start',
+          gap: 12,
+          padding: '12px 16px',
+          borderRadius: 10,
+          marginBottom: 20,
+          background: data.error === 'Failed to reach API server'
+            ? 'rgba(239,68,68,0.08)'
+            : 'rgba(234,179,8,0.07)',
+          border: `1px solid ${data.error === 'Failed to reach API server'
+            ? 'rgba(239,68,68,0.2)'
+            : 'rgba(234,179,8,0.2)'}`,
+        }}>
+          <span style={{ fontSize: 16, flexShrink: 0 }}>
+            {data.error === 'Failed to reach API server' ? '🔴' : '🟡'}
+          </span>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: data.error === 'Failed to reach API server' ? 'var(--accent-red)' : 'var(--accent-yellow)', marginBottom: 2 }}>
+              {data.error === 'Failed to reach API server'
+                ? 'Backend API unreachable'
+                : 'IB Gateway not connected'}
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+              {data.error === 'Failed to reach API server'
+                ? 'The backend server is not responding. Check Railway deployment logs.'
+                : 'The IB Gateway service is starting up or awaiting IBKR login. Check Railway → ib-gateway service logs. You may need to approve 2FA on your IBKR Mobile app.'}
+            </div>
           </div>
         </div>
       )}
