@@ -14,13 +14,106 @@ NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# Well-known NASDAQ 100 tickers to anchor our search
-NASDAQ_WATCHLIST = [
-    "AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "TSLA", "AVGO", "ASML",
-    "AMD", "INTC", "QCOM", "ARM", "SMCI", "MU", "SNOW", "PLTR", "CRWD",
-    "NET", "ZS", "DDOG", "MNDY", "COIN", "MSTR", "RBLX", "SHOP", "ADBE",
-    "CRM", "NOW", "PANW", "OKTA", "TEAM", "HUBS", "BILL", "AFRM", "SOFI",
-    "RIVN", "LCID", "NIO", "XPEV", "F", "GM", "LYFT", "UBER", "DASH",
+# ─── Full NASDAQ Universe (~500 tickers passed to Gemini as context) ─────────
+# Gemini can recommend any of these — organised by sector
+NASDAQ_UNIVERSE = [
+    # ── Mega-cap Tech ──────────────────────────────────────────────────────────
+    "AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "AMZN", "META", "TSLA", "AVGO",
+    "ASML", "AMD", "QCOM", "ARM", "INTC", "TXN", "ADI", "MCHP", "AMAT",
+    "LRCX", "KLAC", "NXPI", "SWKS", "MRVL", "ON", "MPWR", "WOLF", "SMCI",
+    "MU", "WDC", "STX", "NTAP",
+
+    # ── Software / Cloud ───────────────────────────────────────────────────────
+    "ADBE", "CRM", "NOW", "WDAY", "VEEV", "TEAM", "HUBS", "DDOG", "NET",
+    "ZS", "PANW", "CRWD", "OKTA", "S", "MNDY", "BILL", "SMAR", "BOX",
+    "DOCN", "DOMO", "NCNO", "PCOR", "ESTC", "MDB", "GTLB", "CFLT", "SNOW",
+    "PLTR", "COIN", "MSTR", "RBLX", "SHOP", "AFRM", "SOFI", "UPST", "LC",
+    "SQ", "PYPL", "SSNC", "MANH", "PAYC", "GWRE", "AVLR", "RELY", "TOST",
+    "BRZE", "ALTR", "DT", "APTI", "SDGR", "PATH", "AI", "BBAI", "SOUN",
+    "GFAI", "IREN", "CORZ", "CIFR", "BTBT", "CLSK",
+
+    # ── Semiconductors (extended) ──────────────────────────────────────────────
+    "SNPS", "CDNS", "LSCC", "ACLS", "ONTO", "ICHR", "FORM", "CCMP", "AMKR",
+    "QRVO", "LITE", "IIVI", "COHU", "UCTT", "KLIC", "AEHR", "AXTI",
+    "POWI", "DIOD", "SLAB", "AMBA", "ALGM", "MTSI", "AIOT", "CRUS",
+
+    # ── Internet / E-commerce / Digital Media ─────────────────────────────────
+    "EBAY", "ETSY", "CHWY", "W", "DKNG", "PENN", "LYFT", "UBER", "DASH",
+    "ABNB", "BKNG", "EXPE", "TRIP", "YELP", "IAC", "ZG", "RDFN", "OPEN",
+    "TZOO", "NFLX", "ROKU", "SPOT", "SONO", "PARAA", "SIRI",
+
+    # ── EVs / Clean Energy / Autonomous ───────────────────────────────────────
+    "RIVN", "LCID", "NIO", "XPEV", "LI", "NKLA", "GOEV", "WKHS", "FFIE",
+    "FSR", "PTRA", "BLNK", "CHPT", "EVGO", "PLUG", "FCEL", "BLDP",
+    "FSLR", "ENPH", "SEDG", "ARRY", "RUN", "NOVA", "MAXN", "CSIQ",
+    "JOBY", "ACHR", "LILM", "WATT",
+
+    # ── Biotech / Pharma / Life Sciences ──────────────────────────────────────
+    "REGN", "VRTX", "MRNA", "BIIB", "ALNY", "ILMN", "BMRN", "INCY",
+    "EXAS", "NBIX", "ACAD", "RARE", "RCKT", "NTLA", "BEAM", "EDIT",
+    "CRSP", "FATE", "IOVA", "KRTX", "PTGX", "TGTX", "PRAX", "RXRX",
+    "ARQT", "IMVT", "TBPH", "DNLI", "IONS", "ARGX", "KRYS", "APGE",
+    "RVMD", "NKTX", "BLUE", "FOLD", "AVXL", "CDTX", "CGEM", "IMCR",
+    "VCEL", "NUVL", "ARVN", "KYMR", "MGNX", "MIRM", "ALLO", "GRPH",
+    "ROIV", "LNTH", "ACLX", "SNDX", "PMVP", "TARS", "OKLO",
+
+    # ── Medical Devices / Health Tech ─────────────────────────────────────────
+    "ISRG", "IDXX", "DXCM", "PODD", "ALGN", "MASI", "HOLX", "TECH",
+    "NEOG", "NUVA", "HSIC", "XRAY", "ZBH", "NTRA", "PACB", "AXNX",
+    "INSP", "SWAV", "TNDM", "NARI", "ATRS", "LIVN",
+
+    # ── Financial / Fintech ────────────────────────────────────────────────────
+    "HOOD", "MELI", "NU", "PAGS", "DLO", "NUVEI", "GPN", "EVRI",
+    "FOUR", "PAX", "PAYO", "IIIV", "RPAY", "PRSO",
+
+    # ── Cybersecurity ─────────────────────────────────────────────────────────
+    "FTNT", "CYBR", "TENB", "RPD", "QLYS", "VRNS", "SAIL", "RBRK",
+
+    # ── Cloud Infrastructure / Networking ─────────────────────────────────────
+    "CSCO", "ANET", "JNPR", "FFIV", "NTGR", "VIAV", "INFN", "CALX",
+    "CIEN", "SMTC", "SMAR",
+
+    # ── Consumer Tech / Devices ───────────────────────────────────────────────
+    "AAPL", "HPQ", "LOGI", "GPRO", "HEAR", "VZIO", "SONO",
+
+    # ── AI / Data / Analytics ─────────────────────────────────────────────────
+    "CWAN", "VERX", "PDFS", "CNXC", "PRCT", "APPF", "ALRM", "KNSA",
+    "ATNI", "GFAI", "BBAI", "SOUN", "BIGB", "AMSWA", "CLBT", "PTLO",
+
+    # ── Retail / Consumer Discretionary ───────────────────────────────────────
+    "COST", "AMZN", "LULU", "ORLY", "CASY", "FIVE", "ROST", "DLTR",
+    "TSCO", "ULTA", "DECK", "CROX", "SKX", "ONON", "BOOT", "BIRK",
+
+    # ── Telecom / Communications ──────────────────────────────────────────────
+    "TMUS", "LBRDK", "LBRDA", "CHTR", "SHEN", "GSAT", "AST",
+
+    # ── Travel / Hospitality ──────────────────────────────────────────────────
+    "ABNB", "BKNG", "EXPE", "MMYT", "TRVG", "DESP", "SEERA",
+
+    # ── Food / Beverage ───────────────────────────────────────────────────────
+    "SBUX", "PZZA", "WING", "SHAK", "BROS", "CAVA", "TXRH",
+
+    # ── Industrial / Aerospace ────────────────────────────────────────────────
+    "AXON", "KTOS", "RKLB", "SPCE", "LUNR", "MNTS", "ASTS", "SATL",
+
+    # ── Crypto / Blockchain ───────────────────────────────────────────────────
+    "COIN", "MSTR", "MARA", "RIOT", "CLSK", "CORZ", "IREN", "BTBT", "HUT",
+    "BTDR", "WULF", "CIFR", "BITF",
+]
+
+# Remove any duplicates while preserving order
+seen = set()
+NASDAQ_UNIVERSE = [t for t in NASDAQ_UNIVERSE if not (t in seen or seen.add(t))]
+
+# ─── Top 50 most active tickers for individual news API calls ────────────────
+# (NewsAPI rate limits prevent fetching all 500 individually)
+NASDAQ_HOT_LIST = [
+    "AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "TSLA", "AVGO", "AMD",
+    "INTC", "QCOM", "ARM", "SMCI", "MU", "SNOW", "PLTR", "CRWD", "NET",
+    "ZS", "DDOG", "PANW", "COIN", "MSTR", "RBLX", "SHOP", "ADBE", "CRM",
+    "NOW", "MNDY", "AFRM", "SOFI", "RIVN", "LCID", "NIO", "XPEV",
+    "MRNA", "REGN", "BIIB", "VRTX", "ILMN", "ISRG", "DXCM",
+    "FSLR", "ENPH", "PLUG", "JOBY", "ACHR", "RKLB", "HOOD",
 ]
 
 
@@ -97,18 +190,25 @@ def analyse_with_gemini(news_data: list[dict]) -> list[dict]:
     if len(news_json) > 8000:
         news_json = news_json[:8000] + "\n... (truncated)"
 
+    universe_str = ", ".join(NASDAQ_UNIVERSE)
+
     prompt = f"""You are an elite day-trader AI assistant analysing NASDAQ stocks for {today}.
 
+You have access to news about a wide universe of NASDAQ-listed stocks. Below is the full list 
+of tickers you are authorised to recommend from:
+{universe_str}
+
 Below is a collection of recent news articles for various stocks and the broader market.
-Your task is to identify up to 5 NASDAQ-listed stocks that are MOST LIKELY to have a 
-positive price movement TODAY (intraday) based on the news sentiment, earnings surprises, 
-product announcements, analyst upgrades, or other bullish catalysts.
+Your task is to identify up to 5 stocks from the universe above that are MOST LIKELY to have
+a positive price movement TODAY (intraday) based on news sentiment, earnings surprises,
+product announcements, analyst upgrades, FDA approvals, contract wins, or other bullish catalysts.
 
 IMPORTANT RULES:
 - Only recommend stocks with STRONG bullish evidence from the news.
+- You may ONLY recommend tickers that appear in the universe list above.
 - Do NOT recommend stocks with neutral or mixed news.
-- If fewer than 3 stocks meet the criteria, return only those that do. Return empty array if none qualify.
-- Focus on stocks that are likely to see a 1–5%+ intraday gain.
+- If fewer than 3 stocks meet the criteria, return only those that do. Return an empty array if none qualify.
+- Focus on stocks likely to see a 1–5%+ intraday gain.
 - Confidence is 0.0 to 1.0 where 1.0 = extremely confident.
 
 News Data:
@@ -179,9 +279,10 @@ def run_daily_scan() -> list[dict]:
         for a in top_news if a.get("title")
     ])
 
-    # Step 2: Fetch ticker-specific news for watchlist (limited to avoid API rate limits)
-    scan_tickers = NASDAQ_WATCHLIST[:20]
-    for ticker in scan_tickers:
+    # Step 2: Fetch individual ticker news for the hot list (rate-limit safe)
+    # Full universe of 500+ tickers is passed to Gemini as context above
+    logger.info(f"Fetching news for {len(NASDAQ_HOT_LIST)} hot-list tickers...")
+    for ticker in NASDAQ_HOT_LIST:
         articles = fetch_news_for_ticker(ticker)
         all_news.extend(articles)
 
