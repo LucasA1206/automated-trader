@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  # ─── IB Gateway (headless IBKR connection) ─────────────────────
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:latest
+    restart: always
+    environment:
+      - TWS_USERID=${IB_USER}
+      - TWS_PASSWORD=${IB_PASS}
+      - TRADING_MODE=${TRADING_MODE:-paper}      # paper | live
+      - VNC_SERVER_PASSWORD=${VNC_PASSWORD:-blitz123}
+    ports:
+      - "4001:4001"    # Live trading API port
+      - "4002:4002"    # Paper trading API port
+      - "5900:5900"    # VNC for debugging (optional)
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "4002"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ─── Backend API + Scheduler ────────────────────────────────────
+  bot:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: always
+    depends_on:
+      ib-gateway:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      - IB_HOST=ib-gateway
+      - IB_PORT=4002
+      - DATABASE_URL=postgresql://blitz:blitz123@postgres:5432/blitztrader
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - NEWS_API_KEY=${NEWS_API_KEY}
+    volumes:
+      - ./backend:/app    # Hot reload for dev
+    command: uvicorn api_server:app --host 0.0.0.0 --port 8000 --reload
+
+  # ─── PostgreSQL ─────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      - POSTGRES_USER=blitz
+      - POSTGRES_PASSWORD=blitz123
+      - POSTGRES_DB=blitztrader
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+volumes:
+  postgres_data:
