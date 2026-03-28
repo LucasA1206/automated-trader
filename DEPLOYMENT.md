@@ -35,20 +35,24 @@ git push -u origin main
 1. Go to [railway.app](https://railway.app) → **New Project**
 2. Click **Deploy from GitHub repo** → select `automated-trader`
 
-### 2.2 Add PostgreSQL
+> **⚠️ Important**: Railway will try to build from the **root** of the repo and fail with a "Railpack could not determine how to build" error. You MUST set the Root Directory first (Step 2.3 below).
 
-1. In the Railway project → **New** → **Database** → **PostgreSQL**
-2. Click the PostgreSQL service → **Connect** tab → copy the `DATABASE_URL` (starts with `postgresql://`)
+### 2.2 Add PostgreSQL Plugin
+
+1. In the Railway project → click **+ New** → **Database** → **Add PostgreSQL**
+2. Wait for it to provision
+3. Click the PostgreSQL service → **Variables** tab → copy the value of `DATABASE_URL`
 
 ### 2.3 Deploy Backend Bot Service
 
-1. In the Railway project → **New** → **GitHub Repo** → select `automated-trader`
-2. In **Service Settings**:
-   - **Root Directory**: `/backend`
-   - **Build Command**: *(leave blank — uses Dockerfile)*
-   - **Start Command**: *(leave blank — uses Dockerfile CMD)*
+1. In the Railway project → click **+ New** → **GitHub Repo** → select `automated-trader`
+2. **⚡ Before it deploys**, immediately go to the new service → **Settings** tab
+3. Find **Root Directory** → set it to: **`/backend`**
+4. Click **Save** — this triggers a redeploy from the correct folder
 
-3. Go to **Variables** tab → Add all of these:
+> **Why?** Your repo has both `backend/` and `frontend/` at the root. Railway must be told to look only at `backend/`. The `backend/railway.toml`, `Procfile`, and `runtime.txt` files inside `/backend` tell Railway exactly how to build and start the Python service.
+
+Now go to the **Variables** tab and add all of these:
 
 ```
 DATABASE_URL          = (paste from PostgreSQL service above)
