@@ -11,9 +11,12 @@ logger = logging.getLogger(__name__)
 IB_HOST = os.getenv("IB_HOST", "127.0.0.1")
 IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", "1"))
 
-# Ports: 4002 = paper, 4001 = live
-PAPER_PORT = 4002
-LIVE_PORT = 4001
+# The gnzsnz/ib-gateway Docker image uses socat to expose:
+#   container port 4003 -> internal IB live port 4001
+#   container port 4004 -> internal IB paper port 4002
+# When connecting via Railway internal network, use these external container ports.
+PAPER_PORT = int(os.getenv("IB_PORT", "4004"))  # 4004 = paper (socat relay)
+LIVE_PORT = int(os.getenv("IB_PORT_LIVE", "4003"))  # 4003 = live (socat relay)
 
 
 def get_ib_port(trading_mode: str) -> int:
