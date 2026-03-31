@@ -235,6 +235,77 @@ def trigger_sell(background_tasks: BackgroundTasks):
     return {"status": "triggered", "message": "Sell-all job started in background"}
 
 
+@app.post("/api/sell-all-ibkr")
+def sell_all_ibkr(db: Session = Depends(get_db)):
+    """
+    Immediately sells ALL open positions in the IBKR account (synchronous).
+    This uses the live portfolio from IB Gateway — not just DB-tracked trades.
+    Returns per-ticker results.
+    """
+    trading_mode = get_setting(db, "trading_mode", "paper")
+    try:
+        client = IBKRClient(trading_mode=trading_mode)
+        connected = client.connect(retries=2, delay=3)
+        if not connected:
+            raise HTTPException(status_code=503, detail="Could not connect to IB Gateway")
+
+        positions = client.get_positions()
+        if not positions:
+            client.disconnect()
+            return {"status": "ok", "message": "No open positions to sell.", "results": []}
+
+        results = []
+        for pos in positions:
+            ticker = pos["ticker"]
+            shares = pos["shares"]
+            logger.info(f"[SELL-ALL] Placing sell order for {shares} shares of {ticker}...")
+            result = client.place_sell_order(ticker, shares)
+            results.append(result)
+
+            # Update DB trade record if one exists
+            if result.get("success"):
+                trade = (
+                    db.query(Trade)
+                    .filter(Trade.ticker == ticker, Trade.status == "open")
+                    .order_by(Trade.buy_time.desc())
+                    .first()
+                )
+                if trade:
+                    sell_price = result["price"]
+                    pnl = (sell_price - trade.buy_price) * trade.shares
+                    pnl_pct = ((sell_price - trade.buy_price) / trade.buy_price * 100) if trade.buy_price else 0
+                    trade.sell_price = sell_price
+                    trade.sell_time = datetime.now(timezone.utc)
+                    trade.status = "closed"
+                    trade.pnl = round(pnl, 2)
+                    trade.pnl_pct = round(pnl_pct, 2)
+                    db.commit()
+
+            from models import SystemLog
+            level = "INFO" if result.get("success") else "ERROR"
+            msg = (
+                f"✅ Sold {result.get('shares')} shares of {ticker} @ ${result.get('price', 0):.2f}"
+                if result.get("success")
+                else f"❌ Sell failed for {ticker}: {result.get('error')}"
+            )
+            db.add(SystemLog(
+                timestamp=datetime.now(timezone.utc),
+                level=level,
+                category="sell",
+                message=msg,
+            ))
+            db.commit()
+
+        client.disconnect()
+        return {"status": "ok", "results": results}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"sell-all-ibkr error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ─── Entrypoint ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
