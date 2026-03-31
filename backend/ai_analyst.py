@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import logging
 import requests
 import google.generativeai as genai
@@ -132,6 +133,9 @@ def fetch_news_for_ticker(ticker: str) -> list[dict]:
             "apiKey": NEWS_API_KEY,
         }
         resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code == 429:
+            logger.warning(f"NewsAPI rate limit hit on {ticker} — stopping ticker news fetches.")
+            return None  # Signal to caller to stop fetching
         resp.raise_for_status()
         data = resp.json()
         articles = data.get("articles", [])
@@ -226,7 +230,7 @@ Format:
 ]"""
 
     try:
-        model = genai.GenerativeModel("gemini-2.5-flash")
+        model = genai.GenerativeModel("gemini-2.0-flash")
         response = model.generate_content(prompt)
         text = response.text.strip()
 
@@ -282,9 +286,18 @@ def run_daily_scan() -> list[dict]:
     # Step 2: Fetch individual ticker news for the hot list (rate-limit safe)
     # Full universe of 500+ tickers is passed to Gemini as context above
     logger.info(f"Fetching news for {len(NASDAQ_HOT_LIST)} hot-list tickers...")
+    rate_limited = False
     for ticker in NASDAQ_HOT_LIST:
+        if rate_limited:
+            break
         articles = fetch_news_for_ticker(ticker)
+        if articles is None:
+            # 429 received — stop hammering the API
+            rate_limited = True
+            logger.warning("NewsAPI rate limit reached. Proceeding with partial news data.")
+            break
         all_news.extend(articles)
+        time.sleep(0.25)  # 250 ms gap → ~4 req/s, well under NewsAPI limits
 
     logger.info(f"Fetched {len(all_news)} news articles. Sending to Gemini...")
 

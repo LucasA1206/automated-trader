@@ -22,9 +22,11 @@ export default function SettingsTab({ onModeChange }: Props) {
   });
   const [saving, setSaving] = useState(false);
   const [scanning, setScanning] = useState(false);
+  const [selling, setSelling] = useState(false);
   const [saveMsg, setSaveMsg] = useState('');
   const [showLiveWarning, setShowLiveWarning] = useState(false);
   const [pendingMode, setPendingMode] = useState<'paper' | 'live' | null>(null);
+  const [showSellAllConfirm, setShowSellAllConfirm] = useState(false);
 
   const fetchSettings = useCallback(async () => {
     const res = await fetch('/api/settings');
@@ -96,6 +98,37 @@ export default function SettingsTab({ onModeChange }: Props) {
     }
   };
 
+  const sellAllIBKR = async () => {
+    setShowSellAllConfirm(false);
+    setSelling(true);
+    setSaveMsg('');
+    try {
+      const res = await fetch('/api/sell-all-ibkr', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) {
+        setSaveMsg(`❌ Sell failed: ${data.detail || 'Unknown error'}`);
+        return;
+      }
+      const results: Array<{success: boolean; ticker: string; shares?: number; price?: number; error?: string}> = data.results ?? [];
+      if (results.length === 0) {
+        setSaveMsg('ℹ️ No open IBKR positions to sell.');
+      } else {
+        const sold = results.filter((r) => r.success).map((r) => r.ticker).join(', ');
+        const failed = results.filter((r) => !r.success).map((r) => r.ticker).join(', ');
+        setSaveMsg(
+          sold
+            ? `✅ Sold: ${sold}${failed ? ` | ❌ Failed: ${failed}` : ''}`
+            : `❌ All sells failed: ${failed}`
+        );
+      }
+    } catch {
+      setSaveMsg('❌ Network error during sell-all.');
+    } finally {
+      setSelling(false);
+      setTimeout(() => setSaveMsg(''), 8000);
+    }
+  };
+
   const isLive = settings.trading_mode === 'live';
   const budgetPct = parseInt(settings.daily_budget_pct, 10) || 100;
   const maxPos = parseInt(settings.max_positions, 10) || 5;
@@ -150,6 +183,56 @@ export default function SettingsTab({ onModeChange }: Props) {
                 onClick={confirmLive}
               >
                 Yes, Switch to Live
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Sell All IBKR Confirmation Modal */}
+      {showSellAllConfirm && (
+        <div
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            zIndex: 1000,
+          }}
+        >
+          <div
+            style={{
+              background: 'var(--bg-card)',
+              border: '1px solid rgba(239,68,68,0.5)',
+              borderRadius: 16,
+              padding: 32,
+              maxWidth: 460,
+              width: '90%',
+            }}
+          >
+            <div style={{ fontSize: 36, marginBottom: 16, textAlign: 'center' }}>🚨</div>
+            <h3 style={{ fontSize: 18, fontWeight: 700, marginBottom: 12, color: 'var(--accent-red)', textAlign: 'center' }}>
+              Sell All IBKR Positions?
+            </h3>
+            <p style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.7, marginBottom: 8 }}>
+              This will immediately place <strong>market SELL orders</strong> for every open position
+              in your IBKR account — including positions not tracked by the bot.
+            </p>
+            <p style={{ fontSize: 13, color: 'var(--accent-red)', fontWeight: 600, marginBottom: 24 }}>
+              ⚠️ This action cannot be undone and executes instantly.
+            </p>
+            <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end' }}>
+              <button
+                id="btn-cancel-sell-all"
+                className="btn btn-outline"
+                onClick={() => setShowSellAllConfirm(false)}
+              >
+                Cancel
+              </button>
+              <button
+                id="btn-confirm-sell-all"
+                className="btn btn-danger"
+                onClick={sellAllIBKR}
+              >
+                Yes, Sell Everything Now
               </button>
             </div>
           </div>
@@ -278,6 +361,30 @@ export default function SettingsTab({ onModeChange }: Props) {
             disabled={scanning}
           >
             {scanning ? '⏳ Scanning...' : '🔍 Run Scan Now'}
+          </button>
+        </div>
+      </div>
+
+      {/* Danger Zone */}
+      <div className="settings-section" style={{ borderColor: 'rgba(239,68,68,0.3)' }}>
+        <h3 style={{ color: 'var(--accent-red)' }}>⚠️ Danger Zone</h3>
+        <p>Irreversible actions — use with caution.</p>
+
+        <div className="setting-row">
+          <div className="setting-info">
+            <div className="setting-label">Sell All IBKR Positions</div>
+            <div className="setting-desc">
+              Immediately places market sell orders for <strong>every open position</strong> in your
+              IBKR account. Useful for emergency exits or end-of-day manual liquidation.
+            </div>
+          </div>
+          <button
+            id="btn-sell-all-ibkr"
+            className="btn btn-danger"
+            onClick={() => setShowSellAllConfirm(true)}
+            disabled={selling}
+          >
+            {selling ? '⏳ Selling...' : '🚨 Sell All Now'}
           </button>
         </div>
       </div>
