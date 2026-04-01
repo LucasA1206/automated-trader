@@ -99,15 +99,18 @@ class IBKRClient:
                     readonly=False,
                 )
 
-                # Health-check: wait up to 5 s for account portfolio data to arrive.
-                # This confirms the IB Gateway has a live upstream connection.
-                # If 2110 already fired, skip immediately.
-                deadline = time.monotonic() + 5
+                # Health-check: wait up to 8 s for account data to arrive.
+                # We use accountValues() rather than portfolio() because
+                # portfolio() returns empty when there are no open positions
+                # (e.g. after the afternoon sell job closes everything),
+                # which would cause a false failure.  accountValues() is
+                # always non-empty after a successful sync (cash, net liq, etc.)
+                deadline = time.monotonic() + 8
                 healthy = False
                 while time.monotonic() < deadline:
                     if upstream_broken[0] or duplicate_client[0]:
                         break
-                    if self.ib.portfolio():   # non-empty → data is flowing
+                    if self.ib.accountValues():   # non-empty → account sync done
                         healthy = True
                         break
                     self.ib.sleep(0.25)
