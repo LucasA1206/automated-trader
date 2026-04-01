@@ -3,6 +3,7 @@ import math
 import time
 import random
 import asyncio
+import threading
 import logging
 from datetime import datetime, timezone
 from ib_insync import IB, Stock, MarketOrder, util
@@ -44,6 +45,11 @@ class IBKRClient:
     def connect(self, retries: int = 5, delay: int = 10) -> bool:
         """Connect to IB Gateway with retry logic.
 
+        After the TCP handshake succeeds we do a quick health-check:
+        we wait up to 5 s to receive account portfolio data from the
+        gateway.  If Warning 2110 fires first (IB upstream broken) or
+        account data never arrives we treat the attempt as failed.
+
         Uses a random clientId (10–999) per connection so that concurrent
         FastAPI requests don't fight over the same IB Gateway client slot.
         FastAPI sync route handlers run in AnyIO worker threads with no
@@ -68,27 +74,70 @@ class IBKRClient:
                     self.ib.disconnect()
                 self.ib = IB()
 
+                # Track whether Warning 2110 fires (IB upstream is broken)
+                upstream_broken = [False]
+
+                def _on_error(reqId, errorCode, errorString, contract):
+                    if errorCode == 2110:
+                        upstream_broken[0] = True
+
+                self.ib.errorEvent += _on_error
+
                 self.ib.connect(
                     host=IB_HOST,
                     port=self.port,
                     clientId=client_id,
-                    timeout=30,  # Increased for slow laptop initialization
+                    timeout=10,   # TCP handshake only; health-check is separate
                     readonly=False,
                 )
-                logger.info(
-                    f"Connected to IB Gateway at {IB_HOST}:{self.port} "
-                    f"(mode={self.trading_mode}, clientId={client_id})"
-                )
-                return True
+
+                # Health-check: wait up to 5 s for account portfolio data to arrive.
+                # This confirms the IB Gateway has a live upstream connection.
+                # If 2110 already fired, skip immediately.
+                deadline = time.monotonic() + 5
+                healthy = False
+                while time.monotonic() < deadline:
+                    if upstream_broken[0]:
+                        break
+                    if self.ib.portfolio():   # non-empty → data is flowing
+                        healthy = True
+                        break
+                    self.ib.sleep(0.25)
+
+                self.ib.errorEvent -= _on_error
+
+                if upstream_broken[0]:
+                    logger.warning(
+                        f"IBKR connect attempt {attempt + 1}/{retries} failed: "
+                        "IB Gateway upstream connection is broken (error 2110). "
+                        "The gateway container is running but has no live link to IB servers. "
+                        "Try restarting the ib-gateway service on Railway."
+                    )
+                    self.ib.disconnect()
+                elif not healthy:
+                    logger.warning(
+                        f"IBKR connect attempt {attempt + 1}/{retries} failed: "
+                        "Connected to gateway but account data did not arrive in time. "
+                        "The gateway may still be initialising — will retry."
+                    )
+                    self.ib.disconnect()
+                else:
+                    logger.info(
+                        f"Connected to IB Gateway at {IB_HOST}:{self.port} "
+                        f"(mode={self.trading_mode}, clientId={client_id})"
+                    )
+                    return True
+
             except Exception as e:
                 err_msg = str(e) or type(e).__name__
                 logger.warning(
                     f"IBKR connect attempt {attempt + 1}/{retries} failed: {err_msg}"
                 )
-                if attempt < retries - 1:
-                    # Use a different clientId on next attempt in case of collision
-                    client_id = random.randint(10, 999)
-                    time.sleep(delay)
+
+            if attempt < retries - 1:
+                client_id = random.randint(10, 999)
+                time.sleep(delay)
+
         logger.error("Failed to connect to IB Gateway after all retries.")
         return False
 

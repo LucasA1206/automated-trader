@@ -93,7 +93,11 @@ def get_portfolio(db: Session = Depends(get_db)):
                 "mode": trading_mode,
                 "positions": [],
                 "account": {},
-                "error": "Could not connect to IB Gateway",
+                "error": (
+                    "Could not connect to IB Gateway. "
+                    "If backend logs show 'error 2110', the IB Gateway container has lost "
+                    "its upstream connection to IB servers — restart the ib-gateway service on Railway."
+                ),
             }
         positions = client.get_positions()
         account = client.get_account_summary()
