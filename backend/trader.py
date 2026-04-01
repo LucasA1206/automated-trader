@@ -62,13 +62,17 @@ class IBKRClient:
 
         for attempt in range(retries):
             try:
-                if self.ib.isConnected():
+                # Clean up old connection if any, and create a fresh instance
+                # to prevent dirty background asyncio tasks from failing the retry.
+                if hasattr(self, 'ib') and self.ib.isConnected():
                     self.ib.disconnect()
+                self.ib = IB()
+
                 self.ib.connect(
                     host=IB_HOST,
                     port=self.port,
                     clientId=client_id,
-                    timeout=20,
+                    timeout=30,  # Increased for slow laptop initialization
                     readonly=False,
                 )
                 logger.info(
@@ -77,8 +81,9 @@ class IBKRClient:
                 )
                 return True
             except Exception as e:
+                err_msg = str(e) or type(e).__name__
                 logger.warning(
-                    f"IBKR connect attempt {attempt + 1}/{retries} failed: {e}"
+                    f"IBKR connect attempt {attempt + 1}/{retries} failed: {err_msg}"
                 )
                 if attempt < retries - 1:
                     # Use a different clientId on next attempt in case of collision
