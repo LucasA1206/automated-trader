@@ -41,6 +41,9 @@ class IBKRClient:
         self.trading_mode = trading_mode
         self.port = get_ib_port(trading_mode)
         self.ib = IB()
+        # Fixed per-instance clientId — only rotated on duplicate-client error (code 326).
+        # Keeping it stable prevents ghost slots from accumulating on the gateway.
+        self._client_id = random.randint(10, 999)
 
     def connect(self, retries: int = 5, delay: int = 10) -> bool:
         """Connect to IB Gateway with retry logic.
@@ -50,10 +53,14 @@ class IBKRClient:
         gateway.  If Warning 2110 fires first (IB upstream broken) or
         account data never arrives we treat the attempt as failed.
 
-        Uses a random clientId (10–999) per connection so that concurrent
-        FastAPI requests don't fight over the same IB Gateway client slot.
-        FastAPI sync route handlers run in AnyIO worker threads with no
-        asyncio event loop — we create one here before ib_insync needs it.
+        clientId is fixed for the lifetime of this IBKRClient instance
+        so that failed/retried connections don't pile up as ghost slots
+        on the gateway.  It is only rotated when a duplicate-client
+        error (code 326) is detected.
+
+        "Connection refused" is treated as a startup-in-progress signal
+        (socat is up but the IB Gateway Java process hasn't bound its port
+        yet — happens for ~15 s after the daily 11:59 PM auto-restart).
         """
         # Ensure this thread has an asyncio event loop (AnyIO worker threads don't).
         try:
@@ -64,8 +71,6 @@ class IBKRClient:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
-        client_id = random.randint(10, 999)
-
         for attempt in range(retries):
             try:
                 # Clean up old connection if any, and create a fresh instance
@@ -74,19 +79,22 @@ class IBKRClient:
                     self.ib.disconnect()
                 self.ib = IB()
 
-                # Track whether Warning 2110 fires (IB upstream is broken)
+                # Track warning codes that affect retry strategy
                 upstream_broken = [False]
+                duplicate_client = [False]
 
                 def _on_error(reqId, errorCode, errorString, contract):
                     if errorCode == 2110:
                         upstream_broken[0] = True
+                    elif errorCode == 326:   # duplicate clientId
+                        duplicate_client[0] = True
 
                 self.ib.errorEvent += _on_error
 
                 self.ib.connect(
                     host=IB_HOST,
                     port=self.port,
-                    clientId=client_id,
+                    clientId=self._client_id,
                     timeout=10,   # TCP handshake only; health-check is separate
                     readonly=False,
                 )
@@ -97,7 +105,7 @@ class IBKRClient:
                 deadline = time.monotonic() + 5
                 healthy = False
                 while time.monotonic() < deadline:
-                    if upstream_broken[0]:
+                    if upstream_broken[0] or duplicate_client[0]:
                         break
                     if self.ib.portfolio():   # non-empty → data is flowing
                         healthy = True
@@ -106,7 +114,14 @@ class IBKRClient:
 
                 self.ib.errorEvent -= _on_error
 
-                if upstream_broken[0]:
+                if duplicate_client[0]:
+                    logger.warning(
+                        f"IBKR connect attempt {attempt + 1}/{retries} failed: "
+                        f"clientId {self._client_id} already in use — rotating."
+                    )
+                    self.ib.disconnect()
+                    self._client_id = random.randint(10, 999)
+                elif upstream_broken[0]:
                     logger.warning(
                         f"IBKR connect attempt {attempt + 1}/{retries} failed: "
                         "IB Gateway upstream connection is broken (error 2110). "
@@ -124,9 +139,21 @@ class IBKRClient:
                 else:
                     logger.info(
                         f"Connected to IB Gateway at {IB_HOST}:{self.port} "
-                        f"(mode={self.trading_mode}, clientId={client_id})"
+                        f"(mode={self.trading_mode}, clientId={self._client_id})"
                     )
                     return True
+
+            except ConnectionRefusedError:
+                # socat is up but the IB Gateway Java process hasn't bound port 4002 yet.
+                # This happens for ~15 s after the daily 11:59 PM auto-restart.
+                logger.warning(
+                    f"IBKR connect attempt {attempt + 1}/{retries} failed: "
+                    "Connection refused — IB Gateway is still starting up after its "
+                    "daily restart. Will wait 20 s before retrying."
+                )
+                if attempt < retries - 1:
+                    time.sleep(20)
+                continue
 
             except Exception as e:
                 err_msg = str(e) or type(e).__name__
@@ -135,7 +162,6 @@ class IBKRClient:
                 )
 
             if attempt < retries - 1:
-                client_id = random.randint(10, 999)
                 time.sleep(delay)
 
         logger.error("Failed to connect to IB Gateway after all retries.")
