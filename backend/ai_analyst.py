@@ -230,7 +230,7 @@ Format:
 ]"""
 
     try:
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        model = genai.GenerativeModel("gemini-2.5-flash-lite")
         response = model.generate_content(prompt)
         text = response.text.strip()
 
