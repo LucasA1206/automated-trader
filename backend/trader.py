@@ -159,11 +159,18 @@ class IBKRClient:
             contract = Stock(ticker, "SMART", "USD")
             self.ib.qualifyContracts(contract)
 
-            # Request delayed market data (type 3) — no subscription needed
+            # Request delayed market data (type 3) — no subscription needed.
+            # Poll up to 10 s so we survive the initial data-farm connection delay
+            # (Warning 2119 "Market data farm is connecting") that hits the first
+            # ticker in each scan session.
             self.ib.reqMarketDataType(3)
             mkt = self.ib.reqMktData(contract, "", True, False)
-            self.ib.sleep(2)
-            price = safe_float(mkt.last) or safe_float(mkt.close)
+            price = 0.0
+            for _ in range(20):   # 20 × 0.5 s = 10 s max
+                self.ib.sleep(0.5)
+                price = safe_float(mkt.last) or safe_float(mkt.close)
+                if price > 0:
+                    break
             self.ib.cancelMktData(contract)
 
             if not price or price <= 0:
