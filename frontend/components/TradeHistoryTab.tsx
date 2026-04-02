@@ -30,7 +30,9 @@ function formatDate(iso: string | null): string {
 
 type Filter = 'all' | 'open' | 'closed' | 'error';
 
-export default function TradeHistoryTab() {
+type AuthFetch = (url: string, init?: RequestInit) => Promise<Response>;
+
+export default function TradeHistoryTab({ authFetch }: { authFetch: AuthFetch }) {
   const [trades, setTrades] = useState<Trade[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -40,7 +42,7 @@ export default function TradeHistoryTab() {
   const fetchTrades = useCallback(async () => {
     const params = filter !== 'all' ? `?status=${filter}` : '';
     try {
-      const res = await fetch(`/api/trades${params}&limit=100`);
+      const res = await authFetch(`/api/trades${params}&limit=100`);
       const json = await res.json();
       setTrades(json.trades ?? []);
       setTotal(json.total ?? 0);
