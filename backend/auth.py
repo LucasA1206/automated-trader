@@ -34,8 +34,8 @@ if not _env_secret:
 
 JWT_SECRET: str = _env_secret
 
-IBKR_USERNAME: str = os.getenv("IBKR_USERNAME", "")
-IBKR_PASSWORD: str = os.getenv("IBKR_PASSWORD", "")
+IBKR_USERNAME: str = os.getenv("IB_USER", "")
+IBKR_PASSWORD: str = os.getenv("IB_PASS", "")
 
 # ─── Bearer scheme (auto extracts Authorization: Bearer <token>) ───────────────
 
