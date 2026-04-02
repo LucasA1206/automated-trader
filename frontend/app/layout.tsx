@@ -1,10 +1,11 @@
 import type { Metadata } from 'next';
 import './globals.css';
+import { AuthProvider } from '@/components/AuthContext';
 
 export const metadata: Metadata = {
-  title: 'Automated Trader',
+  title: 'Blitz Trader',
   description:
-    'Automated Trader is an AI-powered automated day trading system for NASDAQ stocks using IBKR.',
+    'Blitz Trader is an AI-powered automated day trading system for NASDAQ stocks using IBKR.',
 };
 
 export default function RootLayout({
@@ -14,7 +15,9 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body suppressHydrationWarning>{children}</body>
+      <body suppressHydrationWarning>
+        <AuthProvider>{children}</AuthProvider>
+      </body>
     </html>
   );
 }

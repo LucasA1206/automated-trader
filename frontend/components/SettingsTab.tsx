@@ -9,11 +9,14 @@ interface Settings {
   scan_enabled: string;
 }
 
+type AuthFetch = (url: string, init?: RequestInit) => Promise<Response>;
+
 interface Props {
   onModeChange: (mode: 'paper' | 'live') => void;
+  authFetch: AuthFetch;
 }
 
-export default function SettingsTab({ onModeChange }: Props) {
+export default function SettingsTab({ onModeChange, authFetch }: Props) {
   const [settings, setSettings] = useState<Settings>({
     trading_mode: 'paper',
     daily_budget_pct: '100',
@@ -29,7 +32,7 @@ export default function SettingsTab({ onModeChange }: Props) {
   const [showSellAllConfirm, setShowSellAllConfirm] = useState(false);
 
   const fetchSettings = useCallback(async () => {
-    const res = await fetch('/api/settings');
+    const res = await authFetch('/api/settings');
     const data = await res.json();
     setSettings(data);
   }, []);
@@ -42,7 +45,7 @@ export default function SettingsTab({ onModeChange }: Props) {
     setSaving(true);
     setSaveMsg('');
     try {
-      const res = await fetch('/api/settings', {
+      const res = await authFetch('/api/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(patch),
@@ -88,7 +91,7 @@ export default function SettingsTab({ onModeChange }: Props) {
   const triggerScan = async () => {
     setScanning(true);
     try {
-      await fetch('/api/scan', { method: 'POST' });
+      await authFetch('/api/scan', { method: 'POST' });
       setSaveMsg('✅ Scan triggered! Check System Logs for progress.');
     } catch {
       setSaveMsg('❌ Failed to trigger scan.');
@@ -103,7 +106,7 @@ export default function SettingsTab({ onModeChange }: Props) {
     setSelling(true);
     setSaveMsg('');
     try {
-      const res = await fetch('/api/sell-all-ibkr', { method: 'POST' });
+      const res = await authFetch('/api/sell-all-ibkr', { method: 'POST' });
       const data = await res.json();
       if (!res.ok) {
         setSaveMsg(`❌ Sell failed: ${data.detail || 'Unknown error'}`);

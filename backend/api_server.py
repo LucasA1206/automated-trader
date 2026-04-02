@@ -14,6 +14,7 @@ from database import get_db, init_db, get_setting, set_setting, SessionLocal
 from models import Trade, SystemLog, Setting
 from scheduler import create_scheduler, get_next_job_times
 from trader import IBKRClient
+from auth import require_auth, validate_credentials, create_access_token
 
 # ─── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -57,6 +58,11 @@ app.add_middleware(
 
 
 # ─── Pydantic schemas ──────────────────────────────────────────────────────
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
 class SettingUpdate(BaseModel):
     value: str
 
@@ -68,7 +74,20 @@ class SettingsBulkUpdate(BaseModel):
     scan_enabled: Optional[str] = None
 
 
-# ─── Health ────────────────────────────────────────────────────────────────
+# ─── Auth ─────────────────────────────────────────────────────────────────
+@app.post("/api/auth/login")
+def login(body: LoginRequest):
+    """Validates IBKR credentials and returns a JWT access token."""
+    if not validate_credentials(body.username, body.password):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password",
+        )
+    token = create_access_token(body.username)
+    return {"access_token": token, "token_type": "bearer"}
+
+
+# ─── Health (public — Railway health checks) ────────────────────────────────
 @app.get("/api/health")
 def health():
     return {
@@ -80,7 +99,7 @@ def health():
 
 
 # ─── Portfolio ─────────────────────────────────────────────────────────────
-@app.get("/api/portfolio")
+@app.get("/api/portfolio", dependencies=[Depends(require_auth)])
 def get_portfolio(db: Session = Depends(get_db)):
     """Returns IBKR account summary + open positions."""
     trading_mode = get_setting(db, "trading_mode", "paper")
@@ -110,7 +129,7 @@ def get_portfolio(db: Session = Depends(get_db)):
 
 
 # ─── Trades ────────────────────────────────────────────────────────────────
-@app.get("/api/trades")
+@app.get("/api/trades", dependencies=[Depends(require_auth)])
 def get_trades(
     status: Optional[str] = None,
     limit: int = 100,
@@ -146,7 +165,7 @@ def get_trades(
 
 
 # ─── System Logs ───────────────────────────────────────────────────────────
-@app.get("/api/logs")
+@app.get("/api/logs", dependencies=[Depends(require_auth)])
 def get_logs(
     category: Optional[str] = None,
     level: Optional[str] = None,
@@ -179,14 +198,14 @@ def get_logs(
 
 
 # ─── Settings ──────────────────────────────────────────────────────────────
-@app.get("/api/settings")
+@app.get("/api/settings", dependencies=[Depends(require_auth)])
 def get_settings(db: Session = Depends(get_db)):
     """Returns all user-configurable settings."""
     settings = db.query(Setting).all()
     return {s.key: s.value for s in settings}
 
 
-@app.put("/api/settings")
+@app.put("/api/settings", dependencies=[Depends(require_auth)])
 def update_settings(body: SettingsBulkUpdate, db: Session = Depends(get_db)):
     """Updates one or more settings."""
     updates = body.dict(exclude_none=True)
@@ -219,7 +238,7 @@ def update_settings(body: SettingsBulkUpdate, db: Session = Depends(get_db)):
 
 
 # ─── Manual Triggers ───────────────────────────────────────────────────────
-@app.post("/api/scan")
+@app.post("/api/scan", dependencies=[Depends(require_auth)])
 def trigger_scan(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """Manually triggers the morning scan & buy job in the background."""
     from jobs import job_morning_scan_and_buy
@@ -227,7 +246,7 @@ def trigger_scan(background_tasks: BackgroundTasks, db: Session = Depends(get_db
     return {"status": "triggered", "message": "Market scan started in background"}
 
 
-@app.post("/api/sell-all")
+@app.post("/api/sell-all", dependencies=[Depends(require_auth)])
 def trigger_sell(background_tasks: BackgroundTasks):
     """Manually triggers the sell-all job in the background."""
     from jobs import job_afternoon_sell
@@ -235,7 +254,7 @@ def trigger_sell(background_tasks: BackgroundTasks):
     return {"status": "triggered", "message": "Sell-all job started in background"}
 
 
-@app.post("/api/sell-all-ibkr")
+@app.post("/api/sell-all-ibkr", dependencies=[Depends(require_auth)])
 def sell_all_ibkr(db: Session = Depends(get_db)):
     """
     Immediately sells ALL open positions in the IBKR account (synchronous).
@@ -304,6 +323,59 @@ def sell_all_ibkr(db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"sell-all-ibkr error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── P&L History ───────────────────────────────────────────────────────────
+@app.get("/api/pnl-history", dependencies=[Depends(require_auth)])
+def get_pnl_history(db: Session = Depends(get_db)):
+    """
+    Returns daily realized P&L from closed trades, cumulative P&L over time,
+    and the all-time realized P&L total.
+    """
+    from sqlalchemy import func, cast, Date as SQLDate
+
+    # All closed trades with a sell_time and pnl
+    closed_trades = (
+        db.query(Trade)
+        .filter(Trade.status == "closed", Trade.sell_time.isnot(None), Trade.pnl.isnot(None))
+        .order_by(Trade.sell_time.asc())
+        .all()
+    )
+
+    # Group by calendar date (UTC)
+    from collections import defaultdict
+    daily: dict[str, float] = defaultdict(float)
+    for t in closed_trades:
+        day = t.sell_time.strftime("%Y-%m-%d")
+        daily[day] += t.pnl
+
+    # Build sorted list with cumulative running total
+    sorted_days = sorted(daily.keys())
+    cumulative = 0.0
+    chart_data = []
+    for day in sorted_days:
+        cumulative += daily[day]
+        chart_data.append({
+            "date": day,
+            "daily_pnl": round(daily[day], 2),
+            "cumulative_pnl": round(cumulative, 2),
+        })
+
+    # All-time realized P&L
+    all_time_realized = round(sum(t.pnl for t in closed_trades), 2)
+
+    # Count of winning vs losing closed trades
+    winners = sum(1 for t in closed_trades if t.pnl and t.pnl > 0)
+    losers  = sum(1 for t in closed_trades if t.pnl and t.pnl < 0)
+    total_closed = len(closed_trades)
+
+    return {
+        "chart_data": chart_data,
+        "all_time_realized_pnl": all_time_realized,
+        "total_closed_trades": total_closed,
+        "winning_trades": winners,
+        "losing_trades": losers,
+    }
 
 
 # ─── Entrypoint ───────────────────────────────────────────────────────────

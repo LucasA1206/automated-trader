@@ -19,7 +19,9 @@ function formatTimestamp(iso: string): string {
   });
 }
 
-export default function SystemLogsTab() {
+type AuthFetch = (url: string, init?: RequestInit) => Promise<Response>;
+
+export default function SystemLogsTab({ authFetch }: { authFetch: AuthFetch }) {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -31,7 +33,7 @@ export default function SystemLogsTab() {
     const params = new URLSearchParams({ limit: '200' });
     if (category !== 'all') params.set('category', category);
     try {
-      const res = await fetch(`/api/logs?${params}`);
+      const res = await authFetch(`/api/logs?${params}`);
       const json = await res.json();
       setLogs(json.logs ?? []);
       setTotal(json.total ?? 0);
