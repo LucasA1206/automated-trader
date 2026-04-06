@@ -120,21 +120,14 @@ def job_morning_scan_and_buy():
 def job_afternoon_sell():
     """
     Runs at 15:50 ET weekdays:
-    Sells all open positions.
+    Sells ALL open positions held in the IBKR account — not just the ones
+    bought by this morning's job.  Any position found live in the broker
+    account will be sold, regardless of whether it exists in the local DB.
     """
     db = SessionLocal()
     try:
         trading_mode = get_setting(db, "trading_mode", "paper")
         log_event(db, "sell", "Starting afternoon sell-all job.")
-
-        # Get all open trades
-        open_trades = db.query(Trade).filter(Trade.status == "open").all()
-        if not open_trades:
-            log_event(db, "sell", "No open positions to sell.")
-            return
-
-        log_event(db, "sell",
-                  f"Found {len(open_trades)} open position(s). Connecting to IBKR...")
 
         client = IBKRClient(trading_mode=trading_mode)
         connected = client.connect()
@@ -143,32 +136,64 @@ def job_afternoon_sell():
                       "Failed to connect to IB Gateway for sell job.", "ERROR")
             return
 
-        for trade in open_trades:
+        # Fetch live positions directly from IBKR — this captures everything
+        # in the account, including positions not bought by today's morning job.
+        live_positions = client.get_positions()
+        if not live_positions:
+            log_event(db, "sell", "No live positions found in IBKR account. Nothing to sell.")
+            client.disconnect()
+            return
+
+        log_event(db, "sell",
+                  f"Found {len(live_positions)} live position(s) in IBKR: "
+                  f"{', '.join(p['ticker'] for p in live_positions)}")
+
+        # Build a lookup of DB open trades by ticker for P&L tracking
+        open_trades = db.query(Trade).filter(Trade.status == "open").all()
+        db_trades_by_ticker = {t.ticker: t for t in open_trades}
+
+        for position in live_positions:
+            ticker = position["ticker"]
+            shares = position["shares"]
+
             log_event(db, "sell",
-                      f"Placing SELL order for {trade.shares} shares of {trade.ticker}...")
-            result = client.place_sell_order(trade.ticker, trade.shares)
+                      f"Placing SELL order for {shares} shares of {ticker}...")
+            result = client.place_sell_order(ticker, shares)
 
             if result["success"]:
                 sell_price = result["price"]
-                pnl = (sell_price - trade.buy_price) * trade.shares
-                pnl_pct = ((sell_price - trade.buy_price) / trade.buy_price * 100) if trade.buy_price else 0
 
-                trade.sell_price = sell_price
-                trade.sell_time = datetime.now(timezone.utc)
-                trade.status = "closed"
-                trade.pnl = round(pnl, 2)
-                trade.pnl_pct = round(pnl_pct, 2)
-                db.commit()
+                # Update the DB trade record if one exists
+                trade = db_trades_by_ticker.get(ticker)
+                if trade:
+                    pnl = (sell_price - trade.buy_price) * trade.shares
+                    pnl_pct = ((sell_price - trade.buy_price) / trade.buy_price * 100) if trade.buy_price else 0
 
-                emoji = "🟢" if pnl >= 0 else "🔴"
-                log_event(db, "sell",
-                          f"{emoji} Sold {trade.shares} shares of {trade.ticker} "
-                          f"@ ${sell_price:.2f} | P&L: ${pnl:+.2f} ({pnl_pct:+.2f}%)")
+                    trade.sell_price = sell_price
+                    trade.sell_time = datetime.now(timezone.utc)
+                    trade.status = "closed"
+                    trade.pnl = round(pnl, 2)
+                    trade.pnl_pct = round(pnl_pct, 2)
+                    db.commit()
+
+                    emoji = "🟢" if pnl >= 0 else "🔴"
+                    log_event(db, "sell",
+                              f"{emoji} Sold {trade.shares} shares of {ticker} "
+                              f"@ ${sell_price:.2f} | P&L: ${pnl:+.2f} ({pnl_pct:+.2f}%)")
+                else:
+                    # Position existed in IBKR but not in our DB (e.g. held overnight,
+                    # bought manually, or carried over from a previous session).
+                    log_event(db, "sell",
+                              f"✅ Sold {shares} shares of {ticker} @ ${sell_price:.2f} "
+                              f"(untracked position — no matching DB record)")
             else:
-                trade.status = "error"
-                db.commit()
+                # Mark any matching DB trade as errored
+                trade = db_trades_by_ticker.get(ticker)
+                if trade:
+                    trade.status = "error"
+                    db.commit()
                 log_event(db, "sell",
-                          f"❌ Sell failed for {trade.ticker}: {result.get('error')}", "ERROR")
+                          f"❌ Sell failed for {ticker}: {result.get('error')}", "ERROR")
 
         client.disconnect()
         log_event(db, "sell", "Afternoon sell job complete.")
