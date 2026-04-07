@@ -40,9 +40,9 @@ export default function TradeHistoryTab({ authFetch }: { authFetch: AuthFetch })
   const [expandedId, setExpandedId] = useState<number | null>(null);
 
   const fetchTrades = useCallback(async () => {
-    const params = filter !== 'all' ? `?status=${filter}` : '';
+    const params = filter !== 'all' ? `&status=${filter}` : '';
     try {
-      const res = await authFetch(`/api/trades${params}&limit=100`);
+      const res = await authFetch(`/api/trades?limit=100${params}`);
       const json = await res.json();
       setTrades(json.trades ?? []);
       setTotal(json.total ?? 0);
