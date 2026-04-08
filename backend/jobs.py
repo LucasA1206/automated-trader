@@ -8,6 +8,15 @@ from trader import IBKRClient
 
 logger = logging.getLogger(__name__)
 
+
+def _build_strategy_plan(trading_mode: str, paper_strategy: str, available_cash: float, net_liq: float) -> tuple[float, int, str]:
+    """Return the daily budget, position cap, and a human-readable strategy label."""
+    if trading_mode == "live":
+        return available_cash * 0.5, 3, "live cash account / 3 stocks"
+    if paper_strategy == "margin":
+        return available_cash, 5, "paper margin simulation / 5 stocks"
+    return available_cash * 0.5, 3, "paper cash simulation / 3 stocks"
+
 # ---------------------------------------------------------------------------
 # Persistent keepalive — a single IBKRClient that stays connected between jobs
 # so the gateway never idles out.  Managed by start_persistent_keepalive() /
@@ -102,22 +111,10 @@ def job_morning_scan_and_buy():
             return
 
         trading_mode = get_setting(db, "trading_mode", "paper")
-        daily_budget_pct = float(get_setting(db, "daily_budget_pct", "100")) / 100
-        max_positions = int(get_setting(db, "max_positions", "5"))
+        account_type = get_setting(db, "account_type", "trading_cash")
+        paper_strategy = get_setting(db, "paper_strategy", "cash")
 
-        log_event(db, "scan", f"Starting morning scan. Mode: {trading_mode}, "
-                              f"Budget: {daily_budget_pct*100:.0f}%")
-
-        # Step 1: AI Scan
-        recommendations = run_daily_scan()
-        if not recommendations:
-            log_event(db, "scan", "No stocks recommended by AI today. No trades placed.")
-            return
-
-        tickers_str = ", ".join(r["ticker"] for r in recommendations)
-        log_event(db, "scan", f"AI recommended {len(recommendations)} stock(s): {tickers_str}")
-
-        # Step 2: Connect to IBKR
+        # Connect to IBKR to get account balance
         client = IBKRClient(trading_mode=trading_mode)
         connected = client.connect()
         if not connected:
@@ -127,23 +124,40 @@ def job_morning_scan_and_buy():
         # Keep the connection alive while we iterate through buy orders
         client.start_keepalive(interval=30)
 
-        # Step 3: Get available cash
+        # Get available cash and net liquidation
         account = client.get_account_summary()
         available_cash = account.get("AvailableFunds", 0)
+        net_liq = account.get("NetLiquidation", 0)
+
         if available_cash <= 0:
-            log_event(db, "ibkr", "No available funds. Aborting.", "ERROR")
+            log_event(db, "ibkr", f"No available funds (${available_cash:.2f}). Aborting.", "ERROR")
             client.disconnect()
             return
 
-        daily_budget = available_cash * daily_budget_pct
-        # Cap to max_positions stocks
+        daily_budget, max_positions, strategy_label = _build_strategy_plan(trading_mode, paper_strategy, available_cash, net_liq)
+
+        log_event(db, "scan", f"Starting morning scan. Mode: {trading_mode}, "
+                              f"Account: {account_type}, Strategy: {strategy_label}, "
+                              f"Budget: ${daily_budget:,.2f}")
+
+        # Step 1: AI Scan
+        recommendations = run_daily_scan()
+        if not recommendations:
+            log_event(db, "scan", "No stocks recommended by AI today. No trades placed.")
+            client.disconnect()
+            return
+
+        tickers_str = ", ".join(r["ticker"] for r in recommendations)
+        log_event(db, "scan", f"AI recommended {len(recommendations)} stock(s): {tickers_str}")
+
+        # Step 2: Cap to max_positions stocks
         picks = recommendations[:max_positions]
         budget_per_trade = daily_budget / len(picks)
 
         log_event(db, "system",
-                  f"Available cash: ${available_cash:,.2f} | "
-                  f"Daily budget: ${daily_budget:,.2f} | "
-                  f"Per trade: ${budget_per_trade:,.2f}")
+              f"Net Liq: ${net_liq:,.2f} | Available cash: ${available_cash:,.2f} | "
+              f"Today's budget: ${daily_budget:,.2f} | "
+              f"Per trade: ${budget_per_trade:,.2f}")
 
         # Step 4: Place buy orders
         for rec in picks:

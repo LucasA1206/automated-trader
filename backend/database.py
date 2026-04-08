@@ -20,9 +20,12 @@ def init_db():
     try:
         defaults = {
             "trading_mode": "paper",      # paper | live
-            "daily_budget_pct": "100",    # percentage of cash to use per day
-            "max_positions": "5",         # max simultaneous open trades
+            "account_type": "trading_cash",   # trading_cash | investment_cash
+            "paper_strategy": "cash",         # cash | margin comparison preset
+            "daily_budget_pct": "50",         # derived from paper_strategy
+            "max_positions": "3",             # derived from paper_strategy
             "scan_enabled": "true",       # pause/resume auto scanning
+            "margin_upgrade_alerted": "false",
         }
         for key, value in defaults.items():
             existing = db.query(Setting).filter(Setting.key == key).first()

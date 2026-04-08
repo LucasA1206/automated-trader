@@ -4,9 +4,11 @@ import { useEffect, useState, useCallback } from 'react';
 
 interface Settings {
   trading_mode: string;
+  paper_strategy: string;
   daily_budget_pct: string;
   max_positions: string;
   scan_enabled: string;
+  account_type: string;
 }
 
 type AuthFetch = (url: string, init?: RequestInit) => Promise<Response>;
@@ -19,9 +21,11 @@ interface Props {
 export default function SettingsTab({ onModeChange, authFetch }: Props) {
   const [settings, setSettings] = useState<Settings>({
     trading_mode: 'paper',
+    paper_strategy: 'cash',
     daily_budget_pct: '100',
     max_positions: '5',
     scan_enabled: 'true',
+    account_type: 'trading_cash',
   });
   const [saving, setSaving] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -35,7 +39,7 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
     const res = await authFetch('/api/settings');
     const data = await res.json();
     setSettings(data);
-  }, []);
+  }, [authFetch]);
 
   useEffect(() => {
     fetchSettings();
@@ -133,9 +137,11 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
   };
 
   const isLive = settings.trading_mode === 'live';
-  const budgetPct = parseInt(settings.daily_budget_pct, 10) || 100;
-  const maxPos = parseInt(settings.max_positions, 10) || 5;
+  const isTradingCash = settings.account_type === 'trading_cash';
+  const paperStrategy = settings.paper_strategy === 'margin' ? 'margin' : 'cash';
   const scanEnabled = settings.scan_enabled === 'true';
+  const strategyBudgetPct = parseInt(settings.daily_budget_pct, 10) || (paperStrategy === 'cash' ? 50 : 100);
+  const strategyMaxPositions = parseInt(settings.max_positions, 10) || (paperStrategy === 'cash' ? 3 : 5);
 
   return (
     <div>
@@ -276,54 +282,219 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
         </div>
       </div>
 
-      {/* Budget */}
+      {/* Account Type */}
       <div className="settings-section">
-        <h3>Daily Budget</h3>
-        <p>How much of your available cash the bot is allowed to use each trading day.</p>
+        <h3>IBKR Account Type</h3>
+        <p>
+          Your live IBKR account is cash-only, so this setting reflects the actual account type rather than a margin strategy.
+        </p>
 
         <div className="setting-row">
           <div className="setting-info">
-            <div className="setting-label">Daily Cash Budget</div>
-            <div className="setting-desc">Percentage of available IBKR cash used for buying stocks today.</div>
+            <div className="setting-label">
+              Trading Account
+              <span
+                className={`badge ${isTradingCash ? 'paper' : 'live'}`}
+                style={{ marginLeft: 10, fontSize: 10 }}
+              >
+                {isTradingCash ? 'TRADING ACCOUNT (CASH)' : 'INVESTMENT ACCOUNT (CASH)'}
+              </span>
+            </div>
+            <div className="setting-desc">
+              {isTradingCash
+                ? 'Trading Account (Cash) is suited to active trading and settled-cash rotation.'
+                : 'Investment Account (Cash) is the other cash-only IBKR account type.'}
+            </div>
           </div>
-          <div className="range-container">
-            <input
-              id="range-budget"
-              type="range"
-              min={5}
-              max={100}
-              step={5}
-              value={budgetPct}
-              onChange={(e) => {
-                setSettings((prev) => ({ ...prev, daily_budget_pct: e.target.value }));
-              }}
-              onMouseUp={(e) => save({ daily_budget_pct: (e.target as HTMLInputElement).value })}
-              onTouchEnd={(e) => save({ daily_budget_pct: (e.target as HTMLInputElement).value })}
-            />
-            <div className="range-value">{budgetPct}%</div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button
+              className={`filter-btn ${isTradingCash ? 'active' : ''}`}
+              onClick={() => save({ account_type: 'trading_cash' })}
+              disabled={saving}
+            >
+              Trading Account (Cash)
+            </button>
+            <button
+              className={`filter-btn ${!isTradingCash ? 'active' : ''}`}
+              onClick={() => save({ account_type: 'investment_cash' })}
+              disabled={saving}
+            >
+              Investment Account (Cash)
+            </button>
           </div>
         </div>
 
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+            gap: 12,
+            marginTop: 16,
+          }}
+        >
+          <div
+            style={{
+              background: 'var(--bg-secondary)',
+              border: '1px solid var(--border)',
+              borderRadius: 12,
+              padding: '14px 16px',
+            }}
+          >
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+              Daily Budget
+            </div>
+            <div style={{ fontSize: 22, fontWeight: 700, marginTop: 6 }}>
+              {strategyBudgetPct}%
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+              of available cash for the daily buy cycle
+            </div>
+          </div>
+          <div
+            style={{
+              background: 'var(--bg-secondary)',
+              border: '1px solid var(--border)',
+              borderRadius: 12,
+              padding: '14px 16px',
+            }}
+          >
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+              Stocks Per Day
+            </div>
+            <div style={{ fontSize: 22, fontWeight: 700, marginTop: 6 }}>
+              {strategyMaxPositions}
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+              maximum picks the bot will buy in one scan
+            </div>
+          </div>
+          <div
+            style={{
+              background: 'rgba(59,130,246,0.08)',
+              border: '1px solid rgba(59,130,246,0.2)',
+              borderRadius: 12,
+              padding: '14px 16px',
+            }}
+          >
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+              Live Threshold
+            </div>
+            <div style={{ fontSize: 22, fontWeight: 700, marginTop: 6 }}>
+              $25,000
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+              Cash strategy shows a one-time upgrade alert on the Portfolio screen once live equity crosses this level.
+            </div>
+          </div>
+        </div>
+
+        {settings.trading_mode === 'paper' && (
+          <div style={{ marginTop: 14, padding: '12px 14px', borderRadius: 10, background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.18)', color: 'var(--text-primary)', fontSize: 13, lineHeight: 1.6 }}>
+            Paper mode can still simulate either Cash or Margin strategy in the section below, so you can compare growth without placing real orders.
+          </div>
+        )}
+      </div>
+
+      <div className="settings-section">
+        <h3>Paper Simulation Strategy</h3>
+        <p>Use this to compare Cash versus Margin growth in paper trading. Live trading stays cash-only.</p>
+
         <div className="setting-row">
           <div className="setting-info">
-            <div className="setting-label">Max Simultaneous Positions</div>
-            <div className="setting-desc">Maximum number of stocks to hold at once (budget is split equally).</div>
+            <div className="setting-label">
+              Paper Strategy
+              <span
+                className={`badge ${paperStrategy === 'cash' ? 'paper' : 'live'}`}
+                style={{ marginLeft: 10, fontSize: 10 }}
+              >
+                {paperStrategy === 'cash' ? 'CASH' : 'MARGIN'}
+              </span>
+            </div>
+            <div className="setting-desc">
+              {paperStrategy === 'cash'
+                ? 'Cash simulation: 3 stocks per day using 50% of cash.'
+                : 'Margin simulation: 5 stocks per day using 100% of available funds.'}
+            </div>
           </div>
-          <div className="range-container">
-            <input
-              id="range-max-positions"
-              type="range"
-              min={1}
-              max={10}
-              step={1}
-              value={maxPos}
-              onChange={(e) => {
-                setSettings((prev) => ({ ...prev, max_positions: e.target.value }));
-              }}
-              onMouseUp={(e) => save({ max_positions: (e.target as HTMLInputElement).value })}
-              onTouchEnd={(e) => save({ max_positions: (e.target as HTMLInputElement).value })}
-            />
-            <div className="range-value">{maxPos}</div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button
+              className={`filter-btn ${paperStrategy === 'cash' ? 'active' : ''}`}
+              onClick={() => save({ paper_strategy: 'cash' })}
+              disabled={saving}
+            >
+              Cash
+            </button>
+            <button
+              className={`filter-btn ${paperStrategy === 'margin' ? 'active' : ''}`}
+              onClick={() => save({ paper_strategy: 'margin' })}
+              disabled={saving}
+            >
+              Margin
+            </button>
+          </div>
+        </div>
+
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+            gap: 12,
+            marginTop: 16,
+          }}
+        >
+          <div
+            style={{
+              background: 'var(--bg-secondary)',
+              border: '1px solid var(--border)',
+              borderRadius: 12,
+              padding: '14px 16px',
+            }}
+          >
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+              Daily Budget
+            </div>
+            <div style={{ fontSize: 22, fontWeight: 700, marginTop: 6 }}>
+              {strategyBudgetPct}%
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+              of available cash for the daily buy cycle
+            </div>
+          </div>
+          <div
+            style={{
+              background: 'var(--bg-secondary)',
+              border: '1px solid var(--border)',
+              borderRadius: 12,
+              padding: '14px 16px',
+            }}
+          >
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+              Stocks Per Day
+            </div>
+            <div style={{ fontSize: 22, fontWeight: 700, marginTop: 6 }}>
+              {strategyMaxPositions}
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+              maximum picks the bot will buy in one scan
+            </div>
+          </div>
+          <div
+            style={{
+              background: 'rgba(59,130,246,0.08)',
+              border: '1px solid rgba(59,130,246,0.2)',
+              borderRadius: 12,
+              padding: '14px 16px',
+            }}
+          >
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+              Live Threshold
+            </div>
+            <div style={{ fontSize: 22, fontWeight: 700, marginTop: 6 }}>
+              $25,000
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+              Live cash accounts show an alert here once they cross this level.
+            </div>
           </div>
         </div>
       </div>

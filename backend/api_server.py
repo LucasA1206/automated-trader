@@ -24,6 +24,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+MARGIN_UPGRADE_THRESHOLD = 25_000.0
+
 # ─── Scheduler (global) ───────────────────────────────────────────────────
 scheduler = None
 
@@ -86,9 +88,56 @@ class SettingUpdate(BaseModel):
 
 class SettingsBulkUpdate(BaseModel):
     trading_mode: Optional[str] = None
+    paper_strategy: Optional[str] = None
     daily_budget_pct: Optional[str] = None
     max_positions: Optional[str] = None
     scan_enabled: Optional[str] = None
+    account_type: Optional[str] = None
+
+
+def _sync_strategy_settings(db: Session, account_type: str) -> None:
+    """Keep derived strategy settings aligned with the selected strategy preset."""
+    if account_type == "margin":
+        set_setting(db, "daily_budget_pct", "100")
+        set_setting(db, "max_positions", "5")
+    else:
+        set_setting(db, "daily_budget_pct", "50")
+        set_setting(db, "max_positions", "3")
+
+
+def _normalize_account_type(value: str | None) -> str:
+    if value in ("trading_cash", "investment_cash"):
+        return value
+    return "trading_cash"
+
+
+def _normalize_paper_strategy(value: str | None, legacy_account_type: str | None = None) -> str:
+    if value in ("cash", "margin"):
+        return value
+    if legacy_account_type == "margin":
+        return "margin"
+    return "cash"
+
+
+def _build_margin_upgrade_alert(db: Session, trading_mode: str, account_type: str, net_liq: float) -> dict | None:
+    """Return a one-time alert when a live cash account crosses $25k."""
+    if trading_mode != "live" or account_type not in ("trading_cash", "investment_cash") or net_liq < MARGIN_UPGRADE_THRESHOLD:
+        return None
+
+    alerted = get_setting(db, "margin_upgrade_alerted", "false").lower() == "true"
+    if alerted:
+        return None
+
+    set_setting(db, "margin_upgrade_alerted", "true")
+    return {
+        "type": "margin_upgrade",
+        "threshold": MARGIN_UPGRADE_THRESHOLD,
+        "message": (
+            f"Net liquidation is now ${net_liq:,.2f}. "
+            f"This IBKR account is cash-only, so the live bot stays on the Cash strategy. "
+            f"Use Paper Mode to compare Cash vs Margin setups."
+        ),
+    }
 
 
 # ─── Auth ─────────────────────────────────────────────────────────────────
@@ -137,12 +186,20 @@ def get_portfolio(db: Session = Depends(get_db)):
             }
         positions = client.get_positions()
         account = client.get_account_summary()
+        raw_account_type = get_setting(db, "account_type", "trading_cash")
+        account_type = _normalize_account_type(raw_account_type)
+        paper_strategy = _normalize_paper_strategy(get_setting(db, "paper_strategy", None), raw_account_type)
+        net_liq = account.get("NetLiquidation", 0)
+        strategy_alert = _build_margin_upgrade_alert(db, trading_mode, account_type, net_liq)
         client.disconnect()
         return {
             "connected": True,
             "mode": trading_mode,
+            "account_type": account_type,
+            "paper_strategy": paper_strategy,
             "positions": positions,
             "account": account,
+            "strategy_alert": strategy_alert,
         }
     except Exception as e:
         logger.error(f"Portfolio fetch error: {e}")
@@ -222,8 +279,14 @@ def get_logs(
 @app.get("/api/settings", dependencies=[Depends(require_auth)])
 def get_settings(db: Session = Depends(get_db)):
     """Returns all user-configurable settings."""
-    settings = db.query(Setting).all()
-    return {s.key: s.value for s in settings}
+    settings = {s.key: s.value for s in db.query(Setting).all()}
+    settings["account_type"] = _normalize_account_type(settings.get("account_type"))
+    settings["paper_strategy"] = _normalize_paper_strategy(settings.get("paper_strategy"), settings.get("account_type"))
+    if "daily_budget_pct" not in settings:
+        settings["daily_budget_pct"] = "50" if settings["paper_strategy"] == "cash" else "100"
+    if "max_positions" not in settings:
+        settings["max_positions"] = "3" if settings["paper_strategy"] == "cash" else "5"
+    return settings
 
 
 @app.put("/api/settings", dependencies=[Depends(require_auth)])
@@ -240,9 +303,23 @@ def update_settings(body: SettingsBulkUpdate, db: Session = Depends(get_db)):
         pct = float(updates["daily_budget_pct"])
         if not (1 <= pct <= 100):
             raise HTTPException(status_code=400, detail="daily_budget_pct must be 1-100")
+    if "account_type" in updates and updates["account_type"] not in ("trading_cash", "investment_cash", "cash"):
+        raise HTTPException(status_code=400, detail="account_type must be 'trading_cash' or 'investment_cash'")
+    if "paper_strategy" in updates and updates["paper_strategy"] not in ("cash", "margin"):
+        raise HTTPException(status_code=400, detail="paper_strategy must be 'cash' or 'margin'")
 
     for key, value in updates.items():
         set_setting(db, key, str(value))
+
+    if "paper_strategy" in updates:
+        _sync_strategy_settings(db, updates["paper_strategy"])
+
+    if "account_type" in updates:
+        account_type = _normalize_account_type(updates["account_type"])
+        if account_type == "trading_cash":
+            # Reset the one-time live upgrade alert so it can fire again if the
+            # user switches to a different cash account type later.
+            set_setting(db, "margin_upgrade_alerted", "false")
 
     # Log trading mode change and restart the persistent keepalive on the new port
     if "trading_mode" in updates:
