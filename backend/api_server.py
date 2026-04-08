@@ -15,6 +15,7 @@ from models import Trade, SystemLog, Setting
 from scheduler import create_scheduler, get_next_job_times
 from trader import IBKRClient
 from auth import require_auth, validate_credentials, create_access_token
+from jobs import start_persistent_keepalive, stop_persistent_keepalive
 
 # ─── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -35,7 +36,23 @@ async def lifespan(app: FastAPI):
     scheduler = create_scheduler()
     scheduler.start()
     logger.info("✅ Scheduler started.")
+
+    # Start a persistent IBKR connection that keeps the gateway alive between jobs.
+    # Run in a regular thread since IBKRClient is synchronous.
+    import threading
+    db = SessionLocal()
+    trading_mode = get_setting(db, "trading_mode", "paper")
+    db.close()
+    threading.Thread(
+        target=start_persistent_keepalive,
+        args=(trading_mode,),
+        daemon=True,
+        name="ibkr-startup-keepalive",
+    ).start()
+
     yield
+
+    stop_persistent_keepalive()
     if scheduler and scheduler.running:
         scheduler.shutdown(wait=False)
     logger.info("🛑 Blitz Trader API shut down.")

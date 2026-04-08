@@ -44,6 +44,44 @@ class IBKRClient:
         # Fixed per-instance clientId — only rotated on duplicate-client error (code 326).
         # Keeping it stable prevents ghost slots from accumulating on the gateway.
         self._client_id = random.randint(10, 999)
+        self._keepalive_thread: threading.Thread | None = None
+        self._keepalive_stop = threading.Event()
+
+    def start_keepalive(self, interval: int = 30) -> None:
+        """Start a background thread that keeps the IB Gateway connection alive.
+
+        Every `interval` seconds the thread calls ib.reqAccountUpdates() which
+        resets the gateway's idle-disconnect timer.  This prevents the gateway
+        from dropping us after ~60 s of client silence.
+        """
+        if self._keepalive_thread and self._keepalive_thread.is_alive():
+            return  # already running
+
+        self._keepalive_stop.clear()
+
+        def _loop():
+            logger.info("IBKR keepalive thread started (interval=%ds).", interval)
+            while not self._keepalive_stop.wait(timeout=interval):
+                try:
+                    if self.ib.isConnected():
+                        # reqAccountUpdates is a lightweight round-trip that
+                        # resets the gateway's idle timer without creating
+                        # persistent subscriptions.
+                        self.ib.reqAccountUpdates(True, "")
+                        logger.debug("IBKR keepalive ping sent.")
+                    else:
+                        logger.warning("IBKR keepalive: connection lost — attempting reconnect.")
+                        self.connect()
+                except Exception as exc:
+                    logger.warning("IBKR keepalive error: %s", exc)
+            logger.info("IBKR keepalive thread stopped.")
+
+        self._keepalive_thread = threading.Thread(target=_loop, daemon=True, name="ibkr-keepalive")
+        self._keepalive_thread.start()
+
+    def stop_keepalive(self) -> None:
+        """Signal the keepalive thread to exit."""
+        self._keepalive_stop.set()
 
     def connect(self, retries: int = 5, delay: int = 10) -> bool:
         """Connect to IB Gateway with retry logic.
@@ -171,6 +209,7 @@ class IBKRClient:
         return False
 
     def disconnect(self):
+        self.stop_keepalive()
         if self.ib.isConnected():
             self.ib.disconnect()
             logger.info("Disconnected from IB Gateway.")
@@ -196,10 +235,24 @@ class IBKRClient:
         Uses ib.portfolio() instead of reqMktData so we do not need live market
         data subscriptions — the portfolio update event already carries
         marketPrice, marketValue, and unrealizedPNL from the gateway.
+
+        After connect we wait up to 8 s for the portfolio snapshot to arrive so
+        that a fresh connection always returns the full list of positions.
         """
         try:
             if not self.ib.isConnected():
                 self.connect()
+
+            # Force a fresh portfolio snapshot by requesting account updates.
+            # Wait up to 8 s for data to arrive — critical for the sell job.
+            self.ib.reqAccountUpdates(True, "")
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                self.ib.sleep(0.5)
+                if self.ib.portfolio():
+                    break  # data arrived
+            # Cancel the subscription — we got what we needed.
+            self.ib.reqAccountUpdates(False, "")
 
             portfolio_items = self.ib.portfolio()
             result = []
@@ -225,6 +278,7 @@ class IBKRClient:
                     "pnl_pct": round(safe_float(pnl_pct), 2),
                 })
 
+            logger.info("get_positions: found %d live position(s) in IBKR.", len(result))
             return result
         except Exception as e:
             logger.error(f"Failed to fetch positions: {e}")
