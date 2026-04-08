@@ -570,7 +570,7 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 4 }}>
           {[
             { time: '09:20 ET', action: 'AI Market Scan + Buy Orders', icon: '🔍', color: 'var(--cat-scan)' },
-            { time: '15:50 ET', action: 'Sell All Open Positions', icon: '💰', color: 'var(--cat-sell)' },
+            { time: '15:30 ET', action: 'Sell All Open Positions', icon: '💰', color: 'var(--cat-sell)' },
           ].map((job) => (
             <div
               key={job.time}
