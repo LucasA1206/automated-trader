@@ -1,4 +1,5 @@
 import logging
+import threading
 from datetime import datetime, timezone
 from database import SessionLocal, get_setting
 from models import Trade, SystemLog
@@ -7,6 +8,49 @@ from trader import IBKRClient
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Persistent keepalive — a single IBKRClient that stays connected between jobs
+# so the gateway never idles out.  Managed by start_persistent_keepalive() /
+# stop_persistent_keepalive() which are called from api_server.py on startup /
+# shutdown.
+# ---------------------------------------------------------------------------
+_persistent_client: IBKRClient | None = None
+_persistent_client_lock = threading.Lock()
+
+
+def start_persistent_keepalive(trading_mode: str = "paper") -> None:
+    """Connect a long-lived IBKRClient and keep it alive in the background.
+
+    This prevents the IB Gateway from dropping the connection during the quiet
+    periods between the morning buy and afternoon sell jobs.
+    """
+    global _persistent_client
+    with _persistent_client_lock:
+        if _persistent_client is not None:
+            return  # already running
+        client = IBKRClient(trading_mode=trading_mode)
+        if client.connect():
+            client.start_keepalive(interval=30)
+            _persistent_client = client
+            logger.info("Persistent IBKR keepalive started (mode=%s).", trading_mode)
+        else:
+            logger.warning("Persistent IBKR keepalive: could not connect on startup. "
+                           "Will retry when a job next runs.")
+
+
+def stop_persistent_keepalive() -> None:
+    """Gracefully shut down the persistent keepalive client."""
+    global _persistent_client
+    with _persistent_client_lock:
+        if _persistent_client is not None:
+            _persistent_client.disconnect()
+            _persistent_client = None
+            logger.info("Persistent IBKR keepalive stopped.")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def log_event(db, category: str, message: str, level: str = "INFO"):
     """Helper to write a system log entry."""
@@ -20,6 +64,28 @@ def log_event(db, category: str, message: str, level: str = "INFO"):
     db.commit()
     logger.info(f"[{category.upper()}] {message}")
 
+
+def _reconcile_stale_db_trades(db, live_tickers: set[str], log_fn) -> None:
+    """Close any DB trades marked 'open' for tickers no longer held in IBKR.
+
+    This fixes the discrepancy between the portfolio count and trade history count
+    caused by trades that failed to sell (or were sold manually / outside the system).
+    """
+    open_trades = db.query(Trade).filter(Trade.status == "open").all()
+    for trade in open_trades:
+        if trade.ticker not in live_tickers:
+            trade.status = "closed"
+            trade.sell_time = datetime.now(timezone.utc)
+            # sell_price/pnl left as None — we don't know the actual exit price
+            db.commit()
+            log_fn(db, "sell",
+                   f"⚠️ Reconciled stale DB record for {trade.ticker} "
+                   f"(marked closed — not found in live IBKR positions).")
+
+
+# ---------------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------------
 
 def job_morning_scan_and_buy():
     """
@@ -57,6 +123,9 @@ def job_morning_scan_and_buy():
         if not connected:
             log_event(db, "ibkr", "Failed to connect to IB Gateway. Aborting trades.", "ERROR")
             return
+
+        # Keep the connection alive while we iterate through buy orders
+        client.start_keepalive(interval=30)
 
         # Step 3: Get available cash
         account = client.get_account_summary()
@@ -119,15 +188,19 @@ def job_morning_scan_and_buy():
 
 def job_afternoon_sell():
     """
-    Runs at 15:50 ET weekdays:
+    Runs at 15:30 ET weekdays (30 min before NYSE close):
     Sells ALL open positions held in the IBKR account — not just the ones
     bought by this morning's job.  Any position found live in the broker
     account will be sold, regardless of whether it exists in the local DB.
+
+    After selling, any DB trades still marked 'open' for tickers that are no
+    longer in IBKR are reconciled (marked closed) to keep the trade history
+    count consistent with the portfolio count.
     """
     db = SessionLocal()
     try:
         trading_mode = get_setting(db, "trading_mode", "paper")
-        log_event(db, "sell", "Starting afternoon sell-all job.")
+        log_event(db, "sell", "Starting afternoon sell-all job (30 min before close).")
 
         client = IBKRClient(trading_mode=trading_mode)
         connected = client.connect()
@@ -136,11 +209,22 @@ def job_afternoon_sell():
                       "Failed to connect to IB Gateway for sell job.", "ERROR")
             return
 
-        # Fetch live positions directly from IBKR — this captures everything
+        # Keep the connection alive while we iterate through sell orders
+        client.start_keepalive(interval=30)
+
+        # Fetch live positions directly from IBKR — this captures EVERYTHING
         # in the account, including positions not bought by today's morning job.
+        # get_positions() now waits up to 8 s for the portfolio snapshot so we
+        # are guaranteed to see all holdings after a fresh connect.
         live_positions = client.get_positions()
+
+        live_tickers = {p["ticker"] for p in live_positions}
+
         if not live_positions:
-            log_event(db, "sell", "No live positions found in IBKR account. Nothing to sell.")
+            log_event(db, "sell",
+                      "No live positions found in IBKR account. "
+                      "Reconciling any stale DB records.")
+            _reconcile_stale_db_trades(db, live_tickers, log_event)
             client.disconnect()
             return
 
@@ -152,6 +236,8 @@ def job_afternoon_sell():
         open_trades = db.query(Trade).filter(Trade.status == "open").all()
         db_trades_by_ticker = {t.ticker: t for t in open_trades}
 
+        sold_tickers: set[str] = set()
+
         for position in live_positions:
             ticker = position["ticker"]
             shares = position["shares"]
@@ -162,6 +248,7 @@ def job_afternoon_sell():
 
             if result["success"]:
                 sell_price = result["price"]
+                sold_tickers.add(ticker)
 
                 # Update the DB trade record if one exists
                 trade = db_trades_by_ticker.get(ticker)
@@ -194,6 +281,10 @@ def job_afternoon_sell():
                     db.commit()
                 log_event(db, "sell",
                           f"❌ Sell failed for {ticker}: {result.get('error')}", "ERROR")
+
+        # Reconcile any DB open records for tickers that weren't in IBKR at all —
+        # these are "ghost" records from previous sessions that were never closed.
+        _reconcile_stale_db_trades(db, live_tickers, log_event)
 
         client.disconnect()
         log_event(db, "sell", "Afternoon sell job complete.")

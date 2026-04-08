@@ -33,13 +33,13 @@ def create_scheduler() -> BackgroundScheduler:
         misfire_grace_time=300,  # 5min grace window
     )
 
-    # 15:50 ET Mon-Fri — sell all positions (10min before close)
+    # 15:30 ET Mon-Fri — sell all positions (30min before close)
     scheduler.add_job(
         func=job_afternoon_sell,
         trigger=CronTrigger(
             day_of_week="mon-fri",
             hour=15,
-            minute=50,
+            minute=30,
             timezone=ET,
         ),
         id="afternoon_sell",
