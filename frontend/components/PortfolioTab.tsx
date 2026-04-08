@@ -34,8 +34,15 @@ interface Account {
 interface PortfolioData {
   connected: boolean;
   mode: string;
+  account_type?: string;
+  paper_strategy?: string;
   positions: Position[];
   account: Account;
+  strategy_alert?: {
+    type: string;
+    threshold?: number;
+    message: string;
+  } | null;
   error?: string;
 }
 
@@ -260,6 +267,30 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
               {data.error === 'Failed to reach API server'
                 ? 'The backend server is not responding. Check Railway deployment logs.'
                 : 'The IB Gateway service is starting up or awaiting IBKR login. Check Railway → ib-gateway service logs. You may need to approve 2FA on your IBKR Mobile app.'}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Strategy upgrade alert */}
+      {data?.strategy_alert && (
+        <div style={{
+          display: 'flex',
+          alignItems: 'flex-start',
+          gap: 12,
+          padding: '14px 16px',
+          borderRadius: 12,
+          marginBottom: 20,
+          background: 'linear-gradient(135deg, rgba(59,130,246,0.14) 0%, rgba(59,130,246,0.06) 100%)',
+          border: '1px solid rgba(59,130,246,0.24)',
+        }}>
+          <span style={{ fontSize: 16, flexShrink: 0 }}>ℹ️</span>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--accent-blue)', marginBottom: 2 }}>
+              Cash account threshold reached
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+              {data.strategy_alert.message}
             </div>
           </div>
         </div>
