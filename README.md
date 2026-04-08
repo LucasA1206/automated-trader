@@ -11,7 +11,7 @@ Automated NASDAQ day trading bot with AI-powered stock scanning and a Next.js da
 | Trading | IBKR via `ib_insync` |
 | AI Scanner | Google Gemini 1.5 Flash + NewsAPI |
 | Database | PostgreSQL (Railway) / SQLite (local) |
-| Scheduler | APScheduler (09:20 ET scan, 15:50 ET sell) |
+| Scheduler | APScheduler (09:20 ET scan, 15:30 ET sell) |
 | Hosting | Railway (backend) + Vercel (frontend) |
 | Domain | www.blitz-trader.com |
 
@@ -19,7 +19,7 @@ Automated NASDAQ day trading bot with AI-powered stock scanning and a Next.js da
 
 1. **09:20 ET** — AI scans NASDAQ news via NewsAPI + Gemini, picks top stocks
 2. **09:30 ET** — Market opens, buy orders are already placed
-3. **15:50 ET** — All positions sold before market close
+3. **15:30 ET** — All positions sold before market close
 4. Repeat daily, fully automated in the cloud
 
 ## Project Structure
