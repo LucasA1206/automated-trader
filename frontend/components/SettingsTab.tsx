@@ -55,7 +55,7 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
         body: JSON.stringify(patch),
       });
       if (res.ok) {
-        setSettings((prev) => ({ ...prev, ...patch }));
+        await fetchSettings();
         setSaveMsg('✅ Saved successfully');
         if (patch.trading_mode) {
           onModeChange(patch.trading_mode as 'paper' | 'live');
