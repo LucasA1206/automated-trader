@@ -244,16 +244,28 @@ def update_settings(body: SettingsBulkUpdate, db: Session = Depends(get_db)):
     for key, value in updates.items():
         set_setting(db, key, str(value))
 
-    # Log trading mode change
+    # Log trading mode change and restart the persistent keepalive on the new port
     if "trading_mode" in updates:
-        from models import SystemLog
+        new_mode = updates["trading_mode"]
         db.add(SystemLog(
             timestamp=datetime.now(timezone.utc),
             level="INFO",
             category="system",
-            message=f"Trading mode changed to: {updates['trading_mode'].upper()}",
+            message=f"Trading mode changed to: {new_mode.upper()} — restarting IBKR keepalive.",
         ))
         db.commit()
+
+        # Restart the persistent keepalive so it connects to the correct IB Gateway port.
+        # paper → port 4004 | live → port 4003
+        import threading
+        stop_persistent_keepalive()
+        threading.Thread(
+            target=start_persistent_keepalive,
+            args=(new_mode,),
+            daemon=True,
+            name="ibkr-mode-switch-keepalive",
+        ).start()
+        logger.info("IBKR keepalive restarted for mode: %s", new_mode)
 
     return {"status": "updated", "settings": updates}
 
