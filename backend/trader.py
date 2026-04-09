@@ -67,7 +67,7 @@ class IBKRClient:
                         # reqAccountUpdates is a lightweight round-trip that
                         # resets the gateway's idle timer without creating
                         # persistent subscriptions.
-                        self.ib.reqAccountUpdates(True, "")
+                        self.ib.client.reqAccountUpdates(True, "")
                         logger.debug("IBKR keepalive ping sent.")
                     else:
                         logger.warning("IBKR keepalive: connection lost — attempting reconnect.")
@@ -245,14 +245,14 @@ class IBKRClient:
 
             # Force a fresh portfolio snapshot by requesting account updates.
             # Wait up to 8 s for data to arrive — critical for the sell job.
-            self.ib.reqAccountUpdates(True, "")
+            self.ib.client.reqAccountUpdates(True, "")
             deadline = time.monotonic() + 8
             while time.monotonic() < deadline:
                 self.ib.sleep(0.5)
                 if self.ib.portfolio():
                     break  # data arrived
             # Cancel the subscription — we got what we needed.
-            self.ib.reqAccountUpdates(False, "")
+            self.ib.client.reqAccountUpdates(False, "")
 
             portfolio_items = self.ib.portfolio()
             result = []
