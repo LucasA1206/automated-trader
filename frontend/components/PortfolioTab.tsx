@@ -50,6 +50,8 @@ interface DailyPnlPoint {
   date: string;
   daily_pnl: number;
   cumulative_pnl: number;
+  daily_pct?: number;
+  cumulative_pct?: number;
 }
 
 interface PnlHistory {
@@ -100,7 +102,7 @@ function PnlCell({ val, pct }: { val: number; pct: number }) {
 
 function ChartTooltip({ active, payload, label }: {
   active?: boolean;
-  payload?: { value: number; name: string; color: string }[];
+  payload?: { value: number; name: string; color: string; payload: DailyPnlPoint }[];
   label?: string;
 }) {
   if (!active || !payload || !payload.length) return null;
@@ -118,6 +120,9 @@ function ChartTooltip({ active, payload, label }: {
       </div>
       {payload.map((p, i) => {
         const isPos = p.value >= 0;
+        const isDaily = p.name === 'daily_pnl';
+        const pct = isDaily ? p.payload.daily_pct : p.payload.cumulative_pct;
+        const pctStr = pct !== undefined ? ` (${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)` : '';
         return (
           <div key={i} style={{
             fontSize: 13,
@@ -125,7 +130,7 @@ function ChartTooltip({ active, payload, label }: {
             color: isPos ? 'var(--accent-green)' : 'var(--accent-red)',
             fontFamily: "'JetBrains Mono', monospace",
           }}>
-            {p.name === 'daily_pnl' ? 'Day' : 'Total'}: {fmtSigned(p.value)}
+            {isDaily ? 'Day' : 'Total'}: {fmtSigned(p.value)}{pctStr}
           </div>
         );
       })}

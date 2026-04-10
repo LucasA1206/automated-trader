@@ -60,6 +60,14 @@ class IBKRClient:
         self._keepalive_stop.clear()
 
         def _loop():
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_closed():
+                    raise RuntimeError("closed")
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
             logger.info("IBKR keepalive thread started (interval=%ds).", interval)
             while not self._keepalive_stop.wait(timeout=interval):
                 try:
@@ -184,12 +192,14 @@ class IBKRClient:
                     )
                     return True
 
-            except ConnectionRefusedError:
-                # socat is up but the IB Gateway Java process hasn't bound port 4002 yet.
-                # This happens for ~15 s after the daily 11:59 PM auto-restart.
+            except (ConnectionRefusedError, TimeoutError) as e:
+                # socat is up but the IB Gateway Java process hasn't bound port 4002 yet,
+                # or it dropped the connection before API handshake completed.
+                # This happens for ~15-60 s after the daily 11:59 PM auto-restart.
+                err_name = type(e).__name__
                 logger.warning(
                     f"IBKR connect attempt {attempt + 1}/{retries} failed: "
-                    "Connection refused — IB Gateway is still starting up after its "
+                    f"{err_name} — IB Gateway is still starting up after its "
                     "daily restart. Will wait 20 s before retrying."
                 )
                 if attempt < retries - 1:
