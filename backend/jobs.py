@@ -180,6 +180,7 @@ def job_morning_scan_and_buy():
                     status="open",
                     order_id=result.get("order_id"),
                     ai_reason=reason,
+                    mode=trading_mode,
                 )
                 db.add(trade)
                 db.commit()

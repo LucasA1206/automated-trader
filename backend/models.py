@@ -21,6 +21,7 @@ class Trade(Base):
     sell_time = Column(DateTime(timezone=True), nullable=True)
     # open = bought but not yet sold, closed = sold, error = failed
     status = Column(String(20), default="open", nullable=False)
+    mode = Column(String(20), default="paper", nullable=False)
     pnl = Column(Float, nullable=True)
     pnl_pct = Column(Float, nullable=True)
     order_id = Column(String(50), nullable=True)

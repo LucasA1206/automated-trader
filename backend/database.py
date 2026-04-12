@@ -1,6 +1,7 @@
 import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy import text
 from models import Base, Setting
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./blitz_trader.db")
@@ -16,6 +17,14 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 def init_db():
     """Create all tables and seed default settings."""
     Base.metadata.create_all(bind=engine)
+    
+    # Safely migrate existing trades table to add 'mode' column
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE trades ADD COLUMN mode VARCHAR(20) DEFAULT 'paper' NOT NULL"))
+    except Exception:
+        pass  # Column likely already exists
+
     db = SessionLocal()
     try:
         defaults = {
