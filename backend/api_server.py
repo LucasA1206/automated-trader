@@ -215,7 +215,8 @@ def get_trades(
     db: Session = Depends(get_db),
 ):
     """Returns trade history, optionally filtered by status (open/closed/error)."""
-    query = db.query(Trade).order_by(Trade.buy_time.desc())
+    trading_mode = get_setting(db, "trading_mode", "paper")
+    query = db.query(Trade).filter(Trade.mode == trading_mode).order_by(Trade.buy_time.desc())
     if status:
         query = query.filter(Trade.status == status)
     total = query.count()
@@ -444,10 +445,12 @@ def get_pnl_history(db: Session = Depends(get_db)):
     """
     from sqlalchemy import func, cast, Date as SQLDate
 
-    # All closed trades with a sell_time and pnl
+    trading_mode = get_setting(db, "trading_mode", "paper")
+
+    # All closed trades with a sell_time and pnl in current mode
     closed_trades = (
         db.query(Trade)
-        .filter(Trade.status == "closed", Trade.sell_time.isnot(None), Trade.pnl.isnot(None))
+        .filter(Trade.status == "closed", Trade.sell_time.isnot(None), Trade.pnl.isnot(None), Trade.mode == trading_mode)
         .order_by(Trade.sell_time.asc())
         .all()
     )
