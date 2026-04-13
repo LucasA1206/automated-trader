@@ -242,19 +242,29 @@ class IBKRClient:
             aud_rate = by_curr.get("AUD", {}).get("ExchangeRate")
             if not aud_rate: aud_rate = 1.0
 
-            base = by_curr.get("BASE", {})
+            net_liq_base = 0.0
+            avail_base = 0.0
+            bp_base = 0.0
+            
+            for av in summary:
+                if av.tag == "NetLiquidation" and net_liq_base == 0.0:
+                    net_liq_base = safe_float(av.value)
+                elif av.tag == "AvailableFunds" and avail_base == 0.0:
+                    avail_base = safe_float(av.value)
+                elif av.tag == "BuyingPower" and bp_base == 0.0:
+                    bp_base = safe_float(av.value)
             
             result = {
                 # Core metrics in USD for trades/budget
-                "NetLiquidation": base.get("NetLiquidation", 0.0) / usd_rate,
-                "AvailableFunds": base.get("AvailableFunds", 0.0) / usd_rate,
-                "BuyingPower": base.get("BuyingPower", 0.0) / usd_rate,
+                "NetLiquidation": net_liq_base / usd_rate,
+                "AvailableFunds": avail_base / usd_rate,
+                "BuyingPower": bp_base / usd_rate,
                 "TotalCashValue": by_curr.get("USD", {}).get("TotalCashValue", 0.0),
                 
                 # AUD metrics for UI display
-                "NetLiquidation_AUD": base.get("NetLiquidation", 0.0) / aud_rate,
-                "AvailableFunds_AUD": base.get("AvailableFunds", 0.0) / aud_rate,
-                "BuyingPower_AUD": base.get("BuyingPower", 0.0) / aud_rate,
+                "NetLiquidation_AUD": net_liq_base / aud_rate,
+                "AvailableFunds_AUD": avail_base / aud_rate,
+                "BuyingPower_AUD": bp_base / aud_rate,
                 "TotalCashValue_AUD": by_curr.get("AUD", {}).get("TotalCashValue", 0.0),
             }
             return result
