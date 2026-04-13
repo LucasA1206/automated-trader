@@ -230,11 +230,33 @@ class IBKRClient:
             if not self.ib.isConnected():
                 self.connect()
             summary = self.ib.accountValues()
-            result = {}
+            by_curr = {}
             for av in summary:
-                if av.tag in ("TotalCashValue", "NetLiquidation", "AvailableFunds", "BuyingPower"):
-                    if av.currency == "USD":
-                        result[av.tag] = safe_float(av.value)
+                if av.currency not in by_curr:
+                    by_curr[av.currency] = {}
+                by_curr[av.currency][av.tag] = safe_float(av.value)
+
+            usd_rate = by_curr.get("USD", {}).get("ExchangeRate")
+            if not usd_rate: usd_rate = 1.0
+            
+            aud_rate = by_curr.get("AUD", {}).get("ExchangeRate")
+            if not aud_rate: aud_rate = 1.0
+
+            base = by_curr.get("BASE", {})
+            
+            result = {
+                # Core metrics in USD for trades/budget
+                "NetLiquidation": base.get("NetLiquidation", 0.0) / usd_rate,
+                "AvailableFunds": base.get("AvailableFunds", 0.0) / usd_rate,
+                "BuyingPower": base.get("BuyingPower", 0.0) / usd_rate,
+                "TotalCashValue": by_curr.get("USD", {}).get("TotalCashValue", 0.0),
+                
+                # AUD metrics for UI display
+                "NetLiquidation_AUD": base.get("NetLiquidation", 0.0) / aud_rate,
+                "AvailableFunds_AUD": base.get("AvailableFunds", 0.0) / aud_rate,
+                "BuyingPower_AUD": base.get("BuyingPower", 0.0) / aud_rate,
+                "TotalCashValue_AUD": by_curr.get("AUD", {}).get("TotalCashValue", 0.0),
+            }
             return result
         except Exception as e:
             logger.error(f"Failed to fetch account summary: {e}")

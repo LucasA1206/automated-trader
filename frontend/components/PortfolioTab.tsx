@@ -29,6 +29,10 @@ interface Account {
   NetLiquidation?: number;
   AvailableFunds?: number;
   BuyingPower?: number;
+  TotalCashValue_AUD?: number;
+  NetLiquidation_AUD?: number;
+  AvailableFunds_AUD?: number;
+  BuyingPower_AUD?: number;
 }
 
 interface PortfolioData {
@@ -468,11 +472,17 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
           <div className="card-value">
             {loading ? '—' : fmt(account.NetLiquidation ?? 0)}
           </div>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+             {loading ? '' : fmt(account.NetLiquidation_AUD ?? 0, 'A$')}
+          </div>
         </div>
         <div className="card">
           <div className="card-label">Available Cash</div>
           <div className="card-value">
             {loading ? '—' : fmt(account.AvailableFunds ?? 0)}
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+             {loading ? '' : fmt(account.AvailableFunds_AUD ?? 0, 'A$')}
           </div>
         </div>
         <div className="card">
