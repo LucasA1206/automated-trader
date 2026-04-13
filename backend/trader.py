@@ -233,7 +233,8 @@ class IBKRClient:
             result = {}
             for av in summary:
                 if av.tag in ("TotalCashValue", "NetLiquidation", "AvailableFunds", "BuyingPower"):
-                    result[av.tag] = safe_float(av.value)
+                    if av.currency == "USD":
+                        result[av.tag] = safe_float(av.value)
             return result
         except Exception as e:
             logger.error(f"Failed to fetch account summary: {e}")
@@ -268,6 +269,8 @@ class IBKRClient:
             result = []
 
             for item in portfolio_items:
+                if getattr(item.contract, 'secType', 'STK') != 'STK':
+                    continue
                 size = item.position
                 if size == 0:
                     continue
