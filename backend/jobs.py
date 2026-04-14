@@ -181,6 +181,7 @@ def job_morning_scan_and_buy():
                     order_id=result.get("order_id"),
                     ai_reason=reason,
                     mode=trading_mode,
+                    fees=result.get("fees", 0.0),
                 )
                 db.add(trade)
                 db.commit()
@@ -276,12 +277,15 @@ def job_afternoon_sell():
                     trade.status = "closed"
                     trade.pnl = round(pnl, 2)
                     trade.pnl_pct = round(pnl_pct, 2)
+                    
+                    sell_fees = result.get("fees", 0.0)
+                    trade.fees = round((trade.fees or 0.0) + sell_fees, 4)
                     db.commit()
 
                     emoji = "🟢" if pnl >= 0 else "🔴"
                     log_event(db, "sell",
                               f"{emoji} Sold {trade.shares} shares of {ticker} "
-                              f"@ ${sell_price:.2f} | P&L: ${pnl:+.2f} ({pnl_pct:+.2f}%)")
+                              f"@ ${sell_price:.2f} | P&L: ${pnl:+.2f} ({pnl_pct:+.2f}%) | Fees: ${sell_fees:.2f}")
                 else:
                     # Position existed in IBKR but not in our DB (e.g. held overnight,
                     # bought manually, or carried over from a previous session).

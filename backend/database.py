@@ -25,6 +25,13 @@ def init_db():
     except Exception:
         pass  # Column likely already exists
 
+    # Safely migrate existing trades table to add 'fees' column
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE trades ADD COLUMN fees FLOAT DEFAULT 0.0"))
+    except Exception:
+        pass  # Column likely already exists
+
     db = SessionLocal()
     try:
         defaults = {
