@@ -459,9 +459,11 @@ def get_pnl_history(db: Session = Depends(get_db)):
     from collections import defaultdict
     daily: dict[str, float] = defaultdict(float)
     daily_cost: dict[str, float] = defaultdict(float)
+    daily_fees: dict[str, float] = defaultdict(float)
     for t in closed_trades:
         day = t.sell_time.strftime("%Y-%m-%d")
         daily[day] += t.pnl
+        daily_fees[day] += (t.fees or 0.0)
         if t.buy_price is not None and t.shares is not None:
             daily_cost[day] += (t.buy_price * t.shares)
 
@@ -469,12 +471,15 @@ def get_pnl_history(db: Session = Depends(get_db)):
     sorted_days = sorted(daily.keys())
     cumulative = 0.0
     cumulative_cost = 0.0
+    cumulative_fees = 0.0
     chart_data = []
     for day in sorted_days:
         cumulative += daily[day]
         cumulative_cost += daily_cost[day]
+        cumulative_fees += daily_fees[day]
         
         day_pnl = daily[day]
+        day_fees = daily_fees[day]
         day_cost = daily_cost[day]
         daily_pct = (day_pnl / day_cost * 100) if day_cost > 0 else 0.0
         cumulative_pct = (cumulative / cumulative_cost * 100) if cumulative_cost > 0 else 0.0
@@ -485,10 +490,13 @@ def get_pnl_history(db: Session = Depends(get_db)):
             "cumulative_pnl": round(cumulative, 2),
             "daily_pct": round(daily_pct, 2),
             "cumulative_pct": round(cumulative_pct, 2),
+            "daily_fees": round(day_fees, 2),
+            "cumulative_fees": round(cumulative_fees, 2),
         })
 
     # All-time realized P&L
     all_time_realized = round(sum(t.pnl for t in closed_trades), 2)
+    all_time_fees = round(sum((t.fees or 0.0) for t in closed_trades), 2)
 
     # Count of winning vs losing closed trades
     winners = sum(1 for t in closed_trades if t.pnl and t.pnl > 0)
@@ -501,6 +509,7 @@ def get_pnl_history(db: Session = Depends(get_db)):
         "total_closed_trades": total_closed,
         "winning_trades": winners,
         "losing_trades": losers,
+        "all_time_fees": all_time_fees,
     }
 
 

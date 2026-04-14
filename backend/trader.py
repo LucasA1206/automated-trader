@@ -369,14 +369,21 @@ class IBKRClient:
             self.ib.sleep(3)  # Wait for fill
 
             fill_price = price  # fallback
+            fees = 0.0
             if trade.fills:
                 fill_price = trade.fills[-1].execution.price
+                fees = sum(
+                    safe_float(f.commissionReport.commission)
+                    for f in trade.fills
+                    if getattr(f, 'commissionReport', None) and getattr(f.commissionReport, 'commission', None) is not None
+                )
 
             return {
                 "success": True,
                 "ticker": ticker,
                 "shares": shares,
                 "price": round(safe_float(fill_price), 4),
+                "fees": round(fees, 4),
                 "total_cost": round(safe_float(fill_price) * shares, 2),
                 "order_id": str(trade.order.orderId),
             }
@@ -401,8 +408,14 @@ class IBKRClient:
             self.ib.sleep(3)
 
             fill_price = 0.0
+            fees = 0.0
             if trade.fills:
                 fill_price = safe_float(trade.fills[-1].execution.price)
+                fees = sum(
+                    safe_float(f.commissionReport.commission)
+                    for f in trade.fills
+                    if getattr(f, 'commissionReport', None) and getattr(f.commissionReport, 'commission', None) is not None
+                )
             else:
                 # Fallback: request delayed price
                 self.ib.reqMarketDataType(3)
@@ -416,6 +429,7 @@ class IBKRClient:
                 "ticker": ticker,
                 "shares": int(shares),
                 "price": round(fill_price, 4),
+                "fees": round(fees, 4),
                 "total_proceeds": round(fill_price * shares, 2),
             }
         except Exception as e:

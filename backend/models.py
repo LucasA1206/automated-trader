@@ -24,6 +24,7 @@ class Trade(Base):
     mode = Column(String(20), default="paper", nullable=False)
     pnl = Column(Float, nullable=True)
     pnl_pct = Column(Float, nullable=True)
+    fees = Column(Float, default=0.0, nullable=True)
     order_id = Column(String(50), nullable=True)
     ai_reason = Column(Text, nullable=True)
 

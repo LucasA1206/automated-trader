@@ -56,6 +56,8 @@ interface DailyPnlPoint {
   cumulative_pnl: number;
   daily_pct?: number;
   cumulative_pct?: number;
+  daily_fees?: number;
+  cumulative_fees?: number;
 }
 
 interface PnlHistory {
@@ -64,6 +66,7 @@ interface PnlHistory {
   total_closed_trades: number;
   winning_trades: number;
   losing_trades: number;
+  all_time_fees?: number;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -127,16 +130,35 @@ function ChartTooltip({ active, payload, label }: {
         const isDaily = p.name === 'daily_pnl';
         const pct = isDaily ? p.payload.daily_pct : p.payload.cumulative_pct;
         const pctStr = pct !== undefined ? ` (${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)` : '';
-        return (
-          <div key={i} style={{
-            fontSize: 13,
-            fontWeight: 600,
-            color: isPos ? 'var(--accent-green)' : 'var(--accent-red)',
-            fontFamily: "'JetBrains Mono', monospace",
-          }}>
-            {isDaily ? 'Day' : 'Total'}: {fmtSigned(p.value)}{pctStr}
-          </div>
-        );
+        const fees = isDaily ? (p.payload.daily_fees || 0) : (p.payload.cumulative_fees || 0);
+        
+        if (isDaily) {
+          const dayGross = p.value + fees;
+          return (
+            <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: dayGross >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
+                Day: {fmtSigned(dayGross)}{pctStr}
+              </div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: p.value >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
+                Profit: {fmtSigned(p.value)}
+              </div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
+                Fees: {fmt(fees)}
+              </div>
+            </div>
+          );
+        } else {
+          return (
+            <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: isPos ? 'var(--accent-green)' : 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
+                Total: {fmtSigned(p.value)}{pctStr}
+              </div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
+                Fees: {fmt(fees)}
+              </div>
+            </div>
+          );
+        }
       })}
     </div>
   );
@@ -208,6 +230,7 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
   const totalValue = positions.reduce((sum, p) => sum + p.market_value, 0);
 
   const realizedPnl = pnlHistory?.all_time_realized_pnl ?? 0;
+  const allTimeFees = pnlHistory?.all_time_fees ?? 0;
   const openPnl = realizedPnl + unrealisedPnl;   // All-time Open P&L
   const openPnlPositive = openPnl >= 0;
 
@@ -358,6 +381,12 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
               <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>Unrealised: </span>
               <span style={{ color: unrealisedPnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
                 {fmtSigned(unrealisedPnl)}
+              </span>
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+              <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>Fees Paid: </span>
+              <span style={{ color: 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
+                {fmt(allTimeFees)}
               </span>
             </div>
           </div>
