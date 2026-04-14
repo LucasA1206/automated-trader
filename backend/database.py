@@ -41,6 +41,7 @@ def init_db():
             "daily_budget_pct": "50",         # derived from paper_strategy
             "max_positions": "3",             # derived from paper_strategy
             "scan_enabled": "true",       # pause/resume auto scanning
+            "trader_enabled": "true",     # Master switch
             "margin_upgrade_alerted": "false",
         }
         for key, value in defaults.items():

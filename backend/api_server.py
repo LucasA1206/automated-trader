@@ -93,6 +93,7 @@ class SettingsBulkUpdate(BaseModel):
     max_positions: Optional[str] = None
     scan_enabled: Optional[str] = None
     account_type: Optional[str] = None
+    trader_enabled: Optional[str] = None
 
 
 def _sync_strategy_settings(db: Session, account_type: str) -> None:
