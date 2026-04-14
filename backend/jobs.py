@@ -105,6 +105,11 @@ def job_morning_scan_and_buy():
     """
     db = SessionLocal()
     try:
+        trader_enabled = get_setting(db, "trader_enabled", "true")
+        if trader_enabled.lower() != "true":
+            log_event(db, "system", "Trader is globally disabled. Skipping morning job.")
+            return
+
         scan_enabled = get_setting(db, "scan_enabled", "true")
         if scan_enabled.lower() != "true":
             log_event(db, "system", "Auto-scan is disabled. Skipping morning job.")
@@ -215,6 +220,11 @@ def job_afternoon_sell():
     """
     db = SessionLocal()
     try:
+        trader_enabled = get_setting(db, "trader_enabled", "true")
+        if trader_enabled.lower() != "true":
+            log_event(db, "system", "Trader is globally disabled. Skipping afternoon sell job.")
+            return
+
         trading_mode = get_setting(db, "trading_mode", "paper")
         log_event(db, "sell", "Starting afternoon sell-all job (30 min before close).")
 

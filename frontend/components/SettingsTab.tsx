@@ -8,6 +8,7 @@ interface Settings {
   daily_budget_pct: string;
   max_positions: string;
   scan_enabled: string;
+  trader_enabled: string;
   account_type: string;
 }
 
@@ -25,6 +26,7 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
     daily_budget_pct: '100',
     max_positions: '5',
     scan_enabled: 'true',
+    trader_enabled: 'true',
     account_type: 'trading_cash',
   });
   const [saving, setSaving] = useState(false);
@@ -140,6 +142,7 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
   const isTradingCash = settings.account_type === 'trading_cash';
   const paperStrategy = settings.paper_strategy === 'margin' ? 'margin' : 'cash';
   const scanEnabled = settings.scan_enabled === 'true';
+  const traderEnabled = settings.trader_enabled === 'true';
   const strategyBudgetPct = parseInt(settings.daily_budget_pct, 10) || (paperStrategy === 'cash' ? 50 : 100);
   const strategyMaxPositions = parseInt(settings.max_positions, 10) || (paperStrategy === 'cash' ? 3 : 5);
 
@@ -501,8 +504,24 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
 
       {/* Scanner */}
       <div className="settings-section">
-        <h3>Scanner &amp; Automation</h3>
+        <h3 style={{ color: 'var(--accent-blue)' }}>Master Controls &amp; Automation</h3>
         <p>Control the daily automated scanning and trading schedule.</p>
+
+        <div className="setting-row">
+          <div className="setting-info">
+            <div className="setting-label">Trader Enabled (Master Switch)</div>
+            <div className="setting-desc">If turned off, the bot will NOT scan, buy, or sell. It will sit completely idle.</div>
+          </div>
+          <label className="toggle toggle-master" id="toggle-trader-enabled">
+            <input
+              type="checkbox"
+              checked={traderEnabled}
+              onChange={(e) => save({ trader_enabled: e.target.checked ? 'true' : 'false' })}
+              disabled={saving}
+            />
+            <span className="toggle-slider" />
+          </label>
+        </div>
 
         <div className="setting-row">
           <div className="setting-info">
