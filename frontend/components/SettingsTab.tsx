@@ -143,8 +143,6 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
   const paperStrategy = settings.paper_strategy === 'margin' ? 'margin' : 'cash';
   const scanEnabled = settings.scan_enabled === 'true';
   const traderEnabled = settings.trader_enabled === 'true';
-  const strategyBudgetPct = parseInt(settings.daily_budget_pct, 10) || (paperStrategy === 'cash' ? 50 : 100);
-  const strategyMaxPositions = parseInt(settings.max_positions, 10) || (paperStrategy === 'cash' ? 3 : 5);
 
   return (
     <div>
@@ -344,10 +342,29 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
             }}
           >
             <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-              Daily Budget
+              Daily Budget (%)
             </div>
-            <div style={{ fontSize: 22, fontWeight: 700, marginTop: 6 }}>
-              {strategyBudgetPct}%
+            <div style={{ marginTop: 6 }}>
+              <input
+                type="number"
+                min="1"
+                max="100"
+                value={settings.daily_budget_pct}
+                onChange={(e) => setSettings({...settings, daily_budget_pct: e.target.value})}
+                onBlur={(e) => save({ daily_budget_pct: e.target.value })}
+                disabled={saving}
+                style={{
+                  background: 'var(--bg-card)',
+                  border: '1px solid var(--border-bright)',
+                  color: 'var(--text-primary)',
+                  padding: '4px 8px',
+                  borderRadius: 6,
+                  fontSize: 18,
+                  fontWeight: 700,
+                  width: '80px',
+                  outline: 'none'
+                }}
+              />
             </div>
             <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
               of available cash for the daily buy cycle
@@ -364,8 +381,27 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
             <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
               Stocks Per Day
             </div>
-            <div style={{ fontSize: 22, fontWeight: 700, marginTop: 6 }}>
-              {strategyMaxPositions}
+            <div style={{ marginTop: 6 }}>
+              <input
+                type="number"
+                min="1"
+                max="50"
+                value={settings.max_positions}
+                onChange={(e) => setSettings({...settings, max_positions: e.target.value})}
+                onBlur={(e) => save({ max_positions: e.target.value })}
+                disabled={saving}
+                style={{
+                  background: 'var(--bg-card)',
+                  border: '1px solid var(--border-bright)',
+                  color: 'var(--text-primary)',
+                  padding: '4px 8px',
+                  borderRadius: 6,
+                  fontSize: 18,
+                  fontWeight: 700,
+                  width: '80px',
+                  outline: 'none'
+                }}
+              />
             </div>
             <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
               maximum picks the bot will buy in one scan
@@ -454,10 +490,29 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
             }}
           >
             <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-              Daily Budget
+              Daily Budget (%)
             </div>
-            <div style={{ fontSize: 22, fontWeight: 700, marginTop: 6 }}>
-              {strategyBudgetPct}%
+            <div style={{ marginTop: 6 }}>
+              <input
+                type="number"
+                min="1"
+                max="100"
+                value={settings.daily_budget_pct}
+                onChange={(e) => setSettings({...settings, daily_budget_pct: e.target.value})}
+                onBlur={(e) => save({ daily_budget_pct: e.target.value })}
+                disabled={saving}
+                style={{
+                  background: 'var(--bg-card)',
+                  border: '1px solid var(--border-bright)',
+                  color: 'var(--text-primary)',
+                  padding: '4px 8px',
+                  borderRadius: 6,
+                  fontSize: 18,
+                  fontWeight: 700,
+                  width: '80px',
+                  outline: 'none'
+                }}
+              />
             </div>
             <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
               of available cash for the daily buy cycle
@@ -474,8 +529,27 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
             <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
               Stocks Per Day
             </div>
-            <div style={{ fontSize: 22, fontWeight: 700, marginTop: 6 }}>
-              {strategyMaxPositions}
+            <div style={{ marginTop: 6 }}>
+              <input
+                type="number"
+                min="1"
+                max="50"
+                value={settings.max_positions}
+                onChange={(e) => setSettings({...settings, max_positions: e.target.value})}
+                onBlur={(e) => save({ max_positions: e.target.value })}
+                disabled={saving}
+                style={{
+                  background: 'var(--bg-card)',
+                  border: '1px solid var(--border-bright)',
+                  color: 'var(--text-primary)',
+                  padding: '4px 8px',
+                  borderRadius: 6,
+                  fontSize: 18,
+                  fontWeight: 700,
+                  width: '80px',
+                  outline: 'none'
+                }}
+              />
             </div>
             <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
               maximum picks the bot will buy in one scan
