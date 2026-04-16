@@ -9,13 +9,21 @@ from trader import IBKRClient
 logger = logging.getLogger(__name__)
 
 
-def _build_strategy_plan(trading_mode: str, paper_strategy: str, available_cash: float, net_liq: float) -> tuple[float, int, str]:
+def _build_strategy_plan(
+    trading_mode: str, 
+    paper_strategy: str, 
+    available_cash: float, 
+    net_liq: float, 
+    db_budget_pct: float, 
+    db_max_positions: int
+) -> tuple[float, int, str]:
     """Return the daily budget, position cap, and a human-readable strategy label."""
+    fraction = db_budget_pct / 100.0
     if trading_mode == "live":
-        return available_cash * 0.5, 3, "live cash account / 3 stocks"
+        return available_cash * fraction, db_max_positions, f"live cash account / {db_max_positions} stocks / {db_budget_pct}% budget"
     if paper_strategy == "margin":
-        return available_cash, 5, "paper margin simulation / 5 stocks"
-    return available_cash * 0.5, 3, "paper cash simulation / 3 stocks"
+        return available_cash * fraction, db_max_positions, f"paper margin simulation / {db_max_positions} stocks / {db_budget_pct}% budget"
+    return available_cash * fraction, db_max_positions, f"paper cash simulation / {db_max_positions} stocks / {db_budget_pct}% budget"
 
 # ---------------------------------------------------------------------------
 # Persistent keepalive — a single IBKRClient that stays connected between jobs
@@ -118,6 +126,16 @@ def job_morning_scan_and_buy():
         trading_mode = get_setting(db, "trading_mode", "paper")
         account_type = get_setting(db, "account_type", "trading_cash")
         paper_strategy = get_setting(db, "paper_strategy", "cash")
+        
+        try:
+            budget_pct = float(get_setting(db, "daily_budget_pct", "50" if paper_strategy == "cash" else "100"))
+        except ValueError:
+            budget_pct = 50.0
+            
+        try:
+            max_positions_setting = int(get_setting(db, "max_positions", "3" if paper_strategy == "cash" else "5"))
+        except ValueError:
+            max_positions_setting = 3
 
         # Connect to IBKR to get account balance
         client = IBKRClient(trading_mode=trading_mode)
@@ -139,7 +157,9 @@ def job_morning_scan_and_buy():
             client.disconnect()
             return
 
-        daily_budget, max_positions, strategy_label = _build_strategy_plan(trading_mode, paper_strategy, available_cash, net_liq)
+        daily_budget, max_positions, strategy_label = _build_strategy_plan(
+            trading_mode, paper_strategy, available_cash, net_liq, budget_pct, max_positions_setting
+        )
 
         log_event(db, "scan", f"Starting morning scan. Mode: {trading_mode}, "
                               f"Account: {account_type}, Strategy: {strategy_label}, "
