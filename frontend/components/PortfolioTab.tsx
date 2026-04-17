@@ -234,6 +234,14 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
   const openPnl = realizedPnl + unrealisedPnl;   // All-time Open P&L
   const openPnlPositive = openPnl >= 0;
 
+  let audRate = 1.53; // default approx
+  if (account.NetLiquidation && account.NetLiquidation_AUD) {
+    audRate = account.NetLiquidation_AUD / account.NetLiquidation;
+  } else if (account.AvailableFunds && account.AvailableFunds_AUD) {
+    audRate = account.AvailableFunds_AUD / account.AvailableFunds;
+  }
+  const openPnlAud = openPnl * audRate;
+
   const chartData = pnlHistory?.chart_data ?? [];
   const activeKey: 'cumulative_pnl' | 'daily_pnl' =
     chartMode === 'cumulative' ? 'cumulative_pnl' : 'daily_pnl';
@@ -355,19 +363,35 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
             Open P&amp;L — All Time
           </div>
           {loading && pnlLoading ? (
-            <div style={{ fontSize: 42, fontWeight: 800, color: 'var(--text-muted)', fontFamily: "'JetBrains Mono', monospace" }}>—</div>
+            <div style={{ display: 'flex', gap: 24, alignItems: 'baseline' }}>
+              <div style={{ fontSize: 42, fontWeight: 800, color: 'var(--text-muted)', fontFamily: "'JetBrains Mono', monospace" }}>—</div>
+            </div>
           ) : (
-            <div style={{
-              fontSize: 46,
-              fontWeight: 800,
-              letterSpacing: '-1.5px',
-              color: openPnlPositive ? 'var(--accent-green)' : 'var(--accent-red)',
-              fontFamily: "'JetBrains Mono', monospace",
-              textShadow: openPnlPositive
-                ? '0 0 40px rgba(34,197,94,0.35)'
-                : '0 0 40px rgba(239,68,68,0.35)',
-            }}>
-              {fmtSigned(openPnl)}
+            <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap' as const, alignItems: 'baseline' }}>
+              <div style={{
+                fontSize: 46,
+                fontWeight: 800,
+                letterSpacing: '-1.5px',
+                color: openPnlPositive ? 'var(--accent-green)' : 'var(--accent-red)',
+                fontFamily: "'JetBrains Mono', monospace",
+                textShadow: openPnlPositive
+                  ? '0 0 40px rgba(34,197,94,0.35)'
+                  : '0 0 40px rgba(239,68,68,0.35)',
+              }}>
+                {fmtSigned(openPnl)}
+                <span style={{ fontSize: 16, marginLeft: 8, color: 'var(--text-muted)', fontWeight: 600, textShadow: 'none', letterSpacing: '0' }}>USD</span>
+              </div>
+              <div style={{
+                fontSize: 32,
+                fontWeight: 700,
+                letterSpacing: '-1px',
+                color: openPnlPositive ? 'var(--accent-green)' : 'var(--accent-red)',
+                fontFamily: "'JetBrains Mono', monospace",
+                opacity: 0.8,
+              }}>
+                {fmtSigned(openPnlAud)}
+                <span style={{ fontSize: 14, marginLeft: 6, color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0' }}>AUD</span>
+              </div>
             </div>
           )}
           <div style={{ display: 'flex', gap: 20, marginTop: 10, flexWrap: 'wrap' as const }}>
