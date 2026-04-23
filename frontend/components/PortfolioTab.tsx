@@ -33,6 +33,8 @@ interface Account {
   NetLiquidation_AUD?: number;
   AvailableFunds_AUD?: number;
   BuyingPower_AUD?: number;
+  ExchangeRate_USD?: number;
+  ExchangeRate_AUD?: number;
 }
 
 interface PortfolioData {
@@ -234,13 +236,10 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
   const openPnl = realizedPnl + unrealisedPnl;   // All-time Open P&L
   const openPnlPositive = openPnl >= 0;
 
-  let audRate = 1.53; // default approx
-  if (account.NetLiquidation && account.NetLiquidation_AUD) {
-    audRate = account.NetLiquidation_AUD / account.NetLiquidation;
-  } else if (account.AvailableFunds && account.AvailableFunds_AUD) {
-    audRate = account.AvailableFunds_AUD / account.AvailableFunds;
-  }
-  const openPnlAud = openPnl * audRate;
+  // ExchangeRate_USD is the IBKR rate: 1 USD = X AUD (e.g. ~1.53).
+  // When multiplied by a USD amount it gives the AUD equivalent.
+  const usdToAud = account.ExchangeRate_USD ?? 1.53;
+  const openPnlAud = openPnl * usdToAud;
 
   const chartData = pnlHistory?.chart_data ?? [];
   const activeKey: 'cumulative_pnl' | 'daily_pnl' =
