@@ -225,47 +225,63 @@ class IBKRClient:
             logger.info("Disconnected from IB Gateway.")
 
     def get_account_summary(self) -> dict:
-        """Returns key account values: cash, net liquidation, etc."""
+        """Returns key account values: cash, net liquidation, etc.
+
+        IBKR's `accountValues()` returns tagged values grouped by currency.
+        For an AUD-based account we typically see entries like:
+          tag=NetLiquidation, currency=USD,  value=<usd amount>
+          tag=NetLiquidation, currency=AUD,  value=<aud amount>
+          tag=NetLiquidation, currency=BASE, value=<base amount>
+
+        We read directly from the per-currency buckets so that USD and AUD
+        values are always correct — no manual exchange-rate math needed for
+        the summary cards.
+
+        ExchangeRate is still extracted and returned so the frontend can
+        convert P&L figures that are only available in USD.
+        """
         try:
             if not self.ib.isConnected():
                 self.connect()
             summary = self.ib.accountValues()
-            by_curr = {}
+            by_curr: dict[str, dict[str, float]] = {}
             for av in summary:
                 if av.currency not in by_curr:
                     by_curr[av.currency] = {}
                 by_curr[av.currency][av.tag] = safe_float(av.value)
 
-            usd_rate = by_curr.get("USD", {}).get("ExchangeRate")
-            if not usd_rate: usd_rate = 1.0
-            
-            aud_rate = by_curr.get("AUD", {}).get("ExchangeRate")
-            if not aud_rate: aud_rate = 1.0
+            usd = by_curr.get("USD", {})
+            aud = by_curr.get("AUD", {})
+            base = by_curr.get("BASE", {})
 
-            net_liq_base = 0.0
-            avail_base = 0.0
-            bp_base = 0.0
-            
-            for av in summary:
-                if av.tag == "NetLiquidation" and net_liq_base == 0.0:
-                    net_liq_base = safe_float(av.value)
-                elif av.tag == "AvailableFunds" and avail_base == 0.0:
-                    avail_base = safe_float(av.value)
-                elif av.tag == "BuyingPower" and bp_base == 0.0:
-                    bp_base = safe_float(av.value)
-            
+            # Exchange rates (FROM each currency TO account base currency).
+            # Useful for the frontend to convert P&L values.
+            usd_rate = usd.get("ExchangeRate") or 1.0
+            aud_rate = aud.get("ExchangeRate") or 1.0
+
+            def _pick(tag: str, bucket: dict) -> float:
+                """Return the value from `bucket`, falling back to BASE."""
+                val = bucket.get(tag)
+                if val is not None and val != 0.0:
+                    return val
+                return base.get(tag, 0.0)
+
             result = {
                 # Core metrics in USD for trades/budget
-                "NetLiquidation": net_liq_base / usd_rate,
-                "AvailableFunds": avail_base / usd_rate,
-                "BuyingPower": bp_base / usd_rate,
-                "TotalCashValue": by_curr.get("USD", {}).get("TotalCashValue", 0.0),
-                
+                "NetLiquidation": _pick("NetLiquidation", usd),
+                "AvailableFunds": _pick("AvailableFunds", usd),
+                "BuyingPower": _pick("BuyingPower", usd),
+                "TotalCashValue": usd.get("TotalCashValue", 0.0),
+
                 # AUD metrics for UI display
-                "NetLiquidation_AUD": net_liq_base / aud_rate,
-                "AvailableFunds_AUD": avail_base / aud_rate,
-                "BuyingPower_AUD": bp_base / aud_rate,
-                "TotalCashValue_AUD": by_curr.get("AUD", {}).get("TotalCashValue", 0.0),
+                "NetLiquidation_AUD": _pick("NetLiquidation", aud),
+                "AvailableFunds_AUD": _pick("AvailableFunds", aud),
+                "BuyingPower_AUD": _pick("BuyingPower", aud),
+                "TotalCashValue_AUD": aud.get("TotalCashValue", 0.0),
+
+                # Exchange rates so frontend can convert P&L
+                "ExchangeRate_USD": usd_rate,
+                "ExchangeRate_AUD": aud_rate,
             }
             return result
         except Exception as e:
