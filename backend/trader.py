@@ -303,13 +303,27 @@ class IBKRClient:
                 self.connect()
 
             # Force a fresh portfolio snapshot by requesting account updates.
-            # Wait up to 8 s for data to arrive — critical for the sell job.
+            # IBKR streams positions one-by-one, so we must wait until the
+            # count stabilises (no new positions for 1 s) rather than breaking
+            # on the first item — otherwise we miss positions that arrive
+            # slightly later in the stream (this caused the stale ARM bug).
             self.ib.client.reqAccountUpdates(True, "")
-            deadline = time.monotonic() + 8
+            deadline = time.monotonic() + 10  # generous overall timeout
+            last_count = 0
+            stable_since = None
             while time.monotonic() < deadline:
-                self.ib.sleep(0.5)
-                if self.ib.portfolio():
-                    break  # data arrived
+                self.ib.sleep(0.3)
+                current_count = len(self.ib.portfolio())
+                if current_count > 0:
+                    if current_count != last_count:
+                        # New position(s) just arrived — reset the stability timer
+                        last_count = current_count
+                        stable_since = time.monotonic()
+                    elif stable_since and (time.monotonic() - stable_since) >= 1.0:
+                        # Count has been stable for 1 s — all positions received
+                        break
+                    elif stable_since is None:
+                        stable_since = time.monotonic()
             # Cancel the subscription — we got what we needed.
             self.ib.client.reqAccountUpdates(False, "")
 
