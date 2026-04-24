@@ -225,7 +225,7 @@ class IBKRClient:
             logger.info("Disconnected from IB Gateway.")
 
     def get_account_summary(self) -> dict:
-        """Returns key account values: cash, net liquidation, etc.
+        """Returns key account values: cash, net liquidation, etc. 
 
         IBKR's `accountValues()` returns tagged values grouped by currency.
         For an AUD-based account we typically see entries like:
