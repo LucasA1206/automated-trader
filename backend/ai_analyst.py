@@ -443,7 +443,7 @@ def run_daily_scan() -> list[dict]:
     # Step 4: AI analysis with both news + technicals
     recommendations = analyse_with_gemini(all_news, technicals)
 
-    logger.info(f"Scan complete. {len(recommendations)} stock(s) recommended: "
-                f"{[f\"{r['ticker']}({r['confidence']:.0%})\" for r in recommendations]}")
+    picks = [f"{r['ticker']}({r['confidence']:.0%})" for r in recommendations]
+    logger.info(f"Scan complete. {len(recommendations)} stock(s) recommended: {picks}")
 
     return recommendations
