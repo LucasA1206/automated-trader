@@ -11,3 +11,4 @@ python-dotenv==1.0.1
 pydantic==2.10.1
 tzdata==2024.2
 python-jose[cryptography]==3.5.0
+yfinance>=0.2.40
