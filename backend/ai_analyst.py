@@ -301,14 +301,17 @@ TECHNICAL DATA (real-time indicators for key tickers):
 """
 
     prompt = f"""You are an elite quantitative day-trading AI analysing NASDAQ stocks for {today}.
-Your job is to identify the BEST stocks to BUY at market open that will RISE during the trading day.
+Your job is to identify stocks to BUY at market open that will RISE during the trading day.
+
+You MUST recommend between 1 and 5 stocks. Look across the entire universe and find
+every stock that has a genuine reason to go up today. Do NOT limit yourself to just one —
+if you see 3 good setups, recommend all 3. If you see 5, recommend 5.
 
 ═══ AUTHORISED TICKER UNIVERSE ═══
 {universe_str}
 
 ═══ ANALYSIS METHODOLOGY ═══
-Apply ALL of the following factors to score each candidate. Only recommend stocks where
-multiple factors converge bullishly:
+Apply the following factors to evaluate each candidate:
 
 1. NEWS CATALYST (Weight: 35%)
    - Earnings beats / positive guidance revisions
@@ -339,14 +342,12 @@ multiple factors converge bullishly:
    - Avoid stocks already up >8% pre-market (likely to fade)
 
 ═══ CONFIDENCE SCORING ═══
-- 0.90–1.00: Exceptional — strong catalyst + perfect technicals + high volume
-- 0.80–0.89: Strong — clear catalyst + supportive technicals
-- 0.70–0.79: Good — decent catalyst OR strong technicals, some uncertainty
-- 0.60–0.69: Marginal — weak signal, do NOT recommend unless very compelling
-- Below 0.60: Do NOT include
+Assign a confidence between 0.0 and 1.0 reflecting how likely the stock is to go up today.
+Be honest but not overly conservative. If the setup looks good, rate it accordingly.
 
-ONLY return stocks you are genuinely confident will rise TODAY (intraday).
-If no stocks meet the bar, return an EMPTY array []. Quality over quantity.
+IMPORTANT: Recommend 1-5 stocks. Do NOT return an empty array unless there is
+truly nothing worth buying today (e.g. major market crash, all indicators bearish).
+The goal is to find opportunities — be proactive, not overly cautious.
 
 ═══ NEWS DATA ═══
 {news_json}
@@ -357,7 +358,7 @@ Respond ONLY with a valid JSON array. No markdown fences, no explanation outside
   {{
     "ticker": "NVDA",
     "reason": "Beat Q4 earnings by 22%, 3 analyst upgrades, RSI 52 (bullish momentum), MACD bullish crossover, volume 2.1x average — strong multi-factor buy.",
-    "confidence": 0.92
+    "confidence": 0.85
   }}
 ]"""
 
