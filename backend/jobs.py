@@ -172,11 +172,32 @@ def job_morning_scan_and_buy():
             client.disconnect()
             return
 
-        tickers_str = ", ".join(r["ticker"] for r in recommendations)
+        tickers_str = ", ".join(
+            f"{r['ticker']}({r.get('confidence', 0):.0%})" for r in recommendations
+        )
         log_event(db, "scan", f"AI recommended {len(recommendations)} stock(s): {tickers_str}")
 
-        # Step 2: Cap to max_positions stocks
-        picks = recommendations[:max_positions]
+        # Step 2: Filter to ≥70% confidence and sort by highest confidence
+        MIN_CONFIDENCE = 0.70
+        qualified = [r for r in recommendations if r.get("confidence", 0) >= MIN_CONFIDENCE]
+        qualified.sort(key=lambda r: r.get("confidence", 0), reverse=True)
+
+        if not qualified:
+            log_event(db, "scan",
+                      f"No stocks met the {MIN_CONFIDENCE:.0%} confidence threshold. "
+                      f"Skipping trades today.")
+            client.disconnect()
+            return
+
+        filtered_str = ", ".join(
+            f"{r['ticker']}({r.get('confidence', 0):.0%})" for r in qualified
+        )
+        log_event(db, "scan",
+                  f"{len(qualified)} stock(s) passed ≥{MIN_CONFIDENCE:.0%} confidence filter: "
+                  f"{filtered_str}")
+
+        # Step 3: Cap to max_positions stocks (already sorted by confidence)
+        picks = qualified[:max_positions]
         budget_per_trade = daily_budget / len(picks)
 
         log_event(db, "system",

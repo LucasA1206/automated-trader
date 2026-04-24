@@ -4,6 +4,8 @@ import time
 import logging
 import requests
 import google.generativeai as genai
+import yfinance as yf
+import concurrent.futures
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
@@ -118,6 +120,7 @@ NASDAQ_HOT_LIST = [
 ]
 
 
+
 def fetch_news_for_ticker(ticker: str) -> list[dict]:
     """Fetch recent news articles for a given ticker via NewsAPI."""
     if not NEWS_API_KEY:
@@ -176,10 +179,100 @@ def fetch_top_movers_news() -> list[dict]:
         return []
 
 
-def analyse_with_gemini(news_data: list[dict]) -> list[dict]:
+# ─── Technical Analysis via yfinance ──────────────────────────────────────────
+
+def _compute_rsi(closes, period: int = 14) -> float | None:
+    """Compute RSI from a pandas Series of closing prices."""
+    if closes is None or len(closes) < period + 1:
+        return None
+    delta = closes.diff()
+    gain = delta.where(delta > 0, 0.0).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0.0)).rolling(window=period).mean()
+    last_gain = gain.iloc[-1]
+    last_loss = loss.iloc[-1]
+    if last_loss == 0:
+        return 100.0
+    rs = last_gain / last_loss
+    return round(100 - (100 / (1 + rs)), 2)
+
+
+def _fetch_technicals_for_ticker(ticker: str) -> dict | None:
+    """Fetch price history and compute technical indicators for one ticker."""
+    try:
+        tk = yf.Ticker(ticker)
+        # 1-month of daily data for moving averages / RSI
+        hist = tk.history(period="1mo", interval="1d")
+        if hist.empty or len(hist) < 5:
+            return None
+
+        closes = hist["Close"]
+        volumes = hist["Volume"]
+        latest_close = float(closes.iloc[-1])
+        prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else latest_close
+
+        # Moving averages
+        sma_5 = float(closes.rolling(5).mean().iloc[-1]) if len(closes) >= 5 else None
+        sma_10 = float(closes.rolling(10).mean().iloc[-1]) if len(closes) >= 10 else None
+        sma_20 = float(closes.rolling(20).mean().iloc[-1]) if len(closes) >= 20 else None
+
+        # RSI
+        rsi = _compute_rsi(closes)
+
+        # MACD (12, 26, 9)
+        macd_val = None
+        macd_signal = None
+        if len(closes) >= 26:
+            ema12 = closes.ewm(span=12, adjust=False).mean()
+            ema26 = closes.ewm(span=26, adjust=False).mean()
+            macd_line = ema12 - ema26
+            signal_line = macd_line.ewm(span=9, adjust=False).mean()
+            macd_val = round(float(macd_line.iloc[-1]), 4)
+            macd_signal = round(float(signal_line.iloc[-1]), 4)
+
+        # Volume spike (today vs 10-day average)
+        avg_vol_10 = float(volumes.rolling(10).mean().iloc[-1]) if len(volumes) >= 10 else None
+        latest_vol = float(volumes.iloc[-1])
+        vol_ratio = round(latest_vol / avg_vol_10, 2) if avg_vol_10 and avg_vol_10 > 0 else None
+
+        # Day change
+        day_change_pct = round((latest_close - prev_close) / prev_close * 100, 2) if prev_close else 0
+
+        return {
+            "ticker": ticker,
+            "price": round(latest_close, 2),
+            "prev_close": round(prev_close, 2),
+            "day_change_pct": day_change_pct,
+            "sma_5": round(sma_5, 2) if sma_5 else None,
+            "sma_10": round(sma_10, 2) if sma_10 else None,
+            "sma_20": round(sma_20, 2) if sma_20 else None,
+            "rsi_14": rsi,
+            "macd": macd_val,
+            "macd_signal": macd_signal,
+            "volume": int(latest_vol),
+            "vol_vs_avg": vol_ratio,
+        }
+    except Exception as e:
+        logger.debug(f"Technical fetch failed for {ticker}: {e}")
+        return None
+
+
+def fetch_technicals_batch(tickers: list[str], max_workers: int = 10) -> list[dict]:
+    """Fetch technical indicators for a batch of tickers in parallel."""
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_fetch_technicals_for_ticker, t): t for t in tickers}
+        for future in concurrent.futures.as_completed(futures):
+            data = future.result()
+            if data:
+                results.append(data)
+    logger.info(f"Fetched technicals for {len(results)}/{len(tickers)} tickers.")
+    return results
+
+
+def analyse_with_gemini(news_data: list[dict], technicals: list[dict] | None = None) -> list[dict]:
     """
-    Uses Gemini to analyse news and return ranked stock recommendations
-    for the current trading day using structured JSON output.
+    Uses Gemini to analyse news + technical data and return ranked stock
+    recommendations for the current trading day using structured JSON output.
 
     Returns: list of {"ticker": str, "reason": str, "confidence": float (0-1)}
     """
@@ -196,37 +289,76 @@ def analyse_with_gemini(news_data: list[dict]) -> list[dict]:
 
     universe_str = ", ".join(NASDAQ_UNIVERSE)
 
-    prompt = f"""You are an elite day-trader AI assistant analysing NASDAQ stocks for {today}.
+    # Build technical data section
+    tech_section = ""
+    if technicals:
+        tech_json = json.dumps(technicals, indent=2)
+        if len(tech_json) > 6000:
+            tech_json = tech_json[:6000] + "\n... (truncated)"
+        tech_section = f"""
+TECHNICAL DATA (real-time indicators for key tickers):
+{tech_json}
+"""
 
-You have access to news about a wide universe of NASDAQ-listed stocks. Below is the full list 
-of tickers you are authorised to recommend from:
+    prompt = f"""You are an elite quantitative day-trading AI analysing NASDAQ stocks for {today}.
+Your job is to identify the BEST stocks to BUY at market open that will RISE during the trading day.
+
+═══ AUTHORISED TICKER UNIVERSE ═══
 {universe_str}
 
-Below is a collection of recent news articles for various stocks and the broader market.
-Your task is to identify up to 5 stocks from the universe above that are MOST LIKELY to have
-a positive price movement TODAY (intraday) based on news sentiment, earnings surprises,
-product announcements, analyst upgrades, FDA approvals, contract wins, or other bullish catalysts.
+═══ ANALYSIS METHODOLOGY ═══
+Apply ALL of the following factors to score each candidate. Only recommend stocks where
+multiple factors converge bullishly:
 
-IMPORTANT RULES:
-- Only recommend stocks with STRONG bullish evidence from the news.
-- You may ONLY recommend tickers that appear in the universe list above.
-- Do NOT recommend stocks with neutral or mixed news.
-- If fewer than 3 stocks meet the criteria, return only those that do. Return an empty array if none qualify.
-- Focus on stocks likely to see a 1–5%+ intraday gain.
-- Confidence is 0.0 to 1.0 where 1.0 = extremely confident.
+1. NEWS CATALYST (Weight: 35%)
+   - Earnings beats / positive guidance revisions
+   - Product launches, major partnerships, or contract wins
+   - FDA approvals, clinical trial successes
+   - Analyst upgrades with price-target increases
+   - Insider buying or institutional accumulation reports
+   - Sector-wide tailwinds (e.g. AI spending surge, rate cut expectations)
+   NEGATIVE: Lawsuits, recalls, downgrades, executive departures → DISQUALIFY
 
-News Data:
+2. TECHNICAL MOMENTUM (Weight: 30%)
+   - RSI between 40–65 is ideal (not overbought, showing momentum)
+   - RSI < 30 with a bullish catalyst = oversold bounce opportunity
+   - RSI > 75 = AVOID (overbought, likely to pull back)
+   - Price above SMA-5 and SMA-10 = short-term uptrend ✓
+   - MACD line above signal line = bullish crossover ✓
+   - Volume spike (vol_vs_avg > 1.5) confirms conviction
+
+3. PRICE ACTION (Weight: 20%)
+   - Gap-up in pre-market on high volume = strong momentum
+   - Positive day_change_pct with rising volume = buyers in control
+   - Look for stocks breaking above recent resistance
+
+4. RISK MANAGEMENT (Weight: 15%)
+   - Avoid penny stocks (price < $5) — too volatile, wide spreads
+   - Avoid stocks with negative news even if technicals look good
+   - Prefer liquid, mid-to-large cap stocks for reliable fills
+   - Avoid stocks already up >8% pre-market (likely to fade)
+
+═══ CONFIDENCE SCORING ═══
+- 0.90–1.00: Exceptional — strong catalyst + perfect technicals + high volume
+- 0.80–0.89: Strong — clear catalyst + supportive technicals
+- 0.70–0.79: Good — decent catalyst OR strong technicals, some uncertainty
+- 0.60–0.69: Marginal — weak signal, do NOT recommend unless very compelling
+- Below 0.60: Do NOT include
+
+ONLY return stocks you are genuinely confident will rise TODAY (intraday).
+If no stocks meet the bar, return an EMPTY array []. Quality over quantity.
+
+═══ NEWS DATA ═══
 {news_json}
-
-Respond ONLY with a valid JSON array. No markdown, no explanation outside the JSON.
-Format:
+{tech_section}
+═══ OUTPUT FORMAT ═══
+Respond ONLY with a valid JSON array. No markdown fences, no explanation outside the JSON.
 [
   {{
     "ticker": "NVDA",
-    "reason": "Beat earnings expectations by 15%, analyst upgrades from 3 firms.",
+    "reason": "Beat Q4 earnings by 22%, 3 analyst upgrades, RSI 52 (bullish momentum), MACD bullish crossover, volume 2.1x average — strong multi-factor buy.",
     "confidence": 0.92
-  }},
-  ...
+  }}
 ]"""
 
     try:
@@ -245,7 +377,7 @@ Format:
         if not isinstance(recommendations, list):
             raise ValueError("Gemini did not return a list")
 
-        # Validate structure
+        # Validate structure and sort by confidence descending
         validated = []
         for rec in recommendations:
             if isinstance(rec, dict) and "ticker" in rec and "reason" in rec:
@@ -254,6 +386,7 @@ Format:
                     "reason": str(rec.get("reason", "")),
                     "confidence": float(rec.get("confidence", 0.5)),
                 })
+        validated.sort(key=lambda r: r["confidence"], reverse=True)
         return validated
 
     except Exception as e:
@@ -264,7 +397,8 @@ Format:
 def run_daily_scan() -> list[dict]:
     """
     Main entry point: scans the market and returns AI-ranked stock picks.
-    Fetches news for watchlist tickers + top movers, then asks Gemini to rank.
+    Fetches news for watchlist tickers + top movers, fetches real-time
+    technical indicators, then asks Gemini to rank.
     """
     logger.info("Starting daily market scan...")
 
@@ -284,7 +418,6 @@ def run_daily_scan() -> list[dict]:
     ])
 
     # Step 2: Fetch individual ticker news for the hot list (rate-limit safe)
-    # Full universe of 500+ tickers is passed to Gemini as context above
     logger.info(f"Fetching news for {len(NASDAQ_HOT_LIST)} hot-list tickers...")
     rate_limited = False
     for ticker in NASDAQ_HOT_LIST:
@@ -299,12 +432,18 @@ def run_daily_scan() -> list[dict]:
         all_news.extend(articles)
         time.sleep(0.25)  # 250 ms gap → ~4 req/s, well under NewsAPI limits
 
-    logger.info(f"Fetched {len(all_news)} news articles. Sending to Gemini...")
+    logger.info(f"Fetched {len(all_news)} news articles.")
 
-    # Step 3: AI analysis
-    recommendations = analyse_with_gemini(all_news)
+    # Step 3: Fetch technical indicators for the hot list
+    logger.info(f"Fetching technical indicators for {len(NASDAQ_HOT_LIST)} tickers...")
+    technicals = fetch_technicals_batch(NASDAQ_HOT_LIST, max_workers=10)
+
+    logger.info(f"Sending {len(all_news)} articles + {len(technicals)} technical profiles to Gemini...")
+
+    # Step 4: AI analysis with both news + technicals
+    recommendations = analyse_with_gemini(all_news, technicals)
 
     logger.info(f"Scan complete. {len(recommendations)} stock(s) recommended: "
-                f"{[r['ticker'] for r in recommendations]}")
+                f"{[f\"{r['ticker']}({r['confidence']:.0%})\" for r in recommendations]}")
 
     return recommendations
