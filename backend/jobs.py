@@ -3,7 +3,7 @@ import threading
 from datetime import datetime, timezone
 from database import SessionLocal, get_setting
 from models import Trade, SystemLog
-from ai_analyst import run_daily_scan
+from ai_analyst import run_daily_scan, verify_ticker_momentum
 from trader import IBKRClient
 
 logger = logging.getLogger(__name__)
@@ -199,6 +199,13 @@ def job_morning_scan_and_buy():
             log_event(db, "buy",
                       f"Placing BUY order for {ticker} "
                       f"(confidence={confidence:.0%}): {reason}")
+
+            # Pre-buy momentum gate: reject if stock has dropped >3% in last 3 days
+            if not verify_ticker_momentum(ticker):
+                log_event(db, "buy",
+                          f"⚠️ Skipped {ticker} — failed pre-buy momentum check "
+                          f"(down >3%% over recent sessions despite AI recommendation)")
+                continue
 
             result = client.place_buy_order(ticker, budget_per_trade)
 
