@@ -200,8 +200,8 @@ def _fetch_technicals_for_ticker(ticker: str) -> dict | None:
     """Fetch price history and compute technical indicators for one ticker."""
     try:
         tk = yf.Ticker(ticker)
-        # 1-month of daily data for moving averages / RSI
-        hist = tk.history(period="1mo", interval="1d")
+        # 3-month daily data for trend detection, moving averages, and RSI
+        hist = tk.history(period="3mo", interval="1d")
         if hist.empty or len(hist) < 5:
             return None
 
@@ -214,6 +214,7 @@ def _fetch_technicals_for_ticker(ticker: str) -> dict | None:
         sma_5 = float(closes.rolling(5).mean().iloc[-1]) if len(closes) >= 5 else None
         sma_10 = float(closes.rolling(10).mean().iloc[-1]) if len(closes) >= 10 else None
         sma_20 = float(closes.rolling(20).mean().iloc[-1]) if len(closes) >= 20 else None
+        sma_50 = float(closes.rolling(50).mean().iloc[-1]) if len(closes) >= 50 else None
 
         # RSI
         rsi = _compute_rsi(closes)
@@ -237,14 +238,21 @@ def _fetch_technicals_for_ticker(ticker: str) -> dict | None:
         # Day change
         day_change_pct = round((latest_close - prev_close) / prev_close * 100, 2) if prev_close else 0
 
+        # Multi-timeframe momentum (percentage returns)
+        mom_5d = round((latest_close / float(closes.iloc[-6]) - 1) * 100, 2) if len(closes) >= 6 else None
+        mom_20d = round((latest_close / float(closes.iloc[-21]) - 1) * 100, 2) if len(closes) >= 21 else None
+
         return {
             "ticker": ticker,
             "price": round(latest_close, 2),
             "prev_close": round(prev_close, 2),
             "day_change_pct": day_change_pct,
+            "mom_5d": mom_5d,
+            "mom_20d": mom_20d,
             "sma_5": round(sma_5, 2) if sma_5 else None,
             "sma_10": round(sma_10, 2) if sma_10 else None,
             "sma_20": round(sma_20, 2) if sma_20 else None,
+            "sma_50": round(sma_50, 2) if sma_50 else None,
             "rsi_14": rsi,
             "macd": macd_val,
             "macd_signal": macd_signal,
@@ -269,7 +277,122 @@ def fetch_technicals_batch(tickers: list[str], max_workers: int = 10) -> list[di
     return results
 
 
-def analyse_with_gemini(news_data: list[dict], technicals: list[dict] | None = None) -> list[dict]:
+# ─── Market Regime & Pre-Filtering ────────────────────────────────────────────
+
+def check_market_regime() -> dict:
+    """Check overall NASDAQ market health via QQQ ETF.
+
+    Returns a dict with regime ('bullish', 'neutral', 'bearish'),
+    recent QQQ changes, and whether price is above SMA-20.
+    Used to scale position sizing and set minimum confidence thresholds.
+    """
+    try:
+        qqq = yf.Ticker("QQQ")
+        hist = qqq.history(period="1mo", interval="1d")
+        if hist.empty or len(hist) < 5:
+            return {"regime": "unknown", "qqq_change_3d": 0, "qqq_change_5d": 0}
+
+        closes = hist["Close"]
+        latest = float(closes.iloc[-1])
+        change_3d = round((latest / float(closes.iloc[-4]) - 1) * 100, 2) if len(closes) >= 4 else 0
+        change_5d = round((latest / float(closes.iloc[-6]) - 1) * 100, 2) if len(closes) >= 6 else 0
+        sma_20 = float(closes.rolling(20).mean().iloc[-1]) if len(closes) >= 20 else latest
+
+        if change_3d < -2.0 or (change_5d < -3.0 and latest < sma_20):
+            regime = "bearish"
+        elif change_3d > 1.0 and latest > sma_20:
+            regime = "bullish"
+        else:
+            regime = "neutral"
+
+        return {
+            "regime": regime,
+            "qqq_price": round(latest, 2),
+            "qqq_change_3d": change_3d,
+            "qqq_change_5d": change_5d,
+            "qqq_above_sma20": latest > sma_20,
+        }
+    except Exception as e:
+        logger.error(f"Market regime check failed: {e}")
+        return {"regime": "unknown", "qqq_change_3d": 0, "qqq_change_5d": 0}
+
+
+def pre_filter_candidates(technicals: list[dict]) -> list[dict]:
+    """Remove stocks that are obviously in downtrends before sending to AI.
+
+    This saves API tokens and prevents the AI from being tempted by
+    stocks that look cheap but are actually falling knives.
+    """
+    filtered = []
+    rejected = []
+
+    for t in technicals:
+        ticker = t["ticker"]
+        price = t.get("price", 0)
+        sma_20 = t.get("sma_20")
+        sma_50 = t.get("sma_50")
+        rsi = t.get("rsi_14")
+        mom_5d = t.get("mom_5d")
+        mom_20d = t.get("mom_20d")
+
+        # Reject: price below both SMA-20 and SMA-50 (strong downtrend)
+        if sma_20 and sma_50 and price < sma_20 and price < sma_50:
+            rejected.append(f"{ticker}(below SMA-20 & SMA-50)")
+            continue
+
+        # Reject: negative momentum on both timeframes
+        if mom_5d is not None and mom_20d is not None:
+            if mom_5d < -3.0 and mom_20d < -5.0:
+                rejected.append(f"{ticker}(downtrend: 5d={mom_5d}%, 20d={mom_20d}%)")
+                continue
+
+        # Reject: heavily overbought (likely to pull back)
+        if rsi and rsi > 80:
+            rejected.append(f"{ticker}(overbought RSI={rsi})")
+            continue
+
+        # Reject: penny stocks
+        if price < 5.0:
+            rejected.append(f"{ticker}(penny stock ${price})")
+            continue
+
+        filtered.append(t)
+
+    if rejected:
+        logger.info(f"Pre-filter rejected {len(rejected)} ticker(s): {', '.join(rejected[:15])}")
+    logger.info(f"Pre-filter passed {len(filtered)}/{len(technicals)} tickers.")
+    return filtered
+
+
+def verify_ticker_momentum(ticker: str) -> bool:
+    """Quick pre-buy check: reject stocks that are actively declining.
+
+    Runs just before order execution to catch stocks that may have
+    turned negative between the AI scan and the buy order.
+    """
+    try:
+        tk = yf.Ticker(ticker)
+        hist = tk.history(period="5d", interval="1d")
+        if hist.empty or len(hist) < 3:
+            return True  # Insufficient data — allow the trade
+
+        closes = hist["Close"]
+        latest = float(closes.iloc[-1])
+        three_days_ago = float(closes.iloc[0]) if len(closes) >= 3 else latest
+
+        change = (latest / three_days_ago - 1) * 100
+
+        if change < -3.0:
+            logger.warning(f"Pre-buy check FAILED for {ticker}: down {change:.1f}% over recent sessions")
+            return False
+
+        return True
+    except Exception as e:
+        logger.warning(f"Pre-buy momentum check error for {ticker}: {e}")
+        return True  # On error, allow the trade
+
+
+def analyse_with_gemini(news_data: list[dict], technicals: list[dict] | None = None, market_regime: dict | None = None) -> list[dict]:
     """
     Uses Gemini to analyse news + technical data and return ranked stock
     recommendations for the current trading day using structured JSON output.
@@ -282,10 +405,10 @@ def analyse_with_gemini(news_data: list[dict], technicals: list[dict] | None = N
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # Trim headline blob to avoid token limits — 8KB cap
+    # Trim headline blob to avoid token limits — 10KB cap
     news_json = json.dumps(news_data, indent=2)
-    if len(news_json) > 8000:
-        news_json = news_json[:8000] + "\n... (truncated)"
+    if len(news_json) > 10000:
+        news_json = news_json[:10000] + "\n... (truncated)"
 
     universe_str = ", ".join(NASDAQ_UNIVERSE)
 
@@ -293,77 +416,119 @@ def analyse_with_gemini(news_data: list[dict], technicals: list[dict] | None = N
     tech_section = ""
     if technicals:
         tech_json = json.dumps(technicals, indent=2)
-        if len(tech_json) > 6000:
-            tech_json = tech_json[:6000] + "\n... (truncated)"
+        if len(tech_json) > 8000:
+            tech_json = tech_json[:8000] + "\n... (truncated)"
         tech_section = f"""
-TECHNICAL DATA (real-time indicators for key tickers):
+TECHNICAL DATA (real-time indicators — includes momentum, moving averages, RSI, MACD):
 {tech_json}
 """
+
+    # Build market regime section
+    regime_section = "No market regime data available."
+    market_caution = ""
+    if market_regime:
+        regime_section = (
+            f"Overall NASDAQ (QQQ) status:\n"
+            f"  - 3-day change: {market_regime.get('qqq_change_3d', 'N/A')}%\n"
+            f"  - 5-day change: {market_regime.get('qqq_change_5d', 'N/A')}%\n"
+            f"  - QQQ above SMA-20: {market_regime.get('qqq_above_sma20', 'N/A')}\n"
+            f"  - Regime: {market_regime.get('regime', 'unknown').upper()}"
+        )
+        if market_regime.get("regime") == "bearish":
+            market_caution = (
+                "\n⚠️ BEARISH MARKET REGIME DETECTED: The broad market is declining. "
+                "Minimum confidence threshold is 0.75. Be VERY selective — only recommend "
+                "stocks with exceptional individual catalysts that can buck the market trend. "
+                "Consider recommending FEWER stocks (1-2 max)."
+            )
+        elif market_regime.get("regime") == "neutral":
+            market_caution = (
+                "\n📊 NEUTRAL MARKET: Minimum confidence threshold is 0.60. "
+                "Require solid technical confirmation before recommending."
+            )
 
     prompt = f"""You are an elite quantitative day-trading AI analysing NASDAQ stocks for {today}.
 Your job is to identify stocks to BUY at market open that will RISE during the trading day.
 
-You MUST recommend between 1 and 5 stocks. Look across the entire universe and find
-every stock that has a genuine reason to go up today. Do NOT limit yourself to just one —
-if you see 3 good setups, recommend all 3. If you see 5, recommend 5.
+QUALITY OVER QUANTITY — recommend 1 to 5 stocks, but only include stocks with genuinely
+strong setups. If only 1 stock has a great setup, recommend only 1. Do NOT pad the list
+with mediocre picks just to reach 5.
+
+═══ MARKET REGIME ═══
+{regime_section}
 
 ═══ AUTHORISED TICKER UNIVERSE ═══
 {universe_str}
 
+═══ MANDATORY REJECTION CRITERIA ═══
+IMMEDIATELY DISQUALIFY any stock matching ANY of these — do NOT recommend it regardless
+of how appealing the news looks:
+- Price BELOW both SMA-20 AND SMA-50 → confirmed downtrend, do NOT buy "cheap" falling stocks
+- RSI > 75 → overbought, will likely pull back today
+- Negative momentum on BOTH 5-day (mom_5d < 0) AND 20-day (mom_20d < -3%) → accelerating decline
+- Price below $5 → penny stock, unreliable, wide spreads
+- Stock already up >8% in recent days → extended, likely to fade/mean-revert
+- Any negative news: lawsuits, earnings misses, downgrades, FDA rejections → DISQUALIFY
+- MACD bearish crossover (MACD < signal) WITH declining volume → distribution pattern
+
+═══ STRONG BUY REQUIREMENTS (need at least 3 of these) ═══
+1. ✅ Positive news catalyst (earnings beat, analyst upgrade, partnership, product launch)
+2. ✅ RSI between 40-65 (momentum without being overbought)
+3. ✅ Price ABOVE SMA-20 (short-term uptrend confirmed)
+4. ✅ Price ABOVE SMA-50 (medium-term trend support)
+5. ✅ MACD line ABOVE signal line (bullish crossover)
+6. ✅ Volume spike (vol_vs_avg > 1.3) — institutional interest
+7. ✅ Positive 5-day momentum (mom_5d > 0%)
+8. ✅ Positive 20-day momentum (mom_20d > 0%)
+
 ═══ ANALYSIS METHODOLOGY ═══
-Apply the following factors to evaluate each candidate:
+1. TECHNICAL MOMENTUM (Weight: 35%)
+   - Check ALL moving averages: SMA-5, SMA-10, SMA-20, SMA-50
+   - Price above SMA-20 AND SMA-50 = strong uptrend ✓
+   - MACD line above signal = bullish ✓
+   - RSI 40-65 ideal range
+   - Volume confirms the move (vol_vs_avg > 1.3)
+   - Check mom_5d and mom_20d — BOTH should be positive or one strongly positive
 
-1. NEWS CATALYST (Weight: 35%)
-   - Earnings beats / positive guidance revisions
-   - Product launches, major partnerships, or contract wins
+2. NEWS CATALYST (Weight: 30%)
+   - Earnings beats / positive guidance / analyst upgrades
+   - Product launches, major partnerships, contract wins
    - FDA approvals, clinical trial successes
-   - Analyst upgrades with price-target increases
-   - Insider buying or institutional accumulation reports
-   - Sector-wide tailwinds (e.g. AI spending surge, rate cut expectations)
-   NEGATIVE: Lawsuits, recalls, downgrades, executive departures → DISQUALIFY
+   - Sector tailwinds (AI spending, rate cuts, etc.)
 
-2. TECHNICAL MOMENTUM (Weight: 30%)
-   - RSI between 40–65 is ideal (not overbought, showing momentum)
-   - RSI < 30 with a bullish catalyst = oversold bounce opportunity
-   - RSI > 75 = AVOID (overbought, likely to pull back)
-   - Price above SMA-5 and SMA-10 = short-term uptrend ✓
-   - MACD line above signal line = bullish crossover ✓
-   - Volume spike (vol_vs_avg > 1.5) confirms conviction
-
-3. PRICE ACTION (Weight: 20%)
-   - Gap-up in pre-market on high volume = strong momentum
-   - Positive day_change_pct with rising volume = buyers in control
-   - Look for stocks breaking above recent resistance
+3. TREND CONFIRMATION (Weight: 20%)
+   - Price above SMA-50 = medium-term uptrend
+   - Not extended too far above moving averages (<5% above SMA-20)
+   - Positive momentum on multiple timeframes
 
 4. RISK MANAGEMENT (Weight: 15%)
-   - Avoid penny stocks (price < $5) — too volatile, wide spreads
-   - Avoid stocks with negative news even if technicals look good
    - Prefer liquid, mid-to-large cap stocks for reliable fills
-   - Avoid stocks already up >8% pre-market (likely to fade)
+   - In a BEARISH market regime, require STRONGER signals and HIGHER confidence
+   - Avoid binary events (earnings within 24h, FDA decisions)
 
 ═══ CONFIDENCE SCORING ═══
-Assign a confidence between 0.0 and 1.0 reflecting how likely the stock is to go up today.
-Be honest but not overly conservative. If the setup looks good, rate it accordingly.
-
-IMPORTANT: Recommend 1-5 stocks. Do NOT return an empty array unless there is
-truly nothing worth buying today (e.g. major market crash, all indicators bearish).
-The goal is to find opportunities — be proactive, not overly cautious.
+- 0.80-1.00: Multiple strong catalysts + perfect technicals + volume confirmation
+- 0.65-0.79: Good catalyst + supportive technicals (at least 3 buy signals)
+- 0.50-0.64: Moderate setup — only recommend if nothing better available
+- Below 0.50: Do NOT recommend
+{market_caution}
 
 ═══ NEWS DATA ═══
 {news_json}
 {tech_section}
 ═══ OUTPUT FORMAT ═══
 Respond ONLY with a valid JSON array. No markdown fences, no explanation outside the JSON.
+Each recommendation MUST reference specific technical data points from the data above.
 [
   {{
     "ticker": "NVDA",
-    "reason": "Beat Q4 earnings by 22%, 3 analyst upgrades, RSI 52 (bullish momentum), MACD bullish crossover, volume 2.1x average — strong multi-factor buy.",
+    "reason": "Beat Q4 earnings by 22%, 3 analyst upgrades. Technicals: RSI 52, price $820 above SMA-20 ($795) and SMA-50 ($760), MACD bullish crossover, volume 2.1x average, mom_5d +3.2%, mom_20d +8.1% — strong multi-factor buy.",
     "confidence": 0.85
   }}
 ]"""
 
     try:
-        model = genai.GenerativeModel("gemini-2.5-flash-lite")
+        model = genai.GenerativeModel("gemini-2.5-flash")
         response = model.generate_content(prompt)
         text = response.text.strip()
 
@@ -435,14 +600,33 @@ def run_daily_scan() -> list[dict]:
 
     logger.info(f"Fetched {len(all_news)} news articles.")
 
-    # Step 3: Fetch technical indicators for the hot list
+    # Step 3: Check market regime (QQQ trend)
+    logger.info("Checking market regime (QQQ)...")
+    market_regime = check_market_regime()
+    regime = market_regime.get("regime", "unknown")
+    logger.info(
+        f"Market regime: {regime.upper()} | QQQ 3d: {market_regime.get('qqq_change_3d')}%, "
+        f"5d: {market_regime.get('qqq_change_5d')}%"
+    )
+
+    # In a severe downturn, warn but continue (the prompt adjusts thresholds)
+    if regime == "bearish":
+        logger.warning("⚠️ Bearish market detected — AI will apply stricter filters.")
+
+    # Step 4: Fetch technical indicators for the hot list
     logger.info(f"Fetching technical indicators for {len(NASDAQ_HOT_LIST)} tickers...")
     technicals = fetch_technicals_batch(NASDAQ_HOT_LIST, max_workers=10)
 
-    logger.info(f"Sending {len(all_news)} articles + {len(technicals)} technical profiles to Gemini...")
+    # Step 5: Pre-filter — remove obvious losers before AI analysis
+    filtered_technicals = pre_filter_candidates(technicals)
 
-    # Step 4: AI analysis with both news + technicals
-    recommendations = analyse_with_gemini(all_news, technicals)
+    logger.info(
+        f"Sending {len(all_news)} articles + {len(filtered_technicals)} filtered technical "
+        f"profiles (from {len(technicals)} total) to Gemini ({regime} regime)..."
+    )
+
+    # Step 6: AI analysis with news + filtered technicals + market context
+    recommendations = analyse_with_gemini(all_news, filtered_technicals, market_regime)
 
     picks = [f"{r['ticker']}({r['confidence']:.0%})" for r in recommendations]
     logger.info(f"Scan complete. {len(recommendations)} stock(s) recommended: {picks}")
