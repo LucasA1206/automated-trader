@@ -108,15 +108,11 @@ NASDAQ_UNIVERSE = [
 seen = set()
 NASDAQ_UNIVERSE = [t for t in NASDAQ_UNIVERSE if not (t in seen or seen.add(t))]
 
-# ─── Top 50 most active tickers for individual news API calls ────────────────
-# (NewsAPI rate limits prevent fetching all 500 individually)
-NASDAQ_HOT_LIST = [
-    "AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "TSLA", "AVGO", "AMD",
-    "INTC", "QCOM", "ARM", "SMCI", "MU", "SNOW", "PLTR", "CRWD", "NET",
-    "ZS", "DDOG", "PANW", "COIN", "MSTR", "RBLX", "SHOP", "ADBE", "CRM",
-    "NOW", "MNDY", "AFRM", "SOFI", "RIVN", "LCID", "NIO", "XPEV",
-    "MRNA", "REGN", "BIIB", "VRTX", "ILMN", "ISRG", "DXCM",
-    "FSLR", "ENPH", "PLUG", "JOBY", "ACHR", "RKLB", "HOOD",
+# ─── Core tickers always included in the daily hot list ──────────────────────
+# These mega-caps move markets — we always want news + technicals for them.
+CORE_TICKERS = [
+    "AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "TSLA", "AVGO",
+    "AMD", "PLTR", "COIN", "CRM", "NFLX", "CRWD",
 ]
 
 
@@ -392,6 +388,105 @@ def verify_ticker_momentum(ticker: str) -> bool:
         return True  # On error, allow the trade
 
 
+def _quick_screen_universe(
+    universe: list[str],
+    top_n: int = 50,
+) -> list[str]:
+    """Dynamically screen the full ticker universe to find today's best candidates.
+
+    Uses a free yfinance batch download (no API credits) to fetch 1-month daily
+    data for every ticker, compute quick technical metrics, and rank them by a
+    composite momentum/trend/RSI score.  Returns the top_n tickers — always
+    including CORE_TICKERS so mega-cap movers are never missed.
+
+    This replaces the old static NASDAQ_HOT_LIST so the scanner adapts daily
+    to wherever the momentum is.
+    """
+    logger.info(f"Dynamic screening {len(universe)} tickers to find top {top_n}...")
+
+    try:
+        # Batch download — far faster than individual yf.Ticker() calls
+        data = yf.download(
+            universe,
+            period="1mo",
+            interval="1d",
+            group_by="ticker",
+            threads=True,
+            progress=False,
+        )
+
+        if data.empty:
+            logger.warning("Batch download returned empty data. Using core tickers only.")
+            return list(CORE_TICKERS)
+
+        scores: list[tuple[str, float]] = []
+
+        for ticker in universe:
+            try:
+                if ticker not in data.columns.get_level_values(0):
+                    continue
+                ticker_df = data[ticker]
+                closes = ticker_df["Close"].dropna()
+                volumes = ticker_df["Volume"].dropna()
+
+                if len(closes) < 10:
+                    continue
+
+                latest = float(closes.iloc[-1])
+                if latest < 5.0:  # skip penny stocks
+                    continue
+
+                # ── Quick metrics ──
+                mom_5d = ((latest / float(closes.iloc[-6])) - 1) * 100 if len(closes) >= 6 else 0.0
+                mom_10d = ((latest / float(closes.iloc[-11])) - 1) * 100 if len(closes) >= 11 else 0.0
+                sma_20 = float(closes.rolling(20).mean().iloc[-1]) if len(closes) >= 20 else latest
+                above_sma20 = latest > sma_20
+                rsi = _compute_rsi(closes) or 50.0
+                avg_vol = float(volumes.rolling(10).mean().iloc[-1]) if len(volumes) >= 10 else 1.0
+                vol_ratio = float(volumes.iloc[-1]) / avg_vol if avg_vol > 0 else 1.0
+
+                # ── Composite score ──
+                score = 0.0
+                score += mom_5d * 2.0 + mom_10d * 1.0          # momentum (biggest weight)
+                score += 15 if 40 <= rsi <= 65 else (5 if 30 <= rsi <= 75 else (-20 if rsi > 80 else -10))
+                score += 10 if above_sma20 else -10             # trend
+                score += 10 if vol_ratio > 1.5 else (5 if vol_ratio > 1.2 else 0)  # volume
+
+                scores.append((ticker, score))
+            except Exception:
+                continue
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+
+        # Build final list — CORE_TICKERS first, then top scorers
+        selected: set[str] = set()
+        hot_list: list[str] = []
+        screened_set = {s[0] for s in scores}
+
+        for t in CORE_TICKERS:
+            if t in screened_set:
+                hot_list.append(t)
+                selected.add(t)
+
+        for ticker, _ in scores:
+            if len(hot_list) >= top_n:
+                break
+            if ticker not in selected:
+                hot_list.append(ticker)
+                selected.add(ticker)
+
+        top5 = [(t, f"{s:.1f}") for t, s in scores[:5]]
+        logger.info(
+            f"Dynamic screening complete. Selected {len(hot_list)} tickers. "
+            f"Top 5 by score: {top5}"
+        )
+        return hot_list
+
+    except Exception as e:
+        logger.error(f"Dynamic screening failed ({e}). Falling back to core tickers.")
+        return list(CORE_TICKERS)
+
+
 def analyse_with_gemini(news_data: list[dict], technicals: list[dict] | None = None, market_regime: dict | None = None) -> list[dict]:
     """
     Uses Gemini to analyse news + technical data and return ranked stock
@@ -583,24 +678,7 @@ def run_daily_scan() -> list[dict]:
         for a in top_news if a.get("title")
     ])
 
-    # Step 2: Fetch individual ticker news for the hot list (rate-limit safe)
-    logger.info(f"Fetching news for {len(NASDAQ_HOT_LIST)} hot-list tickers...")
-    rate_limited = False
-    for ticker in NASDAQ_HOT_LIST:
-        if rate_limited:
-            break
-        articles = fetch_news_for_ticker(ticker)
-        if articles is None:
-            # 429 received — stop hammering the API
-            rate_limited = True
-            logger.warning("NewsAPI rate limit reached. Proceeding with partial news data.")
-            break
-        all_news.extend(articles)
-        time.sleep(0.25)  # 250 ms gap → ~4 req/s, well under NewsAPI limits
-
-    logger.info(f"Fetched {len(all_news)} news articles.")
-
-    # Step 3: Check market regime (QQQ trend)
+    # Step 2: Check market regime (QQQ trend)
     logger.info("Checking market regime (QQQ)...")
     market_regime = check_market_regime()
     regime = market_regime.get("regime", "unknown")
@@ -609,13 +687,31 @@ def run_daily_scan() -> list[dict]:
         f"5d: {market_regime.get('qqq_change_5d')}%"
     )
 
-    # In a severe downturn, warn but continue (the prompt adjusts thresholds)
     if regime == "bearish":
         logger.warning("⚠️ Bearish market detected — AI will apply stricter filters.")
 
-    # Step 4: Fetch technical indicators for the hot list
-    logger.info(f"Fetching technical indicators for {len(NASDAQ_HOT_LIST)} tickers...")
-    technicals = fetch_technicals_batch(NASDAQ_HOT_LIST, max_workers=10)
+    # Step 3: Dynamic screen — find today's best candidates from full universe
+    hot_list = _quick_screen_universe(NASDAQ_UNIVERSE, top_n=50)
+
+    # Step 4: Fetch individual ticker news for the dynamic hot list
+    logger.info(f"Fetching news for {len(hot_list)} dynamically selected tickers...")
+    rate_limited = False
+    for ticker in hot_list:
+        if rate_limited:
+            break
+        articles = fetch_news_for_ticker(ticker)
+        if articles is None:
+            rate_limited = True
+            logger.warning("NewsAPI rate limit reached. Proceeding with partial news data.")
+            break
+        all_news.extend(articles)
+        time.sleep(0.25)  # 250 ms gap → ~4 req/s, well under NewsAPI limits
+
+    logger.info(f"Fetched {len(all_news)} news articles.")
+
+    # Step 5: Fetch detailed technical indicators for the hot list
+    logger.info(f"Fetching technical indicators for {len(hot_list)} tickers...")
+    technicals = fetch_technicals_batch(hot_list, max_workers=10)
 
     # Step 5: Pre-filter — remove obvious losers before AI analysis
     filtered_technicals = pre_filter_candidates(technicals)
