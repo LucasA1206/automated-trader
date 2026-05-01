@@ -295,9 +295,10 @@ def check_market_regime() -> dict:
         change_5d = round((latest / float(closes.iloc[-6]) - 1) * 100, 2) if len(closes) >= 6 else 0
         sma_20 = float(closes.rolling(20).mean().iloc[-1]) if len(closes) >= 20 else latest
 
-        if change_3d < -2.0 or (change_5d < -3.0 and latest < sma_20):
+        # Loosened thresholds — only flag bearish in a genuine sell-off
+        if change_3d < -3.0 or (change_5d < -5.0 and latest < sma_20):
             regime = "bearish"
-        elif change_3d > 1.0 and latest > sma_20:
+        elif change_3d > 0.5 and latest > sma_20:
             regime = "bullish"
         else:
             regime = "neutral"
@@ -319,6 +320,7 @@ def pre_filter_candidates(technicals: list[dict]) -> list[dict]:
 
     This saves API tokens and prevents the AI from being tempted by
     stocks that look cheap but are actually falling knives.
+    Loosened to allow borderline candidates through — let the AI decide.
     """
     filtered = []
     rejected = []
@@ -331,25 +333,28 @@ def pre_filter_candidates(technicals: list[dict]) -> list[dict]:
         rsi = t.get("rsi_14")
         mom_5d = t.get("mom_5d")
         mom_20d = t.get("mom_20d")
+        macd = t.get("macd")
+        macd_signal = t.get("macd_signal")
 
-        # Reject: price below both SMA-20 and SMA-50 (strong downtrend)
-        if sma_20 and sma_50 and price < sma_20 and price < sma_50:
-            rejected.append(f"{ticker}(below SMA-20 & SMA-50)")
+        # Reject: price WELL below both SMA-20 and SMA-50 (strong downtrend)
+        # Only reject if price is >3% below both — slight dips are OK
+        if sma_20 and sma_50 and price < sma_20 * 0.97 and price < sma_50 * 0.97:
+            rejected.append(f"{ticker}(well below SMA-20 & SMA-50)")
             continue
 
-        # Reject: negative momentum on both timeframes
+        # Reject: heavy negative momentum on both timeframes
         if mom_5d is not None and mom_20d is not None:
-            if mom_5d < -3.0 and mom_20d < -5.0:
+            if mom_5d < -5.0 and mom_20d < -8.0:
                 rejected.append(f"{ticker}(downtrend: 5d={mom_5d}%, 20d={mom_20d}%)")
                 continue
 
-        # Reject: heavily overbought (likely to pull back)
-        if rsi and rsi > 80:
+        # Reject: extremely overbought (likely to pull back hard)
+        if rsi and rsi > 85:
             rejected.append(f"{ticker}(overbought RSI={rsi})")
             continue
 
         # Reject: penny stocks
-        if price < 5.0:
+        if price < 3.0:
             rejected.append(f"{ticker}(penny stock ${price})")
             continue
 
@@ -362,10 +367,11 @@ def pre_filter_candidates(technicals: list[dict]) -> list[dict]:
 
 
 def verify_ticker_momentum(ticker: str) -> bool:
-    """Quick pre-buy check: reject stocks that are actively declining.
+    """Quick pre-buy check: reject stocks that are actively crashing.
 
     Runs just before order execution to catch stocks that may have
-    turned negative between the AI scan and the buy order.
+    turned sharply negative between the AI scan and the buy order.
+    Only blocks genuine crashes, not normal pullbacks.
     """
     try:
         tk = yf.Ticker(ticker)
@@ -379,7 +385,7 @@ def verify_ticker_momentum(ticker: str) -> bool:
 
         change = (latest / three_days_ago - 1) * 100
 
-        if change < -3.0:
+        if change < -5.0:
             logger.warning(f"Pre-buy check FAILED for {ticker}: down {change:.1f}% over recent sessions")
             return False
 
@@ -571,23 +577,23 @@ TECHNICAL DATA (real-time indicators — includes momentum, moving averages, RSI
         )
         if market_regime.get("regime") == "bearish":
             market_caution = (
-                "\n⚠️ BEARISH MARKET REGIME DETECTED: The broad market is declining. "
-                "Minimum confidence threshold is 0.75. Be VERY selective — only recommend "
-                "stocks with exceptional individual catalysts that can buck the market trend. "
-                "Consider recommending FEWER stocks (1-2 max)."
+                "\n⚠️ BEARISH MARKET REGIME: The broad market is weak. "
+                "Minimum confidence threshold is 0.60. Be selective but still look for "
+                "stocks with individual strength or catalysts that can outperform."
             )
         elif market_regime.get("regime") == "neutral":
             market_caution = (
-                "\n📊 NEUTRAL MARKET: Minimum confidence threshold is 0.60. "
-                "Require solid technical confirmation before recommending."
+                "\n📊 NEUTRAL MARKET: Minimum confidence threshold is 0.50. "
+                "Recommend stocks with decent technical setups and positive catalysts."
             )
 
     prompt = f"""You are an elite quantitative day-trading AI analysing NASDAQ stocks for {today}.
 Your job is to identify stocks to BUY at market open that will RISE during the trading day.
 
-QUALITY OVER QUANTITY — recommend 1 to 5 stocks, but only include stocks with genuinely
-strong setups. If only 1 stock has a great setup, recommend only 1. Do NOT pad the list
-with mediocre picks just to reach 5.
+Aim to recommend 1 to 5 stocks. Prioritise quality but don't be overly restrictive —
+if a stock has a reasonable setup with upward momentum, include it. It's better to catch
+a winning stock than to miss it by being too cautious. An empty recommendation list is a
+bad outcome if there are decent setups available.
 
 ═══ MARKET REGIME ═══
 {regime_section}
@@ -596,55 +602,55 @@ with mediocre picks just to reach 5.
 {universe_str}
 
 ═══ MANDATORY REJECTION CRITERIA ═══
-IMMEDIATELY DISQUALIFY any stock matching ANY of these — do NOT recommend it regardless
-of how appealing the news looks:
-- Price BELOW both SMA-20 AND SMA-50 → confirmed downtrend, do NOT buy "cheap" falling stocks
-- RSI > 75 → overbought, will likely pull back today
-- Negative momentum on BOTH 5-day (mom_5d < 0) AND 20-day (mom_20d < -3%) → accelerating decline
-- Price below $5 → penny stock, unreliable, wide spreads
-- Stock already up >8% in recent days → extended, likely to fade/mean-revert
-- Any negative news: lawsuits, earnings misses, downgrades, FDA rejections → DISQUALIFY
-- MACD bearish crossover (MACD < signal) WITH declining volume → distribution pattern
+Only DISQUALIFY stocks that are genuinely dangerous — do NOT reject borderline cases:
+- Price significantly (>3%) BELOW both SMA-20 AND SMA-50 → confirmed downtrend
+- RSI > 80 → heavily overbought, likely to pull back
+- Strongly negative momentum on BOTH 5-day (mom_5d < -3%) AND 20-day (mom_20d < -5%) → accelerating decline
+- Price below $3 → penny stock, unreliable
+- Major negative news: lawsuits, earnings misses, downgrades, FDA rejections → DISQUALIFY
+- Stock up >12% in recent days with declining volume → exhaustion move
 
-═══ STRONG BUY REQUIREMENTS (need at least 3 of these) ═══
-1. ✅ Positive news catalyst (earnings beat, analyst upgrade, partnership, product launch)
-2. ✅ RSI between 40-65 (momentum without being overbought)
-3. ✅ Price ABOVE SMA-20 (short-term uptrend confirmed)
+═══ BUY CRITERIA (need at least 2 of these) ═══
+1. ✅ Positive news catalyst (earnings beat, analyst upgrade, partnership, product launch, sector tailwind)
+2. ✅ RSI between 35-70 (has room to run)
+3. ✅ Price ABOVE SMA-20 (short-term uptrend)
 4. ✅ Price ABOVE SMA-50 (medium-term trend support)
 5. ✅ MACD line ABOVE signal line (bullish crossover)
-6. ✅ Volume spike (vol_vs_avg > 1.3) — institutional interest
+6. ✅ Volume above average (vol_vs_avg > 1.1) — interest present
 7. ✅ Positive 5-day momentum (mom_5d > 0%)
 8. ✅ Positive 20-day momentum (mom_20d > 0%)
 
 ═══ ANALYSIS METHODOLOGY ═══
 1. TECHNICAL MOMENTUM (Weight: 35%)
-   - Check ALL moving averages: SMA-5, SMA-10, SMA-20, SMA-50
-   - Price above SMA-20 AND SMA-50 = strong uptrend ✓
+   - Check moving averages: SMA-5, SMA-10, SMA-20, SMA-50
+   - Price above SMA-20 = solid short-term trend ✓
+   - Price above SMA-50 = strong medium-term trend ✓ (nice to have, not required)
    - MACD line above signal = bullish ✓
-   - RSI 40-65 ideal range
-   - Volume confirms the move (vol_vs_avg > 1.3)
-   - Check mom_5d and mom_20d — BOTH should be positive or one strongly positive
+   - RSI 35-70 is acceptable; 40-60 is ideal
+   - Volume confirms the move (vol_vs_avg > 1.1)
+   - At least one momentum timeframe should be positive
 
 2. NEWS CATALYST (Weight: 30%)
    - Earnings beats / positive guidance / analyst upgrades
    - Product launches, major partnerships, contract wins
    - FDA approvals, clinical trial successes
    - Sector tailwinds (AI spending, rate cuts, etc.)
+   - Absence of negative news is acceptable if technicals are strong
 
 3. TREND CONFIRMATION (Weight: 20%)
-   - Price above SMA-50 = medium-term uptrend
-   - Not extended too far above moving averages (<5% above SMA-20)
-   - Positive momentum on multiple timeframes
+   - Price above SMA-20 = uptrend
+   - Not extended too far above moving averages (<8% above SMA-20)
+   - Positive momentum on at least one timeframe
 
 4. RISK MANAGEMENT (Weight: 15%)
    - Prefer liquid, mid-to-large cap stocks for reliable fills
-   - In a BEARISH market regime, require STRONGER signals and HIGHER confidence
+   - In a BEARISH regime, still recommend stocks with strong individual setups
    - Avoid binary events (earnings within 24h, FDA decisions)
 
 ═══ CONFIDENCE SCORING ═══
-- 0.80-1.00: Multiple strong catalysts + perfect technicals + volume confirmation
-- 0.65-0.79: Good catalyst + supportive technicals (at least 3 buy signals)
-- 0.50-0.64: Moderate setup — only recommend if nothing better available
+- 0.75-1.00: Multiple strong catalysts + great technicals + volume confirmation
+- 0.60-0.74: Good setup with supportive technicals (at least 2 buy signals)
+- 0.50-0.59: Decent setup — recommend if the stock looks poised to move up
 - Below 0.50: Do NOT recommend
 {market_caution}
 
