@@ -16,6 +16,7 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<Tab>('portfolio');
   const [tradingMode, setTradingMode] = useState<'paper' | 'live'>('paper');
   const [authReady, setAuthReady] = useState(false);
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
   // Wait one tick for localStorage rehydration before deciding to show login
   useEffect(() => {
@@ -44,12 +45,30 @@ export default function Home() {
 
   return (
     <div className="app-layout">
+      <div className="mobile-header">
+        <button className="mobile-menu-btn" onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}>
+          ☰
+        </button>
+        <div className="mobile-header-title">
+          <div className="mobile-header-icon">⚡</div>
+          <h1>Blitz Trader</h1>
+        </div>
+      </div>
+      
+      {isMobileMenuOpen && (
+        <div className="mobile-overlay" onClick={() => setIsMobileMenuOpen(false)}></div>
+      )}
+
       <Sidebar
         activeTab={activeTab}
-        setActiveTab={setActiveTab}
+        setActiveTab={(tab) => {
+          setActiveTab(tab);
+          setIsMobileMenuOpen(false); // Close menu on tab selection
+        }}
         tradingMode={tradingMode}
         username={username ?? undefined}
         onLogout={logout}
+        isOpen={isMobileMenuOpen}
       />
       <main className="main-content">
         {activeTab === 'portfolio' && <PortfolioTab authFetch={authFetch} />}
