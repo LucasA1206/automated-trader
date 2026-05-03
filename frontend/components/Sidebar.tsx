@@ -8,6 +8,7 @@ interface Props {
   tradingMode: 'paper' | 'live';
   username?: string;
   onLogout: () => void;
+  isOpen?: boolean;
 }
 
 const navItems: { id: Tab; icon: string; label: string }[] = [
@@ -17,9 +18,9 @@ const navItems: { id: Tab; icon: string; label: string }[] = [
   { id: 'settings', icon: '⚙️', label: 'Settings' },
 ];
 
-export default function Sidebar({ activeTab, setActiveTab, tradingMode, username, onLogout }: Props) {
+export default function Sidebar({ activeTab, setActiveTab, tradingMode, username, onLogout, isOpen }: Props) {
   return (
-    <nav className="sidebar">
+    <nav className={`sidebar ${isOpen ? 'open' : ''}`}>
       <div className="sidebar-logo">
         <div className="sidebar-logo-icon">⚡</div>
         <h1>Blitz Trader</h1>
