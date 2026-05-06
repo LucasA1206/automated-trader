@@ -98,12 +98,8 @@ class SettingsBulkUpdate(BaseModel):
 
 def _sync_strategy_settings(db: Session, account_type: str) -> None:
     """Keep derived strategy settings aligned with the selected strategy preset."""
-    if account_type == "margin":
-        set_setting(db, "daily_budget_pct", "100")
-        set_setting(db, "max_positions", "5")
-    else:
-        set_setting(db, "daily_budget_pct", "50")
-        set_setting(db, "max_positions", "3")
+    set_setting(db, "daily_budget_pct", "100")
+    set_setting(db, "max_positions", "5")
 
 
 def _normalize_account_type(value: str | None) -> str:
@@ -285,9 +281,9 @@ def get_settings(db: Session = Depends(get_db)):
     settings["account_type"] = _normalize_account_type(settings.get("account_type"))
     settings["paper_strategy"] = _normalize_paper_strategy(settings.get("paper_strategy"), settings.get("account_type"))
     if "daily_budget_pct" not in settings:
-        settings["daily_budget_pct"] = "50" if settings["paper_strategy"] == "cash" else "100"
+        settings["daily_budget_pct"] = "100"
     if "max_positions" not in settings:
-        settings["max_positions"] = "3" if settings["paper_strategy"] == "cash" else "5"
+        settings["max_positions"] = "5"
     return settings
 
 

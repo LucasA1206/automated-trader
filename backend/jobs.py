@@ -128,14 +128,14 @@ def job_morning_scan_and_buy():
         paper_strategy = get_setting(db, "paper_strategy", "cash")
         
         try:
-            budget_pct = float(get_setting(db, "daily_budget_pct", "50" if paper_strategy == "cash" else "100"))
+            budget_pct = float(get_setting(db, "daily_budget_pct", "100"))
         except ValueError:
-            budget_pct = 50.0
+            budget_pct = 100.0
             
         try:
-            max_positions_setting = int(get_setting(db, "max_positions", "3" if paper_strategy == "cash" else "5"))
+            max_positions_setting = int(get_setting(db, "max_positions", "5"))
         except ValueError:
-            max_positions_setting = 3
+            max_positions_setting = 5
 
         # Connect to IBKR to get account balance
         client = IBKRClient(trading_mode=trading_mode)
@@ -292,7 +292,7 @@ def job_afternoon_sell():
                   f"{', '.join(p['ticker'] for p in live_positions)}")
 
         # Build a lookup of DB open trades by ticker for P&L tracking
-        open_trades = db.query(Trade).filter(Trade.status == "open").all()
+        open_trades = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
         db_trades_by_ticker = {t.ticker: t for t in open_trades}
 
         sold_tickers: set[str] = set()
@@ -354,5 +354,82 @@ def job_afternoon_sell():
     except Exception as e:
         logger.exception(f"Afternoon sell job crashed: {e}")
         log_event(db, "system", f"Afternoon sell job crashed: {e}", "ERROR")
+    finally:
+        db.close()
+
+
+def job_monitor_swing_trades():
+    """
+    Runs periodically during market hours.
+    Checks all open positions:
+    - If price drops by 5% from buy_price (stop loss), sell ALL.
+    - If price rises by 10% from buy_price (take profit) AND status == "open", sell HALF and set status = "sold_half".
+    """
+    db = SessionLocal()
+    try:
+        trader_enabled = get_setting(db, "trader_enabled", "true")
+        if trader_enabled.lower() != "true":
+            return
+
+        trading_mode = get_setting(db, "trading_mode", "paper")
+        client = IBKRClient(trading_mode=trading_mode)
+        if not client.connect():
+            return
+            
+        client.start_keepalive(interval=30)
+        live_positions = client.get_positions()
+        live_tickers = {p["ticker"]: p for p in live_positions}
+
+        open_trades = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
+        
+        for trade in open_trades:
+            ticker = trade.ticker
+            if ticker not in live_tickers:
+                continue
+                
+            pos = live_tickers[ticker]
+            current_price = pos["current_price"]
+            live_shares = pos["shares"]
+            buy_price = trade.buy_price
+            
+            if not buy_price:
+                continue
+                
+            # Check Stop Loss (5% drop)
+            if current_price <= buy_price * 0.95:
+                log_event(db, "sell", f"📉 Stop Loss triggered for {ticker} (dropped >= 5%). Selling all {live_shares} shares.")
+                result = client.place_sell_order(ticker, live_shares)
+                if result["success"]:
+                    sell_price = result["price"]
+                    pnl = (sell_price - buy_price) * live_shares
+                    pnl_pct = ((sell_price - buy_price) / buy_price * 100)
+                    trade.sell_price = sell_price
+                    trade.sell_time = datetime.now(timezone.utc)
+                    trade.status = "closed"
+                    trade.pnl = round((trade.pnl or 0) + pnl, 2)
+                    trade.pnl_pct = round(pnl_pct, 2)
+                    sell_fees = result.get("fees", 0.0)
+                    trade.fees = round((trade.fees or 0.0) + sell_fees, 4)
+                    db.commit()
+            
+            # Check Take Profit (10% rise)
+            elif current_price >= buy_price * 1.10 and trade.status == "open":
+                shares_to_sell = int(live_shares / 2)
+                if shares_to_sell > 0:
+                    log_event(db, "sell", f"🚀 Take Profit triggered for {ticker} (rose >= 10%). Selling half: {shares_to_sell} shares.")
+                    result = client.place_sell_order(ticker, shares_to_sell)
+                    if result["success"]:
+                        sell_price = result["price"]
+                        pnl = (sell_price - buy_price) * shares_to_sell
+                        trade.status = "sold_half"
+                        # Accumulate PNL and fees, but the trade is still open for the remaining half
+                        trade.pnl = round((trade.pnl or 0) + pnl, 2)
+                        sell_fees = result.get("fees", 0.0)
+                        trade.fees = round((trade.fees or 0.0) + sell_fees, 4)
+                        db.commit()
+
+        client.disconnect()
+    except Exception as e:
+        logger.exception(f"Swing trade monitor crashed: {e}")
     finally:
         db.close()
