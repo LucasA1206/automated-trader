@@ -213,6 +213,10 @@ def _fetch_technicals_for_ticker(ticker: str) -> dict | None:
         sma_20 = float(closes.rolling(20).mean().iloc[-1]) if len(closes) >= 20 else None
         sma_50 = float(closes.rolling(50).mean().iloc[-1]) if len(closes) >= 50 else None
 
+        # EMAs
+        ema_8 = float(closes.ewm(span=8, adjust=False).mean().iloc[-1]) if len(closes) >= 8 else None
+        ema_21 = float(closes.ewm(span=21, adjust=False).mean().iloc[-1]) if len(closes) >= 21 else None
+
         # RSI
         rsi = _compute_rsi(closes)
 
@@ -250,6 +254,8 @@ def _fetch_technicals_for_ticker(ticker: str) -> dict | None:
             "sma_10": round(sma_10, 2) if sma_10 else None,
             "sma_20": round(sma_20, 2) if sma_20 else None,
             "sma_50": round(sma_50, 2) if sma_50 else None,
+            "ema_8": round(ema_8, 2) if ema_8 else None,
+            "ema_21": round(ema_21, 2) if ema_21 else None,
             "rsi_14": rsi,
             "macd": macd_val,
             "macd_signal": macd_signal,
@@ -284,31 +290,60 @@ def check_market_regime() -> dict:
     Used to scale position sizing and set minimum confidence thresholds.
     """
     try:
+        # Check broad market (QQQ)
         qqq = yf.Ticker("QQQ")
         hist = qqq.history(period="1mo", interval="1d")
-        if hist.empty or len(hist) < 5:
-            return {"regime": "unknown", "qqq_change_3d": 0, "qqq_change_5d": 0}
+        
+        regime = "unknown"
+        latest = 0.0
+        change_3d = 0.0
+        change_5d = 0.0
+        sma_20 = 0.0
+        
+        if not hist.empty and len(hist) >= 5:
+            closes = hist["Close"]
+            latest = float(closes.iloc[-1])
+            change_3d = round((latest / float(closes.iloc[-4]) - 1) * 100, 2) if len(closes) >= 4 else 0
+            change_5d = round((latest / float(closes.iloc[-6]) - 1) * 100, 2) if len(closes) >= 6 else 0
+            sma_20 = float(closes.rolling(20).mean().iloc[-1]) if len(closes) >= 20 else latest
 
-        closes = hist["Close"]
-        latest = float(closes.iloc[-1])
-        change_3d = round((latest / float(closes.iloc[-4]) - 1) * 100, 2) if len(closes) >= 4 else 0
-        change_5d = round((latest / float(closes.iloc[-6]) - 1) * 100, 2) if len(closes) >= 6 else 0
-        sma_20 = float(closes.rolling(20).mean().iloc[-1]) if len(closes) >= 20 else latest
+            # Loosened thresholds — only flag bearish in a genuine sell-off
+            if change_3d < -3.0 or (change_5d < -5.0 and latest < sma_20):
+                regime = "bearish"
+            elif change_3d > 0.5 and latest > sma_20:
+                regime = "bullish"
+            else:
+                regime = "neutral"
 
-        # Loosened thresholds — only flag bearish in a genuine sell-off
-        if change_3d < -3.0 or (change_5d < -5.0 and latest < sma_20):
-            regime = "bearish"
-        elif change_3d > 0.5 and latest > sma_20:
-            regime = "bullish"
-        else:
-            regime = "neutral"
+        # Check Sector Relative Strength
+        sectors = {"XLK": "Tech", "XLV": "Healthcare", "XLY": "Consumer", "XLC": "Comm"}
+        sector_perf = {}
+        try:
+            sector_data = yf.download(list(sectors.keys()), period="10d", interval="1d", group_by="ticker", progress=False)
+            if not sector_data.empty:
+                for etf, name in sectors.items():
+                    try:
+                        df = sector_data[etf] if len(sectors) > 1 else sector_data
+                        closes_etf = df["Close"].dropna()
+                        if len(closes_etf) >= 6:
+                            perf = (float(closes_etf.iloc[-1]) / float(closes_etf.iloc[-6]) - 1) * 100
+                            sector_perf[name] = round(perf, 2)
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.error(f"Sector perf check failed: {e}")
+
+        # Determine strongest sectors
+        strongest_sectors = sorted(sector_perf.items(), key=lambda x: x[1], reverse=True)[:2]
+        sector_str = ", ".join([f"{name} ({perf}%)" for name, perf in strongest_sectors]) if strongest_sectors else "N/A"
 
         return {
             "regime": regime,
-            "qqq_price": round(latest, 2),
+            "qqq_price": round(latest, 2) if latest else 0.0,
             "qqq_change_3d": change_3d,
             "qqq_change_5d": change_5d,
-            "qqq_above_sma20": latest > sma_20,
+            "qqq_above_sma20": latest > sma_20 if latest else False,
+            "strongest_sectors": sector_str,
         }
     except Exception as e:
         logger.error(f"Market regime check failed: {e}")
@@ -453,10 +488,13 @@ def _quick_screen_universe(
                 mom_1d = ((latest / prev_close) - 1) * 100 if prev_close > 0 else 0.0
                 mom_5d = ((latest / float(closes.iloc[-6])) - 1) * 100 if len(closes) >= 6 else 0.0
                 mom_10d = ((latest / float(closes.iloc[-11])) - 1) * 100 if len(closes) >= 11 else 0.0
+                ema_8 = float(closes.ewm(span=8, adjust=False).mean().iloc[-1]) if len(closes) >= 8 else latest
+                ema_21 = float(closes.ewm(span=21, adjust=False).mean().iloc[-1]) if len(closes) >= 21 else latest
                 sma_10 = float(closes.rolling(10).mean().iloc[-1]) if len(closes) >= 10 else latest
                 sma_20 = float(closes.rolling(20).mean().iloc[-1]) if len(closes) >= 20 else latest
                 above_sma10 = latest > sma_10
                 above_sma20 = latest > sma_20
+                ema_bullish = ema_8 > ema_21
                 rsi = _compute_rsi(closes) or 50.0
                 avg_vol = float(volumes.rolling(10).mean().iloc[-1]) if len(volumes) >= 10 else 1.0
                 vol_ratio = float(volumes.iloc[-1]) / avg_vol if avg_vol > 0 else 1.0
@@ -491,6 +529,9 @@ def _quick_screen_universe(
                 # Trend alignment
                 score += 10 if above_sma20 else -10
                 score += 5 if above_sma10 else -5
+                
+                # EMA Swing Confirmation
+                score += 8 if ema_bullish else -4
 
                 # MACD
                 score += 8 if macd_bullish else -5
@@ -573,6 +614,7 @@ TECHNICAL DATA (real-time indicators — includes momentum, moving averages, RSI
             f"  - 3-day change: {market_regime.get('qqq_change_3d', 'N/A')}%\n"
             f"  - 5-day change: {market_regime.get('qqq_change_5d', 'N/A')}%\n"
             f"  - QQQ above SMA-20: {market_regime.get('qqq_above_sma20', 'N/A')}\n"
+            f"  - Strongest Sectors (5d perf): {market_regime.get('strongest_sectors', 'N/A')}\n"
             f"  - Regime: {market_regime.get('regime', 'unknown').upper()}"
         )
         if market_regime.get("regime") == "bearish":
@@ -587,13 +629,13 @@ TECHNICAL DATA (real-time indicators — includes momentum, moving averages, RSI
                 "Recommend stocks with decent technical setups and positive catalysts."
             )
 
-    prompt = f"""You are an elite quantitative day-trading AI analysing NASDAQ stocks for {today}.
-Your job is to identify stocks to BUY at market open that will RISE during the trading day.
+    prompt = f"""You are an elite quantitative swing-trading AI analysing NASDAQ stocks for {today}.
+Your job is to identify stocks breaking out of consolidations that are highly likely to trend upward over the next 3 to 5 trading days.
 
 Aim to recommend 1 to 5 stocks. Prioritise quality but don't be overly restrictive —
 if a stock has a reasonable setup with upward momentum, include it. It's better to catch
 a winning stock than to miss it by being too cautious. An empty recommendation list is a
-bad outcome if there are decent setups available.
+bad outcome if there are decent setups available. Give strong preference to stocks in the strongest sectors.
 
 ═══ MARKET REGIME ═══
 {regime_section}
@@ -611,24 +653,21 @@ Only DISQUALIFY stocks that are genuinely dangerous — do NOT reject borderline
 - Stock up >12% in recent days with declining volume → exhaustion move
 
 ═══ BUY CRITERIA (need at least 2 of these) ═══
-1. ✅ Positive news catalyst (earnings beat, analyst upgrade, partnership, product launch, sector tailwind)
-2. ✅ RSI between 35-70 (has room to run)
-3. ✅ Price ABOVE SMA-20 (short-term uptrend)
-4. ✅ Price ABOVE SMA-50 (medium-term trend support)
+1. ✅ Positive news catalyst (earnings beat, analyst upgrade, partnership, product launch)
+2. ✅ Strong Sector Alignment (matches one of the Strongest Sectors listed above)
+3. ✅ EMA-8 crossing or holding ABOVE EMA-21 (Swing trade momentum confirmation)
+4. ✅ Price ABOVE SMA-20 (short-term uptrend)
 5. ✅ MACD line ABOVE signal line (bullish crossover)
 6. ✅ Volume above average (vol_vs_avg > 1.1) — interest present
-7. ✅ Positive 5-day momentum (mom_5d > 0%)
-8. ✅ Positive 20-day momentum (mom_20d > 0%)
+7. ✅ Positive 5-day and 20-day momentum
 
 ═══ ANALYSIS METHODOLOGY ═══
 1. TECHNICAL MOMENTUM (Weight: 35%)
-   - Check moving averages: SMA-5, SMA-10, SMA-20, SMA-50
-   - Price above SMA-20 = solid short-term trend ✓
-   - Price above SMA-50 = strong medium-term trend ✓ (nice to have, not required)
-   - MACD line above signal = bullish ✓
-   - RSI 35-70 is acceptable; 40-60 is ideal
-   - Volume confirms the move (vol_vs_avg > 1.1)
-   - At least one momentum timeframe should be positive
+    - Check moving averages: EMA-8, EMA-21, SMA-20, SMA-50
+    - EMA-8 above EMA-21 = swing momentum burst ✓
+    - Price above SMA-20 = solid short-term trend ✓
+    - MACD line above signal = bullish ✓
+    - Volume confirms the move (vol_vs_avg > 1.1)
 
 2. NEWS CATALYST (Weight: 30%)
    - Earnings beats / positive guidance / analyst upgrades

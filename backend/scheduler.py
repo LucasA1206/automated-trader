@@ -22,7 +22,7 @@ def create_scheduler() -> BackgroundScheduler:
     scheduler.add_job(
         func=job_morning_scan_and_buy,
         trigger=CronTrigger(
-            day_of_week="mon-fri",
+            day_of_week="mon",
             hour=9,
             minute=20,
             timezone=ET,
@@ -37,7 +37,7 @@ def create_scheduler() -> BackgroundScheduler:
     scheduler.add_job(
         func=job_afternoon_sell,
         trigger=CronTrigger(
-            day_of_week="mon-fri",
+            day_of_week="fri",
             hour=15,
             minute=30,
             timezone=ET,
@@ -46,6 +46,22 @@ def create_scheduler() -> BackgroundScheduler:
         name="Afternoon Sell-All",
         replace_existing=True,
         misfire_grace_time=300,
+    )
+
+    # Monitor Swing Trades (every 5 mins during market hours)
+    from jobs import job_monitor_swing_trades
+    scheduler.add_job(
+        func=job_monitor_swing_trades,
+        trigger=CronTrigger(
+            day_of_week="mon-fri",
+            hour="9-15",
+            minute="*/5",
+            timezone=ET,
+        ),
+        id="monitor_swing_trades",
+        name="Monitor Swing Trades",
+        replace_existing=True,
+        misfire_grace_time=60,
     )
 
     return scheduler
