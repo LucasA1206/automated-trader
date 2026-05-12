@@ -18,13 +18,13 @@ def create_scheduler() -> BackgroundScheduler:
 
     scheduler = BackgroundScheduler(timezone=ET)
 
-    # 09:20 ET Mon-Fri — market scan + buy orders (40min before open)
+    # 09:30 ET Mon-Fri — market scan + buy orders (market open)
     scheduler.add_job(
         func=job_morning_scan_and_buy,
         trigger=CronTrigger(
             day_of_week="mon",
             hour=9,
-            minute=20,
+            minute=30,
             timezone=ET,
         ),
         id="morning_scan_buy",
