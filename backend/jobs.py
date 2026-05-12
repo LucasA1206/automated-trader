@@ -106,7 +106,7 @@ def _reconcile_stale_db_trades(db, live_tickers: set[str], log_fn) -> None:
 
 def job_morning_scan_and_buy():
     """
-    Runs at 09:20 ET weekdays:
+    Runs at 09:30 ET weekdays:
     1. Checks if scan is enabled
     2. Runs AI stock scan
     3. Buys top picks using configured budget %
