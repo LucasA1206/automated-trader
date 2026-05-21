@@ -1,8 +1,10 @@
 import os
 import logging
 import logging.config
+import threading
+import requests
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
@@ -11,7 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from database import get_db, init_db, get_setting, set_setting, SessionLocal
-from models import Trade, SystemLog, Setting
+from models import Trade, SystemLog, Setting, AIPick
 from scheduler import create_scheduler, get_next_job_times
 from trader import IBKRClient
 from auth import require_auth, validate_credentials, create_access_token
@@ -26,6 +28,72 @@ logger = logging.getLogger(__name__)
 
 MARGIN_UPGRADE_THRESHOLD = 25_000.0
 
+# ─── USD/AUD Exchange Rate Cache ───────────────────────────────────────────
+_fx_lock = threading.Lock()
+_fx_rate: float = 1.55          # sensible fallback (approx AUD/USD mid-2025)
+_fx_fetched_at: datetime | None = None
+_fx_stale: bool = True
+_FX_CACHE_TTL = timedelta(hours=1)
+_FX_API_URL = "https://api.frankfurter.app/latest?from=USD&to=AUD"
+
+
+def _refresh_fx_rate() -> None:
+    """
+    Fetch the latest USD→AUD rate from Frankfurter (free, no API key).
+    Updates the module-level cache in place. Thread-safe.
+    Falls back gracefully — the last successful rate is kept if the fetch fails.
+    """
+    global _fx_rate, _fx_fetched_at, _fx_stale
+    try:
+        resp = requests.get(_FX_API_URL, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        rate = float(data["rates"]["AUD"])
+        with _fx_lock:
+            _fx_rate = rate
+            _fx_fetched_at = datetime.now(timezone.utc)
+            _fx_stale = False
+        logger.info(f"USD/AUD exchange rate updated: {rate:.4f}")
+    except Exception as e:
+        with _fx_lock:
+            _fx_stale = True
+        logger.warning(f"Failed to fetch USD/AUD rate: {e}. Using last cached value {_fx_rate:.4f}.")
+
+
+def get_fx_rate() -> dict:
+    """
+    Return the current exchange rate info, refreshing if the cache is > 1 hour old.
+    Returns { rate, fetched_at (ISO string or None), stale, age_minutes }.
+    """
+    global _fx_rate, _fx_fetched_at, _fx_stale
+
+    with _fx_lock:
+        needs_refresh = (
+            _fx_fetched_at is None
+            or (datetime.now(timezone.utc) - _fx_fetched_at) > _FX_CACHE_TTL
+        )
+
+    if needs_refresh:
+        _refresh_fx_rate()
+
+    with _fx_lock:
+        rate = _fx_rate
+        fetched_at = _fx_fetched_at
+        stale = _fx_stale
+
+    age_minutes: float | None = None
+    if fetched_at:
+        age_seconds = (datetime.now(timezone.utc) - fetched_at).total_seconds()
+        age_minutes = round(age_seconds / 60, 1)
+
+    return {
+        "rate": round(rate, 4),
+        "fetched_at": fetched_at.isoformat() if fetched_at else None,
+        "stale": stale,
+        "age_minutes": age_minutes,
+    }
+
+
 # ─── Scheduler (global) ───────────────────────────────────────────────────
 scheduler = None
 
@@ -39,12 +107,15 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info("✅ Scheduler started.")
 
+    # Warm up the exchange rate cache at startup
+    import threading as _threading
+    _threading.Thread(target=_refresh_fx_rate, daemon=True, name="fx-warmup").start()
+
     # Start a persistent IBKR connection that keeps the gateway alive between jobs.
-    # Run in a regular thread since IBKRClient is synchronous.
-    import threading
     db = SessionLocal()
     trading_mode = get_setting(db, "trading_mode", "paper")
     db.close()
+    import threading
     threading.Thread(
         target=start_persistent_keepalive,
         args=(trading_mode,),
@@ -63,7 +134,7 @@ async def lifespan(app: FastAPI):
 # ─── App ───────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Blitz Trader API",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -161,10 +232,21 @@ def health():
     }
 
 
+# ─── Exchange Rate ──────────────────────────────────────────────────────────
+@app.get("/api/exchange-rate", dependencies=[Depends(require_auth)])
+def exchange_rate():
+    """
+    Returns the current USD→AUD exchange rate.
+    Fetches from Frankfurter API (free, no API key) and caches for up to 1 hour.
+    If the API call fails, returns the last successful rate with stale=true.
+    """
+    return get_fx_rate()
+
+
 # ─── Portfolio ─────────────────────────────────────────────────────────────
 @app.get("/api/portfolio", dependencies=[Depends(require_auth)])
 def get_portfolio(db: Session = Depends(get_db)):
-    """Returns IBKR account summary + open positions."""
+    """Returns IBKR account summary + open positions + partial P&L data."""
     trading_mode = get_setting(db, "trading_mode", "paper")
     try:
         client = IBKRClient(trading_mode=trading_mode)
@@ -189,6 +271,20 @@ def get_portfolio(db: Session = Depends(get_db)):
         net_liq = account.get("NetLiquidation", 0)
         strategy_alert = _build_margin_upgrade_alert(db, trading_mode, account_type, net_liq)
         client.disconnect()
+
+        # Enrich positions with realised_partial_pnl from the DB
+        open_trades = db.query(Trade).filter(
+            Trade.status.in_(["open", "sold_half"]),
+            Trade.mode == trading_mode
+        ).all()
+        partial_by_ticker = {t.ticker: t.realised_partial_pnl or 0.0 for t in open_trades}
+        status_by_ticker  = {t.ticker: t.status for t in open_trades}
+
+        for pos in positions:
+            ticker = pos["ticker"]
+            pos["realised_partial_pnl"] = round(partial_by_ticker.get(ticker, 0.0), 2)
+            pos["trade_status"] = status_by_ticker.get(ticker, "open")
+
         return {
             "connected": True,
             "mode": trading_mode,
@@ -211,7 +307,7 @@ def get_trades(
     offset: int = 0,
     db: Session = Depends(get_db),
 ):
-    """Returns trade history, optionally filtered by status (open/closed/error)."""
+    """Returns trade history, optionally filtered by status (open/closed/sold_half/error)."""
     trading_mode = get_setting(db, "trading_mode", "paper")
     query = db.query(Trade).filter(Trade.mode == trading_mode).order_by(Trade.buy_time.desc())
     if status:
@@ -233,9 +329,48 @@ def get_trades(
                 "status": t.status,
                 "pnl": t.pnl,
                 "pnl_pct": t.pnl_pct,
+                "realised_partial_pnl": t.realised_partial_pnl or 0.0,
+                "fees": t.fees or 0.0,
                 "ai_reason": t.ai_reason,
             }
             for t in trades
+        ],
+    }
+
+
+# ─── AI Picks ──────────────────────────────────────────────────────────────
+@app.get("/api/ai-picks", dependencies=[Depends(require_auth)])
+def get_ai_picks(db: Session = Depends(get_db)):
+    """
+    Returns AI stock picks from the most recent scan.
+    Includes confidence score, rationale, and suggested position size.
+    """
+    # Get the most recent scan date
+    latest = db.query(AIPick).order_by(AIPick.scan_date.desc()).first()
+    if not latest:
+        return {"scan_date": None, "picks": [], "total": 0}
+
+    scan_date = latest.scan_date
+    picks = (
+        db.query(AIPick)
+        .filter(AIPick.scan_date == scan_date)
+        .order_by(AIPick.rank.asc())
+        .all()
+    )
+
+    return {
+        "scan_date": scan_date.isoformat() if scan_date else None,
+        "total": len(picks),
+        "picks": [
+            {
+                "rank": p.rank,
+                "ticker": p.ticker,
+                "reason": p.reason,
+                "confidence": p.confidence,
+                "position_size_pct": p.position_size_pct,
+                "created_at": p.created_at.isoformat() if p.created_at else None,
+            }
+            for p in picks
         ],
     }
 
@@ -294,7 +429,6 @@ def update_settings(body: SettingsBulkUpdate, db: Session = Depends(get_db)):
     if not updates:
         raise HTTPException(status_code=400, detail="No settings provided")
 
-    # Validation
     if "trading_mode" in updates and updates["trading_mode"] not in ("paper", "live"):
         raise HTTPException(status_code=400, detail="trading_mode must be 'paper' or 'live'")
     if "daily_budget_pct" in updates:
@@ -315,11 +449,8 @@ def update_settings(body: SettingsBulkUpdate, db: Session = Depends(get_db)):
     if "account_type" in updates:
         account_type = _normalize_account_type(updates["account_type"])
         if account_type == "trading_cash":
-            # Reset the one-time live upgrade alert so it can fire again if the
-            # user switches to a different cash account type later.
             set_setting(db, "margin_upgrade_alerted", "false")
 
-    # Log trading mode change and restart the persistent keepalive on the new port
     if "trading_mode" in updates:
         new_mode = updates["trading_mode"]
         db.add(SystemLog(
@@ -330,8 +461,6 @@ def update_settings(body: SettingsBulkUpdate, db: Session = Depends(get_db)):
         ))
         db.commit()
 
-        # Restart the persistent keepalive so it connects to the correct IB Gateway port.
-        # paper → port 4004 | live → port 4003
         import threading
         stop_persistent_keepalive()
         threading.Thread(
@@ -366,8 +495,7 @@ def trigger_sell(background_tasks: BackgroundTasks):
 def sell_all_ibkr(db: Session = Depends(get_db)):
     """
     Immediately sells ALL open positions in the IBKR account (synchronous).
-    This uses the live portfolio from IB Gateway — not just DB-tracked trades.
-    Returns per-ticker results.
+    P&L calculation correctly includes realised_partial_pnl for sold_half trades.
     """
     trading_mode = get_setting(db, "trading_mode", "paper")
     try:
@@ -384,31 +512,42 @@ def sell_all_ibkr(db: Session = Depends(get_db)):
         results = []
         for pos in positions:
             ticker = pos["ticker"]
-            shares = pos["shares"]
-            logger.info(f"[SELL-ALL] Placing sell order for {shares} shares of {ticker}...")
-            result = client.place_sell_order(ticker, shares)
+            live_shares = pos["shares"]
+            logger.info(f"[SELL-ALL] Placing sell order for {live_shares} shares of {ticker}...")
+            result = client.place_sell_order(ticker, live_shares)
             results.append(result)
 
-            # Update DB trade record if one exists
             if result.get("success"):
+                sell_price = result["price"]
+                # Match on open OR sold_half trades
                 trade = (
                     db.query(Trade)
-                    .filter(Trade.ticker == ticker, Trade.status == "open")
+                    .filter(
+                        Trade.ticker == ticker,
+                        Trade.status.in_(["open", "sold_half"]),
+                        Trade.mode == trading_mode,
+                    )
                     .order_by(Trade.buy_time.desc())
                     .first()
                 )
                 if trade:
-                    sell_price = result["price"]
-                    pnl = (sell_price - trade.buy_price) * trade.shares
-                    pnl_pct = ((sell_price - trade.buy_price) / trade.buy_price * 100) if trade.buy_price else 0
+                    buy_price = trade.buy_price or 0.0
+                    partial_already_realised = trade.realised_partial_pnl or 0.0
+
+                    # Correct P&L: use live shares (actual remaining), add banked partials
+                    remaining_pnl = (sell_price - buy_price) * live_shares
+                    total_pnl = remaining_pnl + partial_already_realised
+
+                    original_cost = buy_price * trade.shares if trade.shares else 1
+                    pnl_pct = (total_pnl / original_cost * 100) if original_cost else 0.0
+
                     trade.sell_price = sell_price
                     trade.sell_time = datetime.now(timezone.utc)
                     trade.status = "closed"
-                    trade.pnl = round(pnl, 2)
+                    trade.pnl = round(total_pnl, 2)
                     trade.pnl_pct = round(pnl_pct, 2)
                     db.commit()
 
-            from models import SystemLog
             level = "INFO" if result.get("success") else "ERROR"
             msg = (
                 f"✅ Sold {result.get('shares')} shares of {ticker} @ ${result.get('price', 0):.2f}"
@@ -439,9 +578,9 @@ def get_pnl_history(db: Session = Depends(get_db)):
     """
     Returns daily realized P&L from closed trades, cumulative P&L over time,
     and the all-time realized P&L total.
-    """
-    from sqlalchemy import func, cast, Date as SQLDate
 
+    Includes realised_partial_pnl in all totals so partial sells are never lost.
+    """
     trading_mode = get_setting(db, "trading_mode", "paper")
 
     # All closed trades with a sell_time and pnl in current mode
@@ -452,19 +591,17 @@ def get_pnl_history(db: Session = Depends(get_db)):
         .all()
     )
 
-    # Group by calendar date (UTC)
     from collections import defaultdict
     daily: dict[str, float] = defaultdict(float)
     daily_cost: dict[str, float] = defaultdict(float)
     daily_fees: dict[str, float] = defaultdict(float)
     for t in closed_trades:
         day = t.sell_time.strftime("%Y-%m-%d")
-        daily[day] += t.pnl
+        daily[day] += t.pnl  # t.pnl already includes realised_partial_pnl (fixed in jobs.py)
         daily_fees[day] += (t.fees or 0.0)
         if t.buy_price is not None and t.shares is not None:
             daily_cost[day] += (t.buy_price * t.shares)
 
-    # Build sorted list with cumulative running total
     sorted_days = sorted(daily.keys())
     cumulative = 0.0
     cumulative_cost = 0.0
@@ -474,11 +611,11 @@ def get_pnl_history(db: Session = Depends(get_db)):
         cumulative += daily[day]
         cumulative_cost += daily_cost[day]
         cumulative_fees += daily_fees[day]
-        
-        day_pnl = daily[day]
+
+        day_pnl  = daily[day]
         day_fees = daily_fees[day]
         day_cost = daily_cost[day]
-        daily_pct = (day_pnl / day_cost * 100) if day_cost > 0 else 0.0
+        daily_pct     = (day_pnl  / day_cost       * 100) if day_cost       > 0 else 0.0
         cumulative_pct = (cumulative / cumulative_cost * 100) if cumulative_cost > 0 else 0.0
 
         chart_data.append({
@@ -491,11 +628,9 @@ def get_pnl_history(db: Session = Depends(get_db)):
             "cumulative_fees": round(cumulative_fees, 2),
         })
 
-    # All-time realized P&L
     all_time_realized = round(sum(t.pnl for t in closed_trades), 2)
     all_time_fees = round(sum((t.fees or 0.0) for t in closed_trades), 2)
 
-    # Count of winning vs losing closed trades
     winners = sum(1 for t in closed_trades if t.pnl and t.pnl > 0)
     losers  = sum(1 for t in closed_trades if t.pnl and t.pnl < 0)
     total_closed = len(closed_trades)
