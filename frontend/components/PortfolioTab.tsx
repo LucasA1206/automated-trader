@@ -279,18 +279,25 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
   const allTimeFees  = pnlHistory?.all_time_fees ?? 0;
   // Open P&L = unrealised gains on all held positions + already-realised partials on still-open trades
   const openPnl = unrealisedPnl + openPartialPnl;
-  const openPnlPositive = openPnl >= 0;
 
   // Live USD→AUD rate from Frankfurter (falls back to IBKR rate or 1.55)
   const usdToAud = fxData?.rate ?? account.ExchangeRate_USD ?? 1.55;
+  const audToUsd = 1 / usdToAud;
   const openPnlAud = openPnl * usdToAud;
+
+  // All-Time P&L = NetLiquidation (USD → AUD) - $7900 AUD starting capital
+  const STARTING_CAPITAL_AUD = 7900;
+  const netLiqAud = (account.NetLiquidation ?? 0) * usdToAud;
+  const allTimePnlAud = netLiqAud - STARTING_CAPITAL_AUD;
+  const allTimePnlUsd = allTimePnlAud * audToUsd;
+  const allTimePnlPositive = allTimePnlAud >= 0;
 
   const chartData = pnlHistory?.chart_data ?? [];
   const activeKey: 'cumulative_pnl' | 'daily_pnl' =
     chartMode === 'cumulative' ? 'cumulative_pnl' : 'daily_pnl';
   const chartColor =
     chartMode === 'cumulative'
-      ? openPnlPositive ? '#22c55e' : '#ef4444'
+      ? allTimePnlPositive ? '#22c55e' : '#ef4444'
       : '#3b82f6';
 
   const winRate =
@@ -382,12 +389,12 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
         </div>
       )}
 
-      {/* ── OPEN P&L HERO ───────────────────────────────────────────── */}
+      {/* ── ALL-TIME P&L HERO ────────────────────────────────────────── */}
       <div style={{
-        background: openPnlPositive
+        background: allTimePnlPositive
           ? 'linear-gradient(135deg, rgba(34,197,94,0.08) 0%, rgba(34,197,94,0.03) 100%)'
           : 'linear-gradient(135deg, rgba(239,68,68,0.08) 0%, rgba(239,68,68,0.03) 100%)',
-        border: `1px solid ${openPnlPositive ? 'rgba(34,197,94,0.2)' : 'rgba(239,68,68,0.2)'}`,
+        border: `1px solid ${allTimePnlPositive ? 'rgba(34,197,94,0.2)' : 'rgba(239,68,68,0.2)'}`,
         borderRadius: 16,
         padding: '24px 28px',
         marginBottom: 24,
@@ -403,52 +410,55 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
             textTransform: 'uppercase' as const,
             color: 'var(--text-muted)', marginBottom: 8,
           }}>
-            Open P&amp;L (Unrealised + Partials)
+            All-Time P&amp;L (Net Liq − A$7,900 starting capital)
           </div>
-          {loading && pnlLoading ? (
+          {loading ? (
             <div style={{ display: 'flex', gap: 24, alignItems: 'baseline' }}>
               <div style={{ fontSize: 42, fontWeight: 800, color: 'var(--text-muted)', fontFamily: "'JetBrains Mono', monospace" }}>—</div>
             </div>
           ) : (
             <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap' as const, alignItems: 'baseline' }}>
+              {/* Primary: AUD */}
               <div style={{
                 fontSize: 46, fontWeight: 800, letterSpacing: '-1.5px',
-                color: openPnlPositive ? 'var(--accent-green)' : 'var(--accent-red)',
+                color: allTimePnlPositive ? 'var(--accent-green)' : 'var(--accent-red)',
                 fontFamily: "'JetBrains Mono', monospace",
-                textShadow: openPnlPositive
+                textShadow: allTimePnlPositive
                   ? '0 0 40px rgba(34,197,94,0.35)'
                   : '0 0 40px rgba(239,68,68,0.35)',
               }}>
-                {fmtSigned(openPnl)}
-                <span style={{ fontSize: 16, marginLeft: 8, color: 'var(--text-muted)', fontWeight: 600, textShadow: 'none', letterSpacing: '0' }}>USD</span>
+                {fmtSigned(allTimePnlAud)}
+                <span style={{ fontSize: 16, marginLeft: 8, color: 'var(--text-muted)', fontWeight: 600, textShadow: 'none', letterSpacing: '0' }}>AUD</span>
+                <AudLabel fxData={fxData} />
               </div>
+              {/* Secondary: USD */}
               <div style={{
                 fontSize: 32, fontWeight: 700, letterSpacing: '-1px',
-                color: openPnlPositive ? 'var(--accent-green)' : 'var(--accent-red)',
+                color: allTimePnlPositive ? 'var(--accent-green)' : 'var(--accent-red)',
                 fontFamily: "'JetBrains Mono', monospace",
                 opacity: 0.8,
               }}>
-                {fmtSigned(openPnlAud)}
-                <span style={{ fontSize: 14, marginLeft: 6, color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0' }}>AUD</span>
-                <AudLabel fxData={fxData} />
+                {fmtSigned(allTimePnlUsd)}
+                <span style={{ fontSize: 14, marginLeft: 6, color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0' }}>USD</span>
               </div>
             </div>
           )}
           <div style={{ display: 'flex', gap: 20, marginTop: 10, flexWrap: 'wrap' as const }}>
             <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-              <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>Unrealised: </span>
-              <span style={{ color: unrealisedPnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
-                {fmtSigned(unrealisedPnl)}
+              <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>Net Liq: </span>
+              <span style={{ color: 'var(--text-primary)', fontFamily: "'JetBrains Mono', monospace" }}>
+                {fmt(account.NetLiquidation ?? 0)} USD
+              </span>
+              <span style={{ color: 'var(--text-muted)', marginLeft: 6, fontFamily: "'JetBrains Mono', monospace" }}>
+                ({fmt(netLiqAud, 'A$')})
               </span>
             </div>
-            {openPartialPnl !== 0 && (
-              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>Partial Gains (open): </span>
-                <span style={{ color: openPartialPnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
-                  {fmtSigned(openPartialPnl)}
-                </span>
-              </div>
-            )}
+            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+              <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>Open P&amp;L: </span>
+              <span style={{ color: openPnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
+                {fmtSigned(openPnl)} USD
+              </span>
+            </div>
             <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
               <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>All-Time Realised: </span>
               <span style={{ color: realizedPnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
