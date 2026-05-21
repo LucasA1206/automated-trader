@@ -1,4 +1,5 @@
 import os
+import io
 import json
 import time
 import logging
@@ -17,106 +18,146 @@ NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# ─── Full NASDAQ Universe (~500 tickers passed to Gemini as context) ─────────
-# Gemini can recommend any of these — organised by sector
-NASDAQ_UNIVERSE = [
-    # ── Mega-cap Tech ──────────────────────────────────────────────────────────
+# ─── Fallback curated NASDAQ universe (used if live fetch fails) ───────────────
+_FALLBACK_UNIVERSE = [
+    # ── Mega-cap Tech ─────────────────────────────────────────────────────────
     "AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "AMZN", "META", "TSLA", "AVGO",
     "ASML", "AMD", "QCOM", "ARM", "INTC", "TXN", "ADI", "MCHP", "AMAT",
     "LRCX", "KLAC", "NXPI", "SWKS", "MRVL", "ON", "MPWR", "WOLF", "SMCI",
     "MU", "WDC", "STX", "NTAP",
-
-    # ── Software / Cloud ───────────────────────────────────────────────────────
+    # ── Software / Cloud ──────────────────────────────────────────────────────
     "ADBE", "CRM", "NOW", "WDAY", "VEEV", "TEAM", "HUBS", "DDOG", "NET",
     "ZS", "PANW", "CRWD", "OKTA", "S", "MNDY", "BILL", "SMAR", "BOX",
     "DOCN", "DOMO", "NCNO", "PCOR", "ESTC", "MDB", "GTLB", "CFLT", "SNOW",
     "PLTR", "COIN", "MSTR", "RBLX", "SHOP", "AFRM", "SOFI", "UPST", "LC",
-    "SQ", "PYPL", "SSNC", "MANH", "PAYC", "GWRE", "AVLR", "RELY", "TOST",
-    "BRZE", "ALTR", "DT", "APTI", "SDGR", "PATH", "AI", "BBAI", "SOUN",
+    "SQ", "PYPL", "SSNC", "MANH", "PAYC", "GWRE", "RELY", "TOST",
+    "BRZE", "ALTR", "DT", "SDGR", "PATH", "AI", "BBAI", "SOUN",
     "GFAI", "IREN", "CORZ", "CIFR", "BTBT", "CLSK",
-
-    # ── Semiconductors (extended) ──────────────────────────────────────────────
-    "SNPS", "CDNS", "LSCC", "ACLS", "ONTO", "ICHR", "FORM", "CCMP", "AMKR",
-    "QRVO", "LITE", "IIVI", "COHU", "UCTT", "KLIC", "AEHR", "AXTI",
-    "POWI", "DIOD", "SLAB", "AMBA", "ALGM", "MTSI", "AIOT", "CRUS",
-
-    # ── Internet / E-commerce / Digital Media ─────────────────────────────────
+    # ── Semiconductors ────────────────────────────────────────────────────────
+    "SNPS", "CDNS", "LSCC", "ACLS", "ONTO", "ICHR", "FORM", "AMKR",
+    "QRVO", "LITE", "COHU", "UCTT", "KLIC", "AEHR", "AXTI",
+    "POWI", "DIOD", "SLAB", "AMBA", "ALGM", "MTSI", "CRUS",
+    # ── Internet / E-commerce ─────────────────────────────────────────────────
     "EBAY", "ETSY", "CHWY", "W", "DKNG", "PENN", "LYFT", "UBER", "DASH",
     "ABNB", "BKNG", "EXPE", "TRIP", "YELP", "IAC", "ZG", "RDFN", "OPEN",
-    "TZOO", "NFLX", "ROKU", "SPOT", "SONO", "PARAA", "SIRI",
-
-    # ── EVs / Clean Energy / Autonomous ───────────────────────────────────────
-    "RIVN", "LCID", "NIO", "XPEV", "LI", "NKLA", "GOEV", "WKHS", "FFIE",
-    "FSR", "PTRA", "BLNK", "CHPT", "EVGO", "PLUG", "FCEL", "BLDP",
-    "FSLR", "ENPH", "SEDG", "ARRY", "RUN", "NOVA", "MAXN", "CSIQ",
-    "JOBY", "ACHR", "LILM", "WATT",
-
-    # ── Biotech / Pharma / Life Sciences ──────────────────────────────────────
+    "NFLX", "ROKU", "SPOT", "PARAA", "SIRI",
+    # ── EVs / Clean Energy ────────────────────────────────────────────────────
+    "RIVN", "LCID", "NIO", "XPEV", "LI", "NKLA", "BLNK", "CHPT", "EVGO",
+    "PLUG", "FCEL", "BLDP", "FSLR", "ENPH", "SEDG", "ARRY", "RUN",
+    "JOBY", "ACHR",
+    # ── Biotech / Pharma ──────────────────────────────────────────────────────
     "REGN", "VRTX", "MRNA", "BIIB", "ALNY", "ILMN", "BMRN", "INCY",
     "EXAS", "NBIX", "ACAD", "RARE", "RCKT", "NTLA", "BEAM", "EDIT",
     "CRSP", "FATE", "IOVA", "KRTX", "PTGX", "TGTX", "PRAX", "RXRX",
-    "ARQT", "IMVT", "TBPH", "DNLI", "IONS", "ARGX", "KRYS", "APGE",
-    "RVMD", "NKTX", "BLUE", "FOLD", "AVXL", "CDTX", "CGEM", "IMCR",
-    "VCEL", "NUVL", "ARVN", "KYMR", "MGNX", "MIRM", "ALLO", "GRPH",
-    "ROIV", "LNTH", "ACLX", "SNDX", "PMVP", "TARS", "OKLO",
-
-    # ── Medical Devices / Health Tech ─────────────────────────────────────────
-    "ISRG", "IDXX", "DXCM", "PODD", "ALGN", "MASI", "HOLX", "TECH",
-    "NEOG", "NUVA", "HSIC", "XRAY", "ZBH", "NTRA", "PACB", "AXNX",
-    "INSP", "SWAV", "TNDM", "NARI", "ATRS", "LIVN",
-
-    # ── Financial / Fintech ────────────────────────────────────────────────────
-    "HOOD", "MELI", "NU", "PAGS", "DLO", "NUVEI", "GPN", "EVRI",
-    "FOUR", "PAX", "PAYO", "IIIV", "RPAY", "PRSO",
-
+    "ARQT", "IMVT", "IONS", "ARGX", "KRYS", "RVMD", "BLUE", "FOLD",
+    "AVXL", "VCEL", "NUVL", "ARVN", "KYMR", "MGNX", "ROIV", "LNTH",
+    # ── Medical Devices ───────────────────────────────────────────────────────
+    "ISRG", "IDXX", "DXCM", "PODD", "ALGN", "HOLX", "NTRA", "PACB",
+    "INSP", "SWAV", "TNDM", "NARI",
+    # ── Financial / Fintech ───────────────────────────────────────────────────
+    "HOOD", "MELI", "NU", "PAGS", "DLO", "GPN", "FOUR", "RPAY",
     # ── Cybersecurity ─────────────────────────────────────────────────────────
     "FTNT", "CYBR", "TENB", "RPD", "QLYS", "VRNS", "SAIL", "RBRK",
-
-    # ── Cloud Infrastructure / Networking ─────────────────────────────────────
-    "CSCO", "ANET", "JNPR", "FFIV", "NTGR", "VIAV", "INFN", "CALX",
-    "CIEN", "SMTC", "SMAR",
-
-    # ── Consumer Tech / Devices ───────────────────────────────────────────────
-    "AAPL", "HPQ", "LOGI", "GPRO", "HEAR", "VZIO", "SONO",
-
-    # ── AI / Data / Analytics ─────────────────────────────────────────────────
-    "CWAN", "VERX", "PDFS", "CNXC", "PRCT", "APPF", "ALRM", "KNSA",
-    "ATNI", "GFAI", "BBAI", "SOUN", "BIGB", "AMSWA", "CLBT", "PTLO",
-
-    # ── Retail / Consumer Discretionary ───────────────────────────────────────
-    "COST", "AMZN", "LULU", "ORLY", "CASY", "FIVE", "ROST", "DLTR",
-    "TSCO", "ULTA", "DECK", "CROX", "SKX", "ONON", "BOOT", "BIRK",
-
-    # ── Telecom / Communications ──────────────────────────────────────────────
-    "TMUS", "LBRDK", "LBRDA", "CHTR", "SHEN", "GSAT", "AST",
-
-    # ── Travel / Hospitality ──────────────────────────────────────────────────
-    "ABNB", "BKNG", "EXPE", "MMYT", "TRVG", "DESP", "SEERA",
-
+    # ── Cloud Infrastructure ──────────────────────────────────────────────────
+    "CSCO", "ANET", "JNPR", "FFIV", "CALX", "CIEN",
+    # ── Consumer Tech ─────────────────────────────────────────────────────────
+    "HPQ", "LOGI", "GPRO",
+    # ── Retail / Consumer ─────────────────────────────────────────────────────
+    "COST", "LULU", "ORLY", "CASY", "FIVE", "ROST", "DLTR",
+    "TSCO", "ULTA", "DECK", "CROX", "SKX", "ONON",
+    # ── Telecom ───────────────────────────────────────────────────────────────
+    "TMUS", "CHTR", "GSAT", "AST",
     # ── Food / Beverage ───────────────────────────────────────────────────────
     "SBUX", "PZZA", "WING", "SHAK", "BROS", "CAVA", "TXRH",
-
     # ── Industrial / Aerospace ────────────────────────────────────────────────
-    "AXON", "KTOS", "RKLB", "SPCE", "LUNR", "MNTS", "ASTS", "SATL",
-
+    "AXON", "KTOS", "RKLB", "LUNR", "ASTS",
     # ── Crypto / Blockchain ───────────────────────────────────────────────────
     "COIN", "MSTR", "MARA", "RIOT", "CLSK", "CORZ", "IREN", "BTBT", "HUT",
-    "BTDR", "WULF", "CIFR", "BITF",
+    "WULF", "BITF",
 ]
 
-# Remove any duplicates while preserving order
-seen = set()
-NASDAQ_UNIVERSE = [t for t in NASDAQ_UNIVERSE if not (t in seen or seen.add(t))]
+# Remove duplicates while preserving order
+_seen: set = set()
+_FALLBACK_UNIVERSE = [t for t in _FALLBACK_UNIVERSE if not (t in _seen or _seen.add(t))]
 
-# ─── Core mega-cap tickers — get a scoring bonus in the daily screen ──────────
-# These move markets so they receive a small bump, but they still need decent
-# technicals to make the final top-50 cut.
+# Core mega-cap tickers — receive a small scoring bonus in the dynamic screen
 CORE_TICKERS = {
     "AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "TSLA", "AVGO",
     "AMD", "PLTR", "COIN", "CRM", "NFLX", "CRWD",
 }
 
+# Module-level cache for the full NASDAQ ticker list
+_nasdaq_ticker_cache: list[str] = []
+_nasdaq_ticker_fetched_at: datetime | None = None
+_NASDAQ_CACHE_TTL_HOURS = 24  # Refresh at most once per day
 
+
+def fetch_full_nasdaq_tickers() -> list[str]:
+    """
+    Fetch the complete list of NASDAQ-listed tickers from NASDAQ's public FTP directory.
+
+    Source: ftp.nasdaqtrader.com/symboldirectory/nasdaqlisted.txt
+    This is a free, unauthenticated text file updated each trading day.
+    Falls back to the curated _FALLBACK_UNIVERSE list if the fetch fails.
+
+    Filters applied:
+    - Exclude test securities (symbol ends with 'test' or starts with '$')
+    - Exclude ETFs (market_category not in ['Q', 'G', 'S', 'M'])
+    - Exclude special warrant/preferred symbols (contain '.', '+', '-')
+    Returns at most 5,000 tickers; in practice NASDAQ has ~3,300 common stocks.
+    """
+    global _nasdaq_ticker_cache, _nasdaq_ticker_fetched_at
+
+    # Return cache if fresh enough
+    if (
+        _nasdaq_ticker_cache
+        and _nasdaq_ticker_fetched_at
+        and (datetime.now(timezone.utc) - _nasdaq_ticker_fetched_at).total_seconds()
+        < _NASDAQ_CACHE_TTL_HOURS * 3600
+    ):
+        logger.info(f"Using cached NASDAQ ticker list ({len(_nasdaq_ticker_cache)} tickers).")
+        return _nasdaq_ticker_cache
+
+    try:
+        url = "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        lines = resp.text.strip().splitlines()
+
+        tickers: list[str] = []
+        for line in lines[1:]:  # Skip header row
+            parts = line.split("|")
+            if len(parts) < 3:
+                continue
+            symbol = parts[0].strip()
+            etf_flag = parts[6].strip() if len(parts) > 6 else ""
+
+            # Skip ETFs, test symbols, special characters
+            if not symbol:
+                continue
+            if "." in symbol or "+" in symbol or "$" in symbol:
+                continue
+            if symbol.lower().endswith("test"):
+                continue
+            if etf_flag.upper() == "Y":  # ETF flag
+                continue
+            tickers.append(symbol)
+
+        if len(tickers) < 100:
+            raise ValueError(f"Suspiciously few tickers returned: {len(tickers)}")
+
+        _nasdaq_ticker_cache = tickers
+        _nasdaq_ticker_fetched_at = datetime.now(timezone.utc)
+        logger.info(f"Fetched {len(tickers)} NASDAQ tickers from nasdaqtrader.com.")
+        return tickers
+
+    except Exception as e:
+        logger.warning(f"Failed to fetch NASDAQ ticker list ({e}). Using fallback universe "
+                       f"({len(_FALLBACK_UNIVERSE)} tickers).")
+        return _FALLBACK_UNIVERSE
+
+
+# ─── News fetching ────────────────────────────────────────────────────────────
 
 def fetch_news_for_ticker(ticker: str) -> list[dict]:
     """Fetch recent news articles for a given ticker via NewsAPI."""
@@ -208,40 +249,59 @@ def _fetch_technicals_for_ticker(ticker: str) -> dict | None:
         prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else latest_close
 
         # Moving averages
-        sma_5 = float(closes.rolling(5).mean().iloc[-1]) if len(closes) >= 5 else None
+        sma_5  = float(closes.rolling(5).mean().iloc[-1])  if len(closes) >= 5  else None
         sma_10 = float(closes.rolling(10).mean().iloc[-1]) if len(closes) >= 10 else None
         sma_20 = float(closes.rolling(20).mean().iloc[-1]) if len(closes) >= 20 else None
         sma_50 = float(closes.rolling(50).mean().iloc[-1]) if len(closes) >= 50 else None
 
         # EMAs
-        ema_8 = float(closes.ewm(span=8, adjust=False).mean().iloc[-1]) if len(closes) >= 8 else None
+        ema_8  = float(closes.ewm(span=8,  adjust=False).mean().iloc[-1]) if len(closes) >= 8  else None
         ema_21 = float(closes.ewm(span=21, adjust=False).mean().iloc[-1]) if len(closes) >= 21 else None
 
         # RSI
         rsi = _compute_rsi(closes)
 
         # MACD (12, 26, 9)
-        macd_val = None
-        macd_signal = None
+        macd_val = macd_signal = None
         if len(closes) >= 26:
             ema12 = closes.ewm(span=12, adjust=False).mean()
             ema26 = closes.ewm(span=26, adjust=False).mean()
-            macd_line = ema12 - ema26
+            macd_line   = ema12 - ema26
             signal_line = macd_line.ewm(span=9, adjust=False).mean()
-            macd_val = round(float(macd_line.iloc[-1]), 4)
+            macd_val    = round(float(macd_line.iloc[-1]),   4)
             macd_signal = round(float(signal_line.iloc[-1]), 4)
 
-        # Volume spike (today vs 10-day average)
+        # Volume — 10-day AND 20-day average for relative volume
         avg_vol_10 = float(volumes.rolling(10).mean().iloc[-1]) if len(volumes) >= 10 else None
-        latest_vol = float(volumes.iloc[-1])
-        vol_ratio = round(latest_vol / avg_vol_10, 2) if avg_vol_10 and avg_vol_10 > 0 else None
+        avg_vol_20 = float(volumes.rolling(20).mean().iloc[-1]) if len(volumes) >= 20 else None
+        latest_vol  = float(volumes.iloc[-1])
 
-        # Day change
+        vol_ratio_10 = round(latest_vol / avg_vol_10, 2) if avg_vol_10 and avg_vol_10 > 0 else None
+        vol_ratio_20 = round(latest_vol / avg_vol_20, 2) if avg_vol_20 and avg_vol_20 > 0 else None
+
+        # Average daily volume (20-day) — used for liquidity screening
+        avg_daily_vol_20 = round(avg_vol_20, 0) if avg_vol_20 else None
+
+        # Day change & momentum
         day_change_pct = round((latest_close - prev_close) / prev_close * 100, 2) if prev_close else 0
-
-        # Multi-timeframe momentum (percentage returns)
-        mom_5d = round((latest_close / float(closes.iloc[-6]) - 1) * 100, 2) if len(closes) >= 6 else None
+        mom_5d  = round((latest_close / float(closes.iloc[-6])  - 1) * 100, 2) if len(closes) >= 6  else None
         mom_20d = round((latest_close / float(closes.iloc[-21]) - 1) * 100, 2) if len(closes) >= 21 else None
+
+        # Check for earnings in the upcoming week via yfinance calendar
+        earnings_this_week = False
+        try:
+            cal = tk.calendar
+            if cal is not None and not cal.empty:
+                # calendar index may include 'Earnings Date'
+                if "Earnings Date" in cal.index:
+                    earn_date = cal.loc["Earnings Date"].iloc[0]
+                    if hasattr(earn_date, "date"):
+                        earn_date = earn_date.date()
+                    today = datetime.now(timezone.utc).date()
+                    delta_days = (earn_date - today).days
+                    earnings_this_week = 0 <= delta_days <= 7
+        except Exception:
+            pass
 
         return {
             "ticker": ticker,
@@ -250,17 +310,20 @@ def _fetch_technicals_for_ticker(ticker: str) -> dict | None:
             "day_change_pct": day_change_pct,
             "mom_5d": mom_5d,
             "mom_20d": mom_20d,
-            "sma_5": round(sma_5, 2) if sma_5 else None,
+            "sma_5":  round(sma_5,  2) if sma_5  else None,
             "sma_10": round(sma_10, 2) if sma_10 else None,
             "sma_20": round(sma_20, 2) if sma_20 else None,
             "sma_50": round(sma_50, 2) if sma_50 else None,
-            "ema_8": round(ema_8, 2) if ema_8 else None,
+            "ema_8":  round(ema_8,  2) if ema_8  else None,
             "ema_21": round(ema_21, 2) if ema_21 else None,
             "rsi_14": rsi,
             "macd": macd_val,
             "macd_signal": macd_signal,
             "volume": int(latest_vol),
-            "vol_vs_avg": vol_ratio,
+            "avg_daily_vol_20": avg_daily_vol_20,   # 20-day avg daily volume (liquidity check)
+            "vol_vs_avg_10": vol_ratio_10,           # Relative volume vs 10-day avg
+            "vol_vs_avg_20": vol_ratio_20,           # Relative volume vs 20-day avg (key signal)
+            "earnings_this_week": earnings_this_week,
         }
     except Exception as e:
         logger.debug(f"Technical fetch failed for {ticker}: {e}")
@@ -283,31 +346,21 @@ def fetch_technicals_batch(tickers: list[str], max_workers: int = 10) -> list[di
 # ─── Market Regime & Pre-Filtering ────────────────────────────────────────────
 
 def check_market_regime() -> dict:
-    """Check overall NASDAQ market health via QQQ ETF.
-
-    Returns a dict with regime ('bullish', 'neutral', 'bearish'),
-    recent QQQ changes, and whether price is above SMA-20.
-    Used to scale position sizing and set minimum confidence thresholds.
-    """
+    """Check overall NASDAQ market health via QQQ ETF."""
     try:
-        # Check broad market (QQQ)
         qqq = yf.Ticker("QQQ")
         hist = qqq.history(period="1mo", interval="1d")
-        
+
         regime = "unknown"
-        latest = 0.0
-        change_3d = 0.0
-        change_5d = 0.0
-        sma_20 = 0.0
-        
+        latest = change_3d = change_5d = sma_20 = 0.0
+
         if not hist.empty and len(hist) >= 5:
-            closes = hist["Close"]
-            latest = float(closes.iloc[-1])
+            closes  = hist["Close"]
+            latest  = float(closes.iloc[-1])
             change_3d = round((latest / float(closes.iloc[-4]) - 1) * 100, 2) if len(closes) >= 4 else 0
             change_5d = round((latest / float(closes.iloc[-6]) - 1) * 100, 2) if len(closes) >= 6 else 0
-            sma_20 = float(closes.rolling(20).mean().iloc[-1]) if len(closes) >= 20 else latest
+            sma_20  = float(closes.rolling(20).mean().iloc[-1]) if len(closes) >= 20 else latest
 
-            # Loosened thresholds — only flag bearish in a genuine sell-off
             if change_3d < -3.0 or (change_5d < -5.0 and latest < sma_20):
                 regime = "bearish"
             elif change_3d > 0.5 and latest > sma_20:
@@ -315,11 +368,13 @@ def check_market_regime() -> dict:
             else:
                 regime = "neutral"
 
-        # Check Sector Relative Strength
         sectors = {"XLK": "Tech", "XLV": "Healthcare", "XLY": "Consumer", "XLC": "Comm"}
-        sector_perf = {}
+        sector_perf: dict[str, float] = {}
         try:
-            sector_data = yf.download(list(sectors.keys()), period="10d", interval="1d", group_by="ticker", progress=False)
+            sector_data = yf.download(
+                list(sectors.keys()), period="10d", interval="1d",
+                group_by="ticker", progress=False
+            )
             if not sector_data.empty:
                 for etf, name in sectors.items():
                     try:
@@ -333,9 +388,8 @@ def check_market_regime() -> dict:
         except Exception as e:
             logger.error(f"Sector perf check failed: {e}")
 
-        # Determine strongest sectors
         strongest_sectors = sorted(sector_perf.items(), key=lambda x: x[1], reverse=True)[:2]
-        sector_str = ", ".join([f"{name} ({perf}%)" for name, perf in strongest_sectors]) if strongest_sectors else "N/A"
+        sector_str = ", ".join([f"{n} ({p}%)" for n, p in strongest_sectors]) if strongest_sectors else "N/A"
 
         return {
             "regime": regime,
@@ -351,235 +405,260 @@ def check_market_regime() -> dict:
 
 
 def pre_filter_candidates(technicals: list[dict]) -> list[dict]:
-    """Remove stocks that are obviously in downtrends before sending to AI.
+    """
+    Remove stocks that are obviously unsuitable before sending to AI.
 
-    This saves API tokens and prevents the AI from being tempted by
-    stocks that look cheap but are actually falling knives.
-    Loosened to allow borderline candidates through — let the AI decide.
+    Rejection criteria (all hard stops):
+    - Average daily volume < 50,000 shares → liquidity risk at sell time
+    - Earnings this week → too unpredictable
+    - 5-day momentum > +20% → likely exhausted, due for pullback
+    - Price well below both SMA-20 and SMA-50 (> 3%) → confirmed downtrend
+    - Heavy negative momentum on both timeframes → falling knife
+    - RSI > 85 → extremely overbought
+
+    Note: Penny stocks (price < $1) are NOT filtered here — they are handled
+    by the volume check (very low-volume pennies won't pass the 50k threshold).
     """
     filtered = []
     rejected = []
 
     for t in technicals:
-        ticker = t["ticker"]
-        price = t.get("price", 0)
-        sma_20 = t.get("sma_20")
-        sma_50 = t.get("sma_50")
-        rsi = t.get("rsi_14")
-        mom_5d = t.get("mom_5d")
+        ticker  = t["ticker"]
+        price   = t.get("price", 0)
+        sma_20  = t.get("sma_20")
+        sma_50  = t.get("sma_50")
+        rsi     = t.get("rsi_14")
+        mom_5d  = t.get("mom_5d")
         mom_20d = t.get("mom_20d")
-        macd = t.get("macd")
-        macd_signal = t.get("macd_signal")
+        avg_vol = t.get("avg_daily_vol_20", 0) or 0
+        earnings = t.get("earnings_this_week", False)
+
+        # Hard reject: insufficient liquidity (< 50k avg daily volume)
+        if avg_vol > 0 and avg_vol < 50_000:
+            rejected.append(f"{ticker}(avg_vol={avg_vol:.0f}<50k)")
+            continue
+
+        # Hard reject: earnings this week (too binary/unpredictable)
+        if earnings:
+            rejected.append(f"{ticker}(earnings_this_week)")
+            continue
+
+        # Hard reject: already surged > 20% in 5 days (likely to pull back)
+        if mom_5d is not None and mom_5d > 20.0:
+            rejected.append(f"{ticker}(already+{mom_5d:.1f}%_in_5d)")
+            continue
 
         # Reject: price WELL below both SMA-20 and SMA-50 (strong downtrend)
-        # Only reject if price is >3% below both — slight dips are OK
         if sma_20 and sma_50 and price < sma_20 * 0.97 and price < sma_50 * 0.97:
-            rejected.append(f"{ticker}(well below SMA-20 & SMA-50)")
+            rejected.append(f"{ticker}(well_below_SMA20&50)")
             continue
 
         # Reject: heavy negative momentum on both timeframes
         if mom_5d is not None and mom_20d is not None:
             if mom_5d < -5.0 and mom_20d < -8.0:
-                rejected.append(f"{ticker}(downtrend: 5d={mom_5d}%, 20d={mom_20d}%)")
+                rejected.append(f"{ticker}(downtrend:5d={mom_5d}%,20d={mom_20d}%)")
                 continue
 
-        # Reject: extremely overbought (likely to pull back hard)
+        # Reject: extremely overbought
         if rsi and rsi > 85:
-            rejected.append(f"{ticker}(overbought RSI={rsi})")
-            continue
-
-        # Reject: penny stocks
-        if price < 3.0:
-            rejected.append(f"{ticker}(penny stock ${price})")
+            rejected.append(f"{ticker}(overbought_RSI={rsi})")
             continue
 
         filtered.append(t)
 
     if rejected:
-        logger.info(f"Pre-filter rejected {len(rejected)} ticker(s): {', '.join(rejected[:15])}")
+        logger.info(f"Pre-filter rejected {len(rejected)} ticker(s): {', '.join(rejected[:20])}")
     logger.info(f"Pre-filter passed {len(filtered)}/{len(technicals)} tickers.")
     return filtered
 
 
 def verify_ticker_momentum(ticker: str) -> bool:
-    """Quick pre-buy check: reject stocks that are actively crashing.
-
-    Runs just before order execution to catch stocks that may have
-    turned sharply negative between the AI scan and the buy order.
-    Only blocks genuine crashes, not normal pullbacks.
-    """
+    """Quick pre-buy check: reject stocks that are actively crashing."""
     try:
         tk = yf.Ticker(ticker)
         hist = tk.history(period="5d", interval="1d")
         if hist.empty or len(hist) < 3:
-            return True  # Insufficient data — allow the trade
+            return True
 
         closes = hist["Close"]
         latest = float(closes.iloc[-1])
         three_days_ago = float(closes.iloc[0]) if len(closes) >= 3 else latest
-
         change = (latest / three_days_ago - 1) * 100
 
         if change < -5.0:
             logger.warning(f"Pre-buy check FAILED for {ticker}: down {change:.1f}% over recent sessions")
             return False
-
         return True
     except Exception as e:
         logger.warning(f"Pre-buy momentum check error for {ticker}: {e}")
-        return True  # On error, allow the trade
+        return True
 
 
 def _quick_screen_universe(
     universe: list[str],
-    top_n: int = 50,
+    top_n: int = 75,
 ) -> list[tuple[str, float]]:
-    """Dynamically screen the full ticker universe to find today's best 50 stocks.
+    """
+    Dynamically screen the full ticker universe to find today's best candidates.
 
-    Uses a free yfinance batch download (no API credits) to fetch 1-month daily
-    data for every ticker, compute quick technical metrics, and rank them by a
-    composite momentum/trend/RSI/volume score.
+    Uses yfinance batch download to fetch 1-month daily data for every ticker,
+    compute quick technical metrics, and rank them by a composite score.
 
-    Returns the top_n tickers as (ticker, score) tuples, sorted by score
-    descending.  CORE_TICKERS receive a small scoring bonus (+8) so they are
-    more likely to appear but are NOT force-included — they still need a
-    reasonable setup to make the cut.
-
-    This replaces the old static NASDAQ_HOT_LIST so the scanner adapts daily
-    to wherever the momentum is.
+    Changes from previous version:
+    - Accepts the full NASDAQ universe (~3,300+ tickers); processes in batches
+      to stay within yfinance limits.
+    - Removed the penny-stock price filter (price < $5 skip) — liquidity is now
+      checked via avg_daily_vol_20 instead.
+    - Added avg_vol_20 check: skip if < 50,000 shares/day (liquidity risk).
+    - Returns top_n=75 instead of 50 to give Gemini more candidates.
     """
     logger.info(f"Dynamic screening {len(universe)} tickers to find top {top_n}...")
 
-    try:
-        # Batch download — far faster than individual yf.Ticker() calls
-        data = yf.download(
-            universe,
-            period="1mo",
-            interval="1d",
-            group_by="ticker",
-            threads=True,
-            progress=False,
-        )
+    scores: list[tuple[str, float]] = []
+    BATCH_SIZE = 500  # yfinance handles batches of ~500 well
 
-        if data.empty:
-            logger.warning("Batch download returned empty data. Using core tickers only.")
-            return [(t, 0.0) for t in CORE_TICKERS]
+    universe_batches = [
+        universe[i:i + BATCH_SIZE] for i in range(0, len(universe), BATCH_SIZE)
+    ]
 
-        scores: list[tuple[str, float]] = []
+    for batch_num, batch in enumerate(universe_batches, 1):
+        logger.info(f"Screening batch {batch_num}/{len(universe_batches)} ({len(batch)} tickers)...")
+        try:
+            data = yf.download(
+                batch,
+                period="1mo",
+                interval="1d",
+                group_by="ticker",
+                threads=True,
+                progress=False,
+            )
 
-        for ticker in universe:
-            try:
-                if ticker not in data.columns.get_level_values(0):
-                    continue
-                ticker_df = data[ticker]
-                closes = ticker_df["Close"].dropna()
-                volumes = ticker_df["Volume"].dropna()
-
-                if len(closes) < 10:
-                    continue
-
-                latest = float(closes.iloc[-1])
-                if latest < 5.0:  # skip penny stocks
-                    continue
-
-                prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else latest
-
-                # ── Quick metrics ──
-                mom_1d = ((latest / prev_close) - 1) * 100 if prev_close > 0 else 0.0
-                mom_5d = ((latest / float(closes.iloc[-6])) - 1) * 100 if len(closes) >= 6 else 0.0
-                mom_10d = ((latest / float(closes.iloc[-11])) - 1) * 100 if len(closes) >= 11 else 0.0
-                ema_8 = float(closes.ewm(span=8, adjust=False).mean().iloc[-1]) if len(closes) >= 8 else latest
-                ema_21 = float(closes.ewm(span=21, adjust=False).mean().iloc[-1]) if len(closes) >= 21 else latest
-                sma_10 = float(closes.rolling(10).mean().iloc[-1]) if len(closes) >= 10 else latest
-                sma_20 = float(closes.rolling(20).mean().iloc[-1]) if len(closes) >= 20 else latest
-                above_sma10 = latest > sma_10
-                above_sma20 = latest > sma_20
-                ema_bullish = ema_8 > ema_21
-                rsi = _compute_rsi(closes) or 50.0
-                avg_vol = float(volumes.rolling(10).mean().iloc[-1]) if len(volumes) >= 10 else 1.0
-                vol_ratio = float(volumes.iloc[-1]) / avg_vol if avg_vol > 0 else 1.0
-
-                # ── MACD quick check ──
-                macd_bullish = False
-                if len(closes) >= 26:
-                    ema12 = closes.ewm(span=12, adjust=False).mean()
-                    ema26 = closes.ewm(span=26, adjust=False).mean()
-                    macd_line = ema12 - ema26
-                    signal_line = macd_line.ewm(span=9, adjust=False).mean()
-                    macd_bullish = float(macd_line.iloc[-1]) > float(signal_line.iloc[-1])
-
-                # ── Composite score (higher = better daily candidate) ──
-                score = 0.0
-
-                # Momentum (biggest weight — we want stocks moving NOW)
-                score += mom_1d * 3.0   # today's gap / move is most important
-                score += mom_5d * 2.0   # short-term trend
-                score += mom_10d * 1.0  # medium-term trend
-
-                # RSI sweet-spot
-                if 40 <= rsi <= 65:
-                    score += 15  # ideal buy zone
-                elif 30 <= rsi <= 75:
-                    score += 5   # acceptable
-                elif rsi > 80:
-                    score -= 20  # overbought penalty
-                else:
-                    score -= 10  # oversold / risky
-
-                # Trend alignment
-                score += 10 if above_sma20 else -10
-                score += 5 if above_sma10 else -5
-                
-                # EMA Swing Confirmation
-                score += 8 if ema_bullish else -4
-
-                # MACD
-                score += 8 if macd_bullish else -5
-
-                # Volume surge (institutional interest)
-                if vol_ratio > 2.0:
-                    score += 15
-                elif vol_ratio > 1.5:
-                    score += 10
-                elif vol_ratio > 1.2:
-                    score += 5
-
-                # Core mega-cap bonus — these are more liquid and move markets
-                if ticker in CORE_TICKERS:
-                    score += 8
-
-                scores.append((ticker, round(score, 2)))
-            except Exception:
+            if data.empty:
                 continue
 
-        scores.sort(key=lambda x: x[1], reverse=True)
+            for ticker in batch:
+                try:
+                    if ticker not in data.columns.get_level_values(0):
+                        continue
+                    ticker_df = data[ticker]
+                    closes  = ticker_df["Close"].dropna()
+                    volumes = ticker_df["Volume"].dropna()
 
-        # Take the top N by score — no force-includes
-        hot_list = scores[:top_n]
+                    if len(closes) < 10:
+                        continue
 
-        top10 = [(t, f"{s:.1f}") for t, s in scores[:10]]
-        core_in_list = [t for t, _ in hot_list if t in CORE_TICKERS]
-        logger.info(
-            f"Dynamic screening complete. Selected {len(hot_list)} tickers. "
-            f"Top 10 by score: {top10} | "
-            f"Core tickers in hot list: {len(core_in_list)}/{len(CORE_TICKERS)}"
-        )
-        # Log full hot list for debugging
-        logger.info(f"Full hot list: {[t for t, _ in hot_list]}")
+                    latest    = float(closes.iloc[-1])
+                    prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else latest
 
-        return hot_list
+                    # ── Liquidity gate — skip low-volume stocks ──
+                    avg_vol_20 = float(volumes.rolling(20).mean().iloc[-1]) if len(volumes) >= 20 else 0.0
+                    if avg_vol_20 < 50_000:
+                        continue
 
-    except Exception as e:
-        logger.error(f"Dynamic screening failed ({e}). Falling back to core tickers.")
-        return [(t, 0.0) for t in CORE_TICKERS]
+                    # ── Quick metrics ──
+                    mom_1d  = ((latest / prev_close) - 1) * 100 if prev_close > 0 else 0.0
+                    mom_5d  = ((latest / float(closes.iloc[-6]))  - 1) * 100 if len(closes) >= 6  else 0.0
+                    mom_10d = ((latest / float(closes.iloc[-11])) - 1) * 100 if len(closes) >= 11 else 0.0
+                    ema_8   = float(closes.ewm(span=8,  adjust=False).mean().iloc[-1]) if len(closes) >= 8  else latest
+                    ema_21  = float(closes.ewm(span=21, adjust=False).mean().iloc[-1]) if len(closes) >= 21 else latest
+                    sma_10  = float(closes.rolling(10).mean().iloc[-1]) if len(closes) >= 10 else latest
+                    sma_20  = float(closes.rolling(20).mean().iloc[-1]) if len(closes) >= 20 else latest
+                    above_sma10 = latest > sma_10
+                    above_sma20 = latest > sma_20
+                    ema_bullish = ema_8 > ema_21
+                    rsi = _compute_rsi(closes) or 50.0
+                    vol_ratio = float(volumes.iloc[-1]) / avg_vol_20 if avg_vol_20 > 0 else 1.0
+
+                    # ── MACD quick check ──
+                    macd_bullish = False
+                    if len(closes) >= 26:
+                        ema12 = closes.ewm(span=12, adjust=False).mean()
+                        ema26 = closes.ewm(span=26, adjust=False).mean()
+                        macd_line   = ema12 - ema26
+                        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+                        macd_bullish = float(macd_line.iloc[-1]) > float(signal_line.iloc[-1])
+
+                    # ── Composite score ──
+                    score = 0.0
+
+                    # Momentum (biggest weight)
+                    score += mom_1d  * 3.0
+                    score += mom_5d  * 2.0
+                    score += mom_10d * 1.0
+
+                    # Hard rejection: already up > 20% in 5 days → likely exhausted
+                    if mom_5d > 20.0:
+                        continue
+
+                    # RSI sweet-spot
+                    if 40 <= rsi <= 65:
+                        score += 15
+                    elif 30 <= rsi <= 75:
+                        score += 5
+                    elif rsi > 80:
+                        score -= 20
+                    else:
+                        score -= 10
+
+                    # Trend alignment
+                    score += 10 if above_sma20 else -10
+                    score += 5  if above_sma10 else -5
+                    score += 8  if ema_bullish  else -4
+                    score += 8  if macd_bullish else -5
+
+                    # Relative volume (1.5x+ is a strong signal per requirements)
+                    if vol_ratio > 2.0:
+                        score += 20
+                    elif vol_ratio > 1.5:
+                        score += 14
+                    elif vol_ratio > 1.2:
+                        score += 7
+                    elif vol_ratio > 1.0:
+                        score += 3
+
+                    # Core mega-cap bonus
+                    if ticker in CORE_TICKERS:
+                        score += 8
+
+                    scores.append((ticker, round(score, 2)))
+                except Exception:
+                    continue
+
+        except Exception as e:
+            logger.error(f"Batch {batch_num} screening failed: {e}")
+            continue
+
+    scores.sort(key=lambda x: x[1], reverse=True)
+    hot_list = scores[:top_n]
+
+    top10 = [(t, f"{s:.1f}") for t, s in scores[:10]]
+    core_in_list = [t for t, _ in hot_list if t in CORE_TICKERS]
+    logger.info(
+        f"Dynamic screening complete. Screened {len(scores)} tickers. "
+        f"Selected top {len(hot_list)}. "
+        f"Top 10 by score: {top10} | "
+        f"Core tickers in hot list: {len(core_in_list)}/{len(CORE_TICKERS)}"
+    )
+    logger.info(f"Full hot list: {[t for t, _ in hot_list]}")
+
+    return hot_list
 
 
-def analyse_with_gemini(news_data: list[dict], technicals: list[dict] | None = None, market_regime: dict | None = None) -> list[dict]:
+def analyse_with_gemini(
+    news_data: list[dict],
+    technicals: list[dict] | None = None,
+    market_regime: dict | None = None,
+) -> list[dict]:
     """
     Uses Gemini to analyse news + technical data and return ranked stock
-    recommendations for the current trading day using structured JSON output.
+    recommendations for the current trading week.
 
-    Returns: list of {"ticker": str, "reason": str, "confidence": float (0-1)}
+    Returns: list of {
+        "ticker": str,
+        "reason": str,
+        "confidence": float (0–1),
+        "position_size_pct": float (% of capital to allocate)
+    }
     """
     if not GEMINI_API_KEY:
         logger.warning("GEMINI_API_KEY not set, skipping AI analysis")
@@ -587,21 +666,19 @@ def analyse_with_gemini(news_data: list[dict], technicals: list[dict] | None = N
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # Trim headline blob to avoid token limits — 10KB cap
+    # Trim headline blob to avoid token limits — 12KB cap
     news_json = json.dumps(news_data, indent=2)
-    if len(news_json) > 10000:
-        news_json = news_json[:10000] + "\n... (truncated)"
+    if len(news_json) > 12000:
+        news_json = news_json[:12000] + "\n... (truncated)"
 
-    universe_str = ", ".join(NASDAQ_UNIVERSE)
-
-    # Build technical data section
+    # Build technical data section (limit to 10KB)
     tech_section = ""
     if technicals:
         tech_json = json.dumps(technicals, indent=2)
-        if len(tech_json) > 8000:
-            tech_json = tech_json[:8000] + "\n... (truncated)"
+        if len(tech_json) > 10000:
+            tech_json = tech_json[:10000] + "\n... (truncated)"
         tech_section = f"""
-TECHNICAL DATA (real-time indicators — includes momentum, moving averages, RSI, MACD):
+TECHNICAL DATA (real-time indicators):
 {tech_json}
 """
 
@@ -620,8 +697,8 @@ TECHNICAL DATA (real-time indicators — includes momentum, moving averages, RSI
         if market_regime.get("regime") == "bearish":
             market_caution = (
                 "\n⚠️ BEARISH MARKET REGIME: The broad market is weak. "
-                "Minimum confidence threshold is 0.60. Be selective but still look for "
-                "stocks with individual strength or catalysts that can outperform."
+                "Minimum confidence threshold is 0.60. Still look for stocks with "
+                "individual strength or catalysts that can outperform the index."
             )
         elif market_regime.get("regime") == "neutral":
             market_caution = (
@@ -629,86 +706,73 @@ TECHNICAL DATA (real-time indicators — includes momentum, moving averages, RSI
                 "Recommend stocks with decent technical setups and positive catalysts."
             )
 
-    prompt = f"""You are an elite quantitative swing-trading AI analysing NASDAQ stocks for {today}.
-Your job is to identify stocks breaking out of consolidations that are highly likely to trend upward over the next 3 to 5 trading days.
+    prompt = f"""You are an elite quantitative swing-trading AI analysing NASDAQ stocks for the week of {today}.
+Your job is to identify stocks that are highly likely to trend upward over the next 3–5 trading days.
 
-Aim to recommend 1 to 5 stocks. Prioritise quality but don't be overly restrictive —
-if a stock has a reasonable setup with upward momentum, include it. It's better to catch
-a winning stock than to miss it by being too cautious. An empty recommendation list is a
-bad outcome if there are decent setups available. Give strong preference to stocks in the strongest sectors.
+═══ TARGET ═══
+Aim to recommend 5 to 15 stocks. Prioritise quality, but ensure the portfolio is diversified
+and not over-concentrated. An empty list or fewer than 5 picks (when viable candidates exist)
+is a poor outcome. If the market offers strong setups, populate the full 5–15 range.
 
 ═══ MARKET REGIME ═══
 {regime_section}
 
-═══ AUTHORISED TICKER UNIVERSE ═══
-{universe_str}
+═══ HARD EXCLUSION CRITERIA (disqualify entirely — no exceptions) ═══
+1. ❌ Earnings announced this week (earnings_this_week = true) — binary risk, too unpredictable
+2. ❌ Stock has already risen > 20% in the last 5 days (mom_5d > 20%) — likely exhausted
+3. ❌ Average daily volume < 50,000 shares (avg_daily_vol_20 < 50k) — cannot exit safely
+4. ❌ Major negative news: lawsuits, earnings misses, FDA rejections, downgrades
+5. ❌ RSI > 85 — extremely overbought with high mean-reversion risk
+6. ❌ Price significantly (> 3%) below both SMA-20 AND SMA-50 — confirmed downtrend
 
-═══ MANDATORY REJECTION CRITERIA ═══
-Only DISQUALIFY stocks that are genuinely dangerous — do NOT reject borderline cases:
-- Price significantly (>3%) BELOW both SMA-20 AND SMA-50 → confirmed downtrend
-- RSI > 80 → heavily overbought, likely to pull back
-- Strongly negative momentum on BOTH 5-day (mom_5d < -3%) AND 20-day (mom_20d < -5%) → accelerating decline
-- Price below $3 → penny stock, unreliable
-- Major negative news: lawsuits, earnings misses, downgrades, FDA rejections → DISQUALIFY
-- Stock up >12% in recent days with declining volume → exhaustion move
+═══ PRIORITY BUY SIGNALS (aim for at least 2 of these) ═══
+1. ✅ Pre-market green on Monday morning (day_change_pct > 0 at open)
+2. ✅ Elevated relative volume (vol_vs_avg_20 >= 1.5x) — institutional interest
+3. ✅ Strong positive 5-day momentum (mom_5d > 3%) entering the week
+4. ✅ Positive news catalyst in the last 72 hours (earnings beat, analyst upgrade,
+      product launch, contract win, FDA approval, sector tailwind)
+5. ✅ EMA-8 crossing or holding ABOVE EMA-21 (swing momentum burst)
+6. ✅ MACD line above signal line (bullish crossover)
+7. ✅ RSI between 50–70 — sweet spot: trending but not overbought
+8. ✅ Price ABOVE SMA-20 — short-term uptrend confirmed
 
-═══ BUY CRITERIA (need at least 2 of these) ═══
-1. ✅ Positive news catalyst (earnings beat, analyst upgrade, partnership, product launch)
-2. ✅ Strong Sector Alignment (matches one of the Strongest Sectors listed above)
-3. ✅ EMA-8 crossing or holding ABOVE EMA-21 (Swing trade momentum confirmation)
-4. ✅ Price ABOVE SMA-20 (short-term uptrend)
-5. ✅ MACD line ABOVE signal line (bullish crossover)
-6. ✅ Volume above average (vol_vs_avg > 1.1) — interest present
-7. ✅ Positive 5-day and 20-day momentum
+═══ DEPRIORITISE (may still include if other signals are very strong) ═══
+- No news catalyst — technicals alone can justify inclusion
+- RSI 70–85 — include only if news catalyst is very strong
+- Low-price stocks — fine to include if volume spike is significant (>= 1.5x 20-day avg)
 
-═══ ANALYSIS METHODOLOGY ═══
-1. TECHNICAL MOMENTUM (Weight: 35%)
-    - Check moving averages: EMA-8, EMA-21, SMA-20, SMA-50
-    - EMA-8 above EMA-21 = swing momentum burst ✓
-    - Price above SMA-20 = solid short-term trend ✓
-    - MACD line above signal = bullish ✓
-    - Volume confirms the move (vol_vs_avg > 1.1)
+═══ ANALYSIS WEIGHTS ═══
+1. Technical Momentum (35%): EMA-8/21 alignment, SMA-20 position, MACD, vol_vs_avg_20
+2. News Catalyst (30%): earnings beats, upgrades, launches, sector tailwinds
+3. Trend Confirmation (20%): price vs MAs, multi-timeframe momentum (mom_5d, mom_20d)
+4. Risk Management (15%): liquidity, avoid binary events, avoid overbought extremes
 
-2. NEWS CATALYST (Weight: 30%)
-   - Earnings beats / positive guidance / analyst upgrades
-   - Product launches, major partnerships, contract wins
-   - FDA approvals, clinical trial successes
-   - Sector tailwinds (AI spending, rate cuts, etc.)
-   - Absence of negative news is acceptable if technicals are strong
-
-3. TREND CONFIRMATION (Weight: 20%)
-   - Price above SMA-20 = uptrend
-   - Not extended too far above moving averages (<8% above SMA-20)
-   - Positive momentum on at least one timeframe
-
-4. RISK MANAGEMENT (Weight: 15%)
-   - Prefer liquid, mid-to-large cap stocks for reliable fills
-   - In a BEARISH regime, still recommend stocks with strong individual setups
-   - Avoid binary events (earnings within 24h, FDA decisions)
-
-═══ CONFIDENCE SCORING ═══
-- 0.75-1.00: Multiple strong catalysts + great technicals + volume confirmation
-- 0.60-0.74: Good setup with supportive technicals (at least 2 buy signals)
-- 0.50-0.59: Decent setup — recommend if the stock looks poised to move up
+═══ CONFIDENCE & POSITION SIZING ═══
+- 0.80–1.00: Multiple strong catalysts + excellent technicals → position_size_pct = 12–20%
+- 0.65–0.79: Good setup with 2+ buy signals → position_size_pct = 7–12%
+- 0.50–0.64: Decent setup, at least 1 strong signal → position_size_pct = 3–7%
 - Below 0.50: Do NOT recommend
 {market_caution}
+Position sizes should sum to approximately 100% across all picks.
+Higher confidence picks get larger allocations. Adjust so the total is sensible.
 
 ═══ NEWS DATA ═══
 {news_json}
 {tech_section}
 ═══ OUTPUT FORMAT ═══
 Respond ONLY with a valid JSON array. No markdown fences, no explanation outside the JSON.
-Each recommendation MUST reference specific technical data points from the data above.
+Each recommendation MUST reference specific data points from the data above.
 [
   {{
     "ticker": "NVDA",
-    "reason": "Beat Q4 earnings by 22%, 3 analyst upgrades. Technicals: RSI 52, price $820 above SMA-20 ($795) and SMA-50 ($760), MACD bullish crossover, volume 2.1x average, mom_5d +3.2%, mom_20d +8.1% — strong multi-factor buy.",
-    "confidence": 0.85
+    "reason": "Earnings beat by 22% last week, 3 analyst upgrades to $1,100 PT. Technicals: RSI 58, price $870 above SMA-20 ($840), EMA-8 ($855) > EMA-21 ($830), MACD bullish, vol_vs_avg_20 = 2.3x, mom_5d +4.1%. Strong momentum entering the week with institutional volume confirmation.",
+    "confidence": 0.87,
+    "position_size_pct": 18
   }}
 ]"""
 
     try:
-        model = genai.GenerativeModel("gemini-2.5-flash")
+        model = genai.GenerativeModel("gemini-2.5-pro")
         response = model.generate_content(prompt)
         text = response.text.strip()
 
@@ -723,7 +787,6 @@ Each recommendation MUST reference specific technical data points from the data 
         if not isinstance(recommendations, list):
             raise ValueError("Gemini did not return a list")
 
-        # Validate structure and sort by confidence descending
         validated = []
         for rec in recommendations:
             if isinstance(rec, dict) and "ticker" in rec and "reason" in rec:
@@ -731,6 +794,7 @@ Each recommendation MUST reference specific technical data points from the data 
                     "ticker": str(rec["ticker"]).upper().strip(),
                     "reason": str(rec.get("reason", "")),
                     "confidence": float(rec.get("confidence", 0.5)),
+                    "position_size_pct": float(rec.get("position_size_pct", 5.0)),
                 })
         validated.sort(key=lambda r: r["confidence"], reverse=True)
         return validated
@@ -742,22 +806,26 @@ Each recommendation MUST reference specific technical data points from the data 
 
 def run_daily_scan() -> list[dict]:
     """
-    Main entry point: scans the market and returns AI-ranked stock picks.
+    Main entry point: scans the full NASDAQ market and returns AI-ranked stock picks.
 
     Pipeline:
-    1. Check market regime (QQQ health)
-    2. Dynamic-screen the full ~500-ticker universe → best 50 by composite score
-    3. Fetch news for those 50 (highest-scored first so the most promising
-       tickers are covered even if we hit a rate limit)
-    4. Fetch detailed technicals for the 50
-    5. Pre-filter obvious losers
-    6. Send everything to Gemini for final AI ranking
+    1. Fetch the complete NASDAQ ticker universe (dynamic, ~3,300 tickers)
+    2. Check market regime (QQQ health)
+    3. Dynamic-screen full universe → best 75 by composite momentum/volume score
+    4. Fetch news for those 75 (highest-scored first)
+    5. Fetch detailed technicals for the 75
+    6. Pre-filter obvious losers (low volume, earnings this week, already ran 20%+)
+    7. Send everything to Gemini for final AI ranking
     """
     logger.info("═══ Starting daily market scan ═══")
 
+    # Step 1: Fetch complete NASDAQ universe
+    nasdaq_tickers = fetch_full_nasdaq_tickers()
+    logger.info(f"NASDAQ universe: {len(nasdaq_tickers)} tickers loaded.")
+
     all_news = []
 
-    # Step 1: Fetch broad market / business headlines
+    # Step 2: Fetch broad market / business headlines
     top_news = fetch_top_movers_news()
     all_news.extend([
         {
@@ -770,7 +838,7 @@ def run_daily_scan() -> list[dict]:
         for a in top_news if a.get("title")
     ])
 
-    # Step 2: Check market regime (QQQ trend)
+    # Step 3: Check market regime (QQQ trend)
     logger.info("Checking market regime (QQQ)...")
     market_regime = check_market_regime()
     regime = market_regime.get("regime", "unknown")
@@ -782,19 +850,17 @@ def run_daily_scan() -> list[dict]:
     if regime == "bearish":
         logger.warning("⚠️ Bearish market detected — AI will apply stricter filters.")
 
-    # Step 3: Dynamic screen — find today's best 50 stocks from full universe
-    scored_hot_list = _quick_screen_universe(NASDAQ_UNIVERSE, top_n=50)
-    # scored_hot_list is [(ticker, score), ...] sorted by score desc
+    # Step 4: Dynamic screen — find today's best 75 stocks from full NASDAQ universe
+    scored_hot_list = _quick_screen_universe(nasdaq_tickers, top_n=75)
     hot_tickers = [t for t, _ in scored_hot_list]
 
     logger.info(
-        f"Hot list: {len(hot_tickers)} best stocks selected for today's analysis. "
+        f"Hot list: {len(hot_tickers)} best stocks selected. "
         f"Score range: {scored_hot_list[0][1] if scored_hot_list else 'N/A'} → "
         f"{scored_hot_list[-1][1] if scored_hot_list else 'N/A'}"
     )
 
-    # Step 4: Fetch individual ticker news — highest-scored tickers first
-    # so the best candidates are covered even if we hit a NewsAPI rate limit
+    # Step 5: Fetch individual ticker news — highest-scored tickers first
     logger.info(f"Fetching news for {len(hot_tickers)} hot-list tickers (best-first)...")
     rate_limited = False
     news_fetched_count = 0
@@ -811,15 +877,15 @@ def run_daily_scan() -> list[dict]:
             break
         all_news.extend(articles)
         news_fetched_count += 1
-        time.sleep(0.25)  # 250 ms gap → ~4 req/s, well under NewsAPI limits
+        time.sleep(0.25)  # 250ms gap → ~4 req/s, well under NewsAPI limits
 
     logger.info(f"Fetched {len(all_news)} news articles across {news_fetched_count} tickers.")
 
-    # Step 5: Fetch detailed technical indicators for the hot list
+    # Step 6: Fetch detailed technical indicators for the hot list
     logger.info(f"Fetching detailed technicals for {len(hot_tickers)} tickers...")
     technicals = fetch_technicals_batch(hot_tickers, max_workers=10)
 
-    # Step 6: Pre-filter — remove obvious losers before AI analysis
+    # Step 7: Pre-filter — remove obvious disqualifications before AI analysis
     filtered_technicals = pre_filter_candidates(technicals)
 
     logger.info(
@@ -827,7 +893,7 @@ def run_daily_scan() -> list[dict]:
         f"profiles (from {len(technicals)} total) to Gemini ({regime} regime)..."
     )
 
-    # Step 7: AI analysis with news + filtered technicals + market context
+    # Step 8: AI analysis with news + filtered technicals + market context
     recommendations = analyse_with_gemini(all_news, filtered_technicals, market_regime)
 
     picks = [f"{r['ticker']}({r['confidence']:.0%})" for r in recommendations]

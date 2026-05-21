@@ -2,7 +2,7 @@ import logging
 import threading
 from datetime import datetime, timezone
 from database import SessionLocal, get_setting
-from models import Trade, SystemLog
+from models import Trade, SystemLog, AIPick
 from ai_analyst import run_daily_scan, verify_ticker_momentum
 from trader import IBKRClient
 
@@ -10,11 +10,11 @@ logger = logging.getLogger(__name__)
 
 
 def _build_strategy_plan(
-    trading_mode: str, 
-    paper_strategy: str, 
-    available_cash: float, 
-    net_liq: float, 
-    db_budget_pct: float, 
+    trading_mode: str,
+    paper_strategy: str,
+    available_cash: float,
+    net_liq: float,
+    db_budget_pct: float,
     db_max_positions: int
 ) -> tuple[float, int, str]:
     """Return the daily budget, position cap, and a human-readable strategy label."""
@@ -27,20 +27,13 @@ def _build_strategy_plan(
 
 # ---------------------------------------------------------------------------
 # Persistent keepalive — a single IBKRClient that stays connected between jobs
-# so the gateway never idles out.  Managed by start_persistent_keepalive() /
-# stop_persistent_keepalive() which are called from api_server.py on startup /
-# shutdown.
 # ---------------------------------------------------------------------------
 _persistent_client: IBKRClient | None = None
 _persistent_client_lock = threading.Lock()
 
 
 def start_persistent_keepalive(trading_mode: str = "paper") -> None:
-    """Connect a long-lived IBKRClient and keep it alive in the background.
-
-    This prevents the IB Gateway from dropping the connection during the quiet
-    periods between the morning buy and afternoon sell jobs.
-    """
+    """Connect a long-lived IBKRClient and keep it alive in the background."""
     global _persistent_client
     with _persistent_client_lock:
         if _persistent_client is not None:
@@ -83,12 +76,8 @@ def log_event(db, category: str, message: str, level: str = "INFO"):
 
 
 def _reconcile_stale_db_trades(db, live_tickers: set[str], log_fn) -> None:
-    """Close any DB trades marked 'open' for tickers no longer held in IBKR.
-
-    This fixes the discrepancy between the portfolio count and trade history count
-    caused by trades that failed to sell (or were sold manually / outside the system).
-    """
-    open_trades = db.query(Trade).filter(Trade.status == "open").all()
+    """Close any DB trades marked 'open'/'sold_half' for tickers no longer held in IBKR."""
+    open_trades = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
     for trade in open_trades:
         if trade.ticker not in live_tickers:
             trade.status = "closed"
@@ -98,6 +87,26 @@ def _reconcile_stale_db_trades(db, live_tickers: set[str], log_fn) -> None:
             log_fn(db, "sell",
                    f"⚠️ Reconciled stale DB record for {trade.ticker} "
                    f"(marked closed — not found in live IBKR positions).")
+
+
+def _persist_ai_picks(db, recommendations: list[dict], scan_date) -> None:
+    """Save this week's AI picks to the ai_picks table, replacing any same-day records."""
+    # Remove old picks for today (in case of a re-scan)
+    db.query(AIPick).filter(AIPick.scan_date == scan_date).delete()
+    db.commit()
+
+    for rank, rec in enumerate(recommendations, start=1):
+        pick = AIPick(
+            scan_date=scan_date,
+            ticker=rec.get("ticker", "").upper().strip(),
+            reason=rec.get("reason", ""),
+            confidence=float(rec.get("confidence", 0.0)),
+            position_size_pct=float(rec.get("position_size_pct", 0.0)),
+            rank=rank,
+        )
+        db.add(pick)
+    db.commit()
+    logger.info(f"Persisted {len(recommendations)} AI pick(s) to database for {scan_date}.")
 
 
 # ---------------------------------------------------------------------------
@@ -126,12 +135,12 @@ def job_morning_scan_and_buy():
         trading_mode = get_setting(db, "trading_mode", "paper")
         account_type = get_setting(db, "account_type", "trading_cash")
         paper_strategy = get_setting(db, "paper_strategy", "cash")
-        
+
         try:
             budget_pct = float(get_setting(db, "daily_budget_pct", "100"))
         except ValueError:
             budget_pct = 100.0
-            
+
         try:
             max_positions_setting = int(get_setting(db, "max_positions", "5"))
         except ValueError:
@@ -144,10 +153,8 @@ def job_morning_scan_and_buy():
             log_event(db, "ibkr", "Failed to connect to IB Gateway. Aborting trades.", "ERROR")
             return
 
-        # Keep the connection alive while we iterate through buy orders
         client.start_keepalive(interval=30)
 
-        # Get available cash and net liquidation
         account = client.get_account_summary()
         available_cash = account.get("AvailableFunds", 0)
         net_liq = account.get("NetLiquidation", 0)
@@ -180,34 +187,49 @@ def job_morning_scan_and_buy():
         )
         log_event(db, "scan", f"AI recommended {len(recommendations)} stock(s): {tickers_str}")
 
-        # Step 2: Cap to at most 5 picks (or max_positions if lower)
-        pick_limit = min(max_positions, 5)
+        # Persist all AI picks to DB for the UI to display
+        today_date = datetime.now(timezone.utc).date()
+        _persist_ai_picks(db, recommendations, today_date)
+
+        # Step 2: Cap to configured max positions
+        pick_limit = min(max_positions, len(recommendations))
         picks = recommendations[:pick_limit]
-        budget_per_trade = daily_budget / len(picks)
+
+        # Distribute budget according to position_size_pct if available,
+        # otherwise split evenly
+        total_pct = sum(r.get("position_size_pct", 0) for r in picks)
+        budgets: list[float] = []
+        if total_pct > 0:
+            for r in picks:
+                weight = r.get("position_size_pct", 0) / total_pct
+                budgets.append(daily_budget * weight)
+        else:
+            budgets = [daily_budget / len(picks)] * len(picks)
 
         log_event(db, "system",
               f"Net Liq: ${net_liq:,.2f} | Available cash: ${available_cash:,.2f} | "
               f"Today's budget: ${daily_budget:,.2f} | "
-              f"Buying {len(picks)} stock(s) @ ${budget_per_trade:,.2f} each")
+              f"Buying {len(picks)} stock(s)")
 
-        # Step 4: Place buy orders
-        for rec in picks:
+        # Step 3: Place buy orders
+        for rec, budget_for_trade in zip(picks, budgets):
             ticker = rec["ticker"]
             reason = rec.get("reason", "")
             confidence = rec.get("confidence", 0)
+            pos_size = rec.get("position_size_pct", 0)
 
             log_event(db, "buy",
                       f"Placing BUY order for {ticker} "
-                      f"(confidence={confidence:.0%}): {reason}")
+                      f"(confidence={confidence:.0%}, size={pos_size:.0f}%): {reason}")
 
-            # Pre-buy momentum gate: reject if stock has dropped >3% in last 3 days
+            # Pre-buy momentum gate
             if not verify_ticker_momentum(ticker):
                 log_event(db, "buy",
                           f"⚠️ Skipped {ticker} — failed pre-buy momentum check "
-                          f"(down >3%% over recent sessions despite AI recommendation)")
+                          f"(down >3% over recent sessions despite AI recommendation)")
                 continue
 
-            result = client.place_buy_order(ticker, budget_per_trade)
+            result = client.place_buy_order(ticker, budget_for_trade)
 
             if result["success"]:
                 trade = Trade(
@@ -220,6 +242,7 @@ def job_morning_scan_and_buy():
                     ai_reason=reason,
                     mode=trading_mode,
                     fees=result.get("fees", 0.0),
+                    realised_partial_pnl=0.0,
                 )
                 db.add(trade)
                 db.commit()
@@ -243,13 +266,15 @@ def job_morning_scan_and_buy():
 def job_afternoon_sell():
     """
     Runs at 15:30 ET weekdays (30 min before NYSE close):
-    Sells ALL open positions held in the IBKR account — not just the ones
-    bought by this morning's job.  Any position found live in the broker
-    account will be sold, regardless of whether it exists in the local DB.
+    Sells ALL open positions held in the IBKR account.
 
-    After selling, any DB trades still marked 'open' for tickers that are no
-    longer in IBKR are reconciled (marked closed) to keep the trade history
-    count consistent with the portfolio count.
+    P&L calculation for closed trades:
+    - For 'open' trades: pnl = (sell_price - buy_price) * shares
+    - For 'sold_half' trades: pnl = (sell_price - buy_price) * remaining_shares
+                                    + trade.realised_partial_pnl
+
+    The realised_partial_pnl column banks the +10% partial gain so it is NEVER
+    overwritten here, regardless of how many shares remain.
     """
     db = SessionLocal()
     try:
@@ -268,15 +293,9 @@ def job_afternoon_sell():
                       "Failed to connect to IB Gateway for sell job.", "ERROR")
             return
 
-        # Keep the connection alive while we iterate through sell orders
         client.start_keepalive(interval=30)
 
-        # Fetch live positions directly from IBKR — this captures EVERYTHING
-        # in the account, including positions not bought by today's morning job.
-        # get_positions() now waits up to 8 s for the portfolio snapshot so we
-        # are guaranteed to see all holdings after a fresh connect.
         live_positions = client.get_positions()
-
         live_tickers = {p["ticker"] for p in live_positions}
 
         if not live_positions:
@@ -291,7 +310,7 @@ def job_afternoon_sell():
                   f"Found {len(live_positions)} live position(s) in IBKR: "
                   f"{', '.join(p['ticker'] for p in live_positions)}")
 
-        # Build a lookup of DB open trades by ticker for P&L tracking
+        # Build lookup of DB open trades by ticker
         open_trades = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
         db_trades_by_ticker = {t.ticker: t for t in open_trades}
 
@@ -299,44 +318,52 @@ def job_afternoon_sell():
 
         for position in live_positions:
             ticker = position["ticker"]
-            shares = position["shares"]
+            live_shares = position["shares"]  # Actual shares currently held (may be halved)
 
             log_event(db, "sell",
-                      f"Placing SELL order for {shares} shares of {ticker}...")
-            result = client.place_sell_order(ticker, shares)
+                      f"Placing SELL order for {live_shares} shares of {ticker}...")
+            result = client.place_sell_order(ticker, live_shares)
 
             if result["success"]:
                 sell_price = result["price"]
                 sold_tickers.add(ticker)
 
-                # Update the DB trade record if one exists
                 trade = db_trades_by_ticker.get(ticker)
                 if trade:
-                    pnl = (sell_price - trade.buy_price) * trade.shares
-                    pnl_pct = ((sell_price - trade.buy_price) / trade.buy_price * 100) if trade.buy_price else 0
+                    buy_price = trade.buy_price or 0.0
+                    partial_already_realised = trade.realised_partial_pnl or 0.0
+
+                    # Correct P&L: use LIVE shares (actual remaining) not trade.shares
+                    # (which still reflects the original full buy quantity).
+                    remaining_pnl = (sell_price - buy_price) * live_shares
+                    total_pnl = remaining_pnl + partial_already_realised
+
+                    # pnl_pct based on the original full position cost
+                    original_cost = buy_price * trade.shares if trade.shares else 1
+                    pnl_pct = (total_pnl / original_cost * 100) if original_cost else 0.0
 
                     trade.sell_price = sell_price
                     trade.sell_time = datetime.now(timezone.utc)
                     trade.status = "closed"
-                    trade.pnl = round(pnl, 2)
+                    trade.pnl = round(total_pnl, 2)
                     trade.pnl_pct = round(pnl_pct, 2)
-                    
+
                     sell_fees = result.get("fees", 0.0)
                     trade.fees = round((trade.fees or 0.0) + sell_fees, 4)
                     db.commit()
 
-                    emoji = "🟢" if pnl >= 0 else "🔴"
+                    emoji = "🟢" if total_pnl >= 0 else "🔴"
+                    partial_note = (f" (incl. +${partial_already_realised:.2f} partial)"
+                                    if partial_already_realised else "")
                     log_event(db, "sell",
-                              f"{emoji} Sold {trade.shares} shares of {ticker} "
-                              f"@ ${sell_price:.2f} | P&L: ${pnl:+.2f} ({pnl_pct:+.2f}%) | Fees: ${sell_fees:.2f}")
+                              f"{emoji} Sold {live_shares} shares of {ticker} "
+                              f"@ ${sell_price:.2f} | P&L: ${total_pnl:+.2f} "
+                              f"({pnl_pct:+.2f}%){partial_note} | Fees: ${sell_fees:.2f}")
                 else:
-                    # Position existed in IBKR but not in our DB (e.g. held overnight,
-                    # bought manually, or carried over from a previous session).
                     log_event(db, "sell",
-                              f"✅ Sold {shares} shares of {ticker} @ ${sell_price:.2f} "
+                              f"✅ Sold {live_shares} shares of {ticker} @ ${sell_price:.2f} "
                               f"(untracked position — no matching DB record)")
             else:
-                # Mark any matching DB trade as errored
                 trade = db_trades_by_ticker.get(ticker)
                 if trade:
                     trade.status = "error"
@@ -344,8 +371,6 @@ def job_afternoon_sell():
                 log_event(db, "sell",
                           f"❌ Sell failed for {ticker}: {result.get('error')}", "ERROR")
 
-        # Reconcile any DB open records for tickers that weren't in IBKR at all —
-        # these are "ghost" records from previous sessions that were never closed.
         _reconcile_stale_db_trades(db, live_tickers, log_event)
 
         client.disconnect()
@@ -362,8 +387,15 @@ def job_monitor_swing_trades():
     """
     Runs periodically during market hours.
     Checks all open positions:
-    - If price drops by 5% from buy_price (stop loss), sell ALL.
-    - If price rises by 10% from buy_price (take profit) AND status == "open", sell HALF and set status = "sold_half".
+    - If price drops >= 5% from buy_price (stop-loss): sell ALL, record final P&L.
+    - If price rises >= 10% from buy_price (take-profit) AND status == 'open':
+        sell HALF, bank the gain to realised_partial_pnl, set status = 'sold_half'.
+
+    P&L rules:
+    - Take-profit partial sell → writes to trade.realised_partial_pnl (NEVER to trade.pnl).
+      trade.pnl is reserved for the final close.
+    - Stop-loss full sell → final pnl = (sell_price - buy_price) * all_live_shares
+                                       + trade.realised_partial_pnl
     """
     db = SessionLocal()
     try:
@@ -375,58 +407,84 @@ def job_monitor_swing_trades():
         client = IBKRClient(trading_mode=trading_mode)
         if not client.connect():
             return
-            
+
         client.start_keepalive(interval=30)
         live_positions = client.get_positions()
         live_tickers = {p["ticker"]: p for p in live_positions}
 
         open_trades = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
-        
+
         for trade in open_trades:
             ticker = trade.ticker
             if ticker not in live_tickers:
                 continue
-                
+
             pos = live_tickers[ticker]
             current_price = pos["current_price"]
             live_shares = pos["shares"]
             buy_price = trade.buy_price
-            
+
             if not buy_price:
                 continue
-                
-            # Check Stop Loss (5% drop)
+
+            # ── Stop Loss (>= 5% drop from buy price) ──────────────────────────
             if current_price <= buy_price * 0.95:
-                log_event(db, "sell", f"📉 Stop Loss triggered for {ticker} (dropped >= 5%). Selling all {live_shares} shares.")
+                log_event(db, "sell",
+                          f"📉 Stop Loss triggered for {ticker} "
+                          f"(dropped >= 5%). Selling all {live_shares} shares.")
                 result = client.place_sell_order(ticker, live_shares)
                 if result["success"]:
                     sell_price = result["price"]
-                    pnl = (sell_price - buy_price) * live_shares
+                    partial_already_realised = trade.realised_partial_pnl or 0.0
+
+                    # Include any already-realised partial gain
+                    remaining_pnl = (sell_price - buy_price) * live_shares
+                    total_pnl = remaining_pnl + partial_already_realised
+
+                    original_cost = buy_price * trade.shares if trade.shares else 1
                     pnl_pct = ((sell_price - buy_price) / buy_price * 100)
+
                     trade.sell_price = sell_price
                     trade.sell_time = datetime.now(timezone.utc)
                     trade.status = "closed"
-                    trade.pnl = round((trade.pnl or 0) + pnl, 2)
+                    trade.pnl = round(total_pnl, 2)
                     trade.pnl_pct = round(pnl_pct, 2)
                     sell_fees = result.get("fees", 0.0)
                     trade.fees = round((trade.fees or 0.0) + sell_fees, 4)
                     db.commit()
-            
-            # Check Take Profit (10% rise)
+
+                    partial_note = (f" (incl. +${partial_already_realised:.2f} partial)"
+                                    if partial_already_realised else "")
+                    log_event(db, "sell",
+                              f"📉 Stop-loss closed {ticker}: "
+                              f"P&L ${total_pnl:+.2f}{partial_note}")
+
+            # ── Take Profit (>= 10% rise, only on first trigger) ───────────────
             elif current_price >= buy_price * 1.10 and trade.status == "open":
                 shares_to_sell = int(live_shares / 2)
                 if shares_to_sell > 0:
-                    log_event(db, "sell", f"🚀 Take Profit triggered for {ticker} (rose >= 10%). Selling half: {shares_to_sell} shares.")
+                    log_event(db, "sell",
+                              f"🚀 Take Profit triggered for {ticker} "
+                              f"(rose >= 10%). Selling half: {shares_to_sell} shares.")
                     result = client.place_sell_order(ticker, shares_to_sell)
                     if result["success"]:
                         sell_price = result["price"]
-                        pnl = (sell_price - buy_price) * shares_to_sell
-                        trade.status = "sold_half"
-                        # Accumulate PNL and fees, but the trade is still open for the remaining half
-                        trade.pnl = round((trade.pnl or 0) + pnl, 2)
+
+                        # Bank this partial gain — never written to trade.pnl
+                        partial_gain = (sell_price - buy_price) * shares_to_sell
                         sell_fees = result.get("fees", 0.0)
+
+                        trade.status = "sold_half"
+                        trade.realised_partial_pnl = round(
+                            (trade.realised_partial_pnl or 0.0) + partial_gain, 2
+                        )
                         trade.fees = round((trade.fees or 0.0) + sell_fees, 4)
                         db.commit()
+
+                        log_event(db, "sell",
+                                  f"🚀 Take-profit: sold {shares_to_sell} shares of {ticker} "
+                                  f"@ ${sell_price:.2f} | Partial gain banked: "
+                                  f"+${partial_gain:.2f} | Status: sold_half")
 
         client.disconnect()
     except Exception as e:

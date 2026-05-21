@@ -22,6 +22,8 @@ interface Position {
   market_value: number;
   pnl: number;
   pnl_pct: number;
+  realised_partial_pnl: number;
+  trade_status: 'open' | 'sold_half' | 'closed';
 }
 
 interface Account {
@@ -69,6 +71,13 @@ interface PnlHistory {
   winning_trades: number;
   losing_trades: number;
   all_time_fees?: number;
+}
+
+interface ExchangeRateData {
+  rate: number;
+  fetched_at: string | null;
+  stale: boolean;
+  age_minutes: number | null;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -133,7 +142,7 @@ function ChartTooltip({ active, payload, label }: {
         const pct = isDaily ? p.payload.daily_pct : p.payload.cumulative_pct;
         const pctStr = pct !== undefined ? ` (${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)` : '';
         const fees = isDaily ? (p.payload.daily_fees || 0) : (p.payload.cumulative_fees || 0);
-        
+
         if (isDaily) {
           const dayGross = p.value + fees;
           return (
@@ -166,6 +175,21 @@ function ChartTooltip({ active, payload, label }: {
   );
 }
 
+// ─── AUD Freshness Label ──────────────────────────────────────────────────────
+
+function AudLabel({ fxData }: { fxData: ExchangeRateData | null }) {
+  if (!fxData) return null;
+  const mins = fxData.age_minutes;
+  const label = mins !== null
+    ? mins < 1 ? 'just now' : `${mins} min ago`
+    : 'unknown';
+  return (
+    <span style={{ fontSize: 10, color: fxData.stale ? 'var(--accent-yellow)' : 'var(--text-muted)', marginLeft: 6 }}>
+      {fxData.stale ? '⚠ stale · ' : ''}Updated {label}
+    </span>
+  );
+}
+
 // ─── Chart Mode Toggle ────────────────────────────────────────────────────────
 
 type ChartMode = 'cumulative' | 'daily';
@@ -177,6 +201,7 @@ type AuthFetch = (url: string, init?: RequestInit) => Promise<Response>;
 export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
   const [data, setData] = useState<PortfolioData | null>(null);
   const [pnlHistory, setPnlHistory] = useState<PnlHistory | null>(null);
+  const [fxData, setFxData] = useState<ExchangeRateData | null>(null);
   const [loading, setLoading] = useState(true);
   const [pnlLoading, setPnlLoading] = useState(true);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
@@ -200,7 +225,7 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [authFetch]);
 
   // ── Fetch P&L history ─────────────────────────────────────────────────────
   const fetchPnlHistory = useCallback(async () => {
@@ -213,32 +238,51 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
     } finally {
       setPnlLoading(false);
     }
-  }, []);
+  }, [authFetch]);
+
+  // ── Fetch USD/AUD exchange rate ───────────────────────────────────────────
+  const fetchFxRate = useCallback(async () => {
+    try {
+      const res = await authFetch('/api/exchange-rate');
+      const json: ExchangeRateData = await res.json();
+      setFxData(json);
+    } catch {
+      /* silently fail */
+    }
+  }, [authFetch]);
 
   useEffect(() => {
     fetchPortfolio();
     fetchPnlHistory();
-    const interval = setInterval(fetchPortfolio, 30_000);
+    fetchFxRate();
+
+    const interval    = setInterval(fetchPortfolio,  30_000);
     const pnlInterval = setInterval(fetchPnlHistory, 60_000);
+    const fxInterval  = setInterval(fetchFxRate,   1_800_000); // every 30 min
     return () => {
       clearInterval(interval);
       clearInterval(pnlInterval);
+      clearInterval(fxInterval);
     };
-  }, [fetchPortfolio, fetchPnlHistory]);
+  }, [fetchPortfolio, fetchPnlHistory, fetchFxRate]);
 
-  const account = data?.account ?? {};
+  const account   = data?.account ?? {};
   const positions = data?.positions ?? [];
+
+  // Unrealised P&L = sum of live position P&L from IBKR
   const unrealisedPnl = positions.reduce((sum, p) => sum + p.pnl, 0);
+  // Partial gains on still-open positions (banked from take-profit partials)
+  const openPartialPnl = positions.reduce((sum, p) => sum + (p.realised_partial_pnl ?? 0), 0);
   const totalValue = positions.reduce((sum, p) => sum + p.market_value, 0);
 
-  const realizedPnl = pnlHistory?.all_time_realized_pnl ?? 0;
-  const allTimeFees = pnlHistory?.all_time_fees ?? 0;
-  const openPnl = realizedPnl + unrealisedPnl;   // All-time Open P&L
+  const realizedPnl  = pnlHistory?.all_time_realized_pnl ?? 0;
+  const allTimeFees  = pnlHistory?.all_time_fees ?? 0;
+  // Open P&L = unrealised gains on all held positions + already-realised partials on still-open trades
+  const openPnl = unrealisedPnl + openPartialPnl;
   const openPnlPositive = openPnl >= 0;
 
-  // ExchangeRate_USD is the IBKR rate: 1 USD = X AUD (e.g. ~1.53).
-  // When multiplied by a USD amount it gives the AUD equivalent.
-  const usdToAud = account.ExchangeRate_USD ?? 1.53;
+  // Live USD→AUD rate from Frankfurter (falls back to IBKR rate or 1.55)
+  const usdToAud = fxData?.rate ?? account.ExchangeRate_USD ?? 1.55;
   const openPnlAud = openPnl * usdToAud;
 
   const chartData = pnlHistory?.chart_data ?? [];
@@ -268,7 +312,7 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
           </div>
           <button
             className="btn btn-outline btn-icon"
-            onClick={() => { fetchPortfolio(); fetchPnlHistory(); }}
+            onClick={() => { fetchPortfolio(); fetchPnlHistory(); fetchFxRate(); }}
             title="Refresh"
             id="btn-refresh-portfolio"
           >
@@ -277,35 +321,42 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
         </div>
       </div>
 
-      {/* ── Connection status banner ────────────────────────────────────── */}
+      {/* ── Stale FX rate warning ─────────────────────────────────────── */}
+      {fxData?.stale && (
+        <div style={{
+          display: 'flex', alignItems: 'flex-start', gap: 12,
+          padding: '10px 16px', borderRadius: 10, marginBottom: 16,
+          background: 'rgba(234,179,8,0.08)', border: '1px solid rgba(234,179,8,0.2)',
+        }}>
+          <span style={{ fontSize: 14, flexShrink: 0 }}>⚠️</span>
+          <div style={{ fontSize: 12, color: 'var(--accent-yellow)' }}>
+            <strong>Stale exchange rate:</strong> The USD/AUD rate could not be refreshed.
+            AUD values shown below are based on the last successful rate.
+          </div>
+        </div>
+      )}
+
+      {/* ── Connection status banner ─────────────────────────────────── */}
       {data && !data.connected && (
         <div style={{
-          display: 'flex',
-          alignItems: 'flex-start',
-          gap: 12,
-          padding: '12px 16px',
-          borderRadius: 10,
-          marginBottom: 20,
+          display: 'flex', alignItems: 'flex-start', gap: 12,
+          padding: '12px 16px', borderRadius: 10, marginBottom: 20,
           background: data.error === 'Failed to reach API server'
-            ? 'rgba(239,68,68,0.08)'
-            : 'rgba(234,179,8,0.07)',
+            ? 'rgba(239,68,68,0.08)' : 'rgba(234,179,8,0.07)',
           border: `1px solid ${data.error === 'Failed to reach API server'
-            ? 'rgba(239,68,68,0.2)'
-            : 'rgba(234,179,8,0.2)'}`,
+            ? 'rgba(239,68,68,0.2)' : 'rgba(234,179,8,0.2)'}`,
         }}>
           <span style={{ fontSize: 16, flexShrink: 0 }}>
             {data.error === 'Failed to reach API server' ? '🔴' : '🟡'}
           </span>
           <div>
             <div style={{ fontSize: 13, fontWeight: 600, color: data.error === 'Failed to reach API server' ? 'var(--accent-red)' : 'var(--accent-yellow)', marginBottom: 2 }}>
-              {data.error === 'Failed to reach API server'
-                ? 'Backend API unreachable'
-                : 'IB Gateway not connected'}
+              {data.error === 'Failed to reach API server' ? 'Backend API unreachable' : 'IB Gateway not connected'}
             </div>
             <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5 }}>
               {data.error === 'Failed to reach API server'
                 ? 'The backend server is not responding. Check Railway deployment logs.'
-                : 'The IB Gateway service is starting up or awaiting IBKR login. Check Railway → ib-gateway service logs. You may need to approve 2FA on your IBKR Mobile app.'}
+                : 'The IB Gateway service is starting up or awaiting IBKR login.'}
             </div>
           </div>
         </div>
@@ -314,12 +365,8 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
       {/* Strategy upgrade alert */}
       {data?.strategy_alert && (
         <div style={{
-          display: 'flex',
-          alignItems: 'flex-start',
-          gap: 12,
-          padding: '14px 16px',
-          borderRadius: 12,
-          marginBottom: 20,
+          display: 'flex', alignItems: 'flex-start', gap: 12,
+          padding: '14px 16px', borderRadius: 12, marginBottom: 20,
           background: 'linear-gradient(135deg, rgba(59,130,246,0.14) 0%, rgba(59,130,246,0.06) 100%)',
           border: '1px solid rgba(59,130,246,0.24)',
         }}>
@@ -335,7 +382,7 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
         </div>
       )}
 
-      {/* ── OPEN P&L HERO ───────────────────────────────────────────────── */}
+      {/* ── OPEN P&L HERO ───────────────────────────────────────────── */}
       <div style={{
         background: openPnlPositive
           ? 'linear-gradient(135deg, rgba(34,197,94,0.08) 0%, rgba(34,197,94,0.03) 100%)'
@@ -352,14 +399,11 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
       }}>
         <div>
           <div style={{
-            fontSize: 11,
-            fontWeight: 600,
-            letterSpacing: '0.8px',
+            fontSize: 11, fontWeight: 600, letterSpacing: '0.8px',
             textTransform: 'uppercase' as const,
-            color: 'var(--text-muted)',
-            marginBottom: 8,
+            color: 'var(--text-muted)', marginBottom: 8,
           }}>
-            Open P&amp;L — All Time
+            Open P&amp;L (Unrealised + Partials)
           </div>
           {loading && pnlLoading ? (
             <div style={{ display: 'flex', gap: 24, alignItems: 'baseline' }}>
@@ -368,9 +412,7 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
           ) : (
             <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap' as const, alignItems: 'baseline' }}>
               <div style={{
-                fontSize: 46,
-                fontWeight: 800,
-                letterSpacing: '-1.5px',
+                fontSize: 46, fontWeight: 800, letterSpacing: '-1.5px',
                 color: openPnlPositive ? 'var(--accent-green)' : 'var(--accent-red)',
                 fontFamily: "'JetBrains Mono', monospace",
                 textShadow: openPnlPositive
@@ -381,29 +423,36 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
                 <span style={{ fontSize: 16, marginLeft: 8, color: 'var(--text-muted)', fontWeight: 600, textShadow: 'none', letterSpacing: '0' }}>USD</span>
               </div>
               <div style={{
-                fontSize: 32,
-                fontWeight: 700,
-                letterSpacing: '-1px',
+                fontSize: 32, fontWeight: 700, letterSpacing: '-1px',
                 color: openPnlPositive ? 'var(--accent-green)' : 'var(--accent-red)',
                 fontFamily: "'JetBrains Mono', monospace",
                 opacity: 0.8,
               }}>
                 {fmtSigned(openPnlAud)}
                 <span style={{ fontSize: 14, marginLeft: 6, color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0' }}>AUD</span>
+                <AudLabel fxData={fxData} />
               </div>
             </div>
           )}
           <div style={{ display: 'flex', gap: 20, marginTop: 10, flexWrap: 'wrap' as const }}>
             <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-              <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>Realized: </span>
-              <span style={{ color: realizedPnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
-                {fmtSigned(realizedPnl)}
-              </span>
-            </div>
-            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
               <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>Unrealised: </span>
               <span style={{ color: unrealisedPnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
                 {fmtSigned(unrealisedPnl)}
+              </span>
+            </div>
+            {openPartialPnl !== 0 && (
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>Partial Gains (open): </span>
+                <span style={{ color: openPartialPnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
+                  {fmtSigned(openPartialPnl)}
+                </span>
+              </div>
+            )}
+            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+              <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>All-Time Realised: </span>
+              <span style={{ color: realizedPnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
+                {fmtSigned(realizedPnl)}
               </span>
             </div>
             <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
@@ -438,7 +487,7 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
         </div>
       </div>
 
-      {/* ── P&L Chart ───────────────────────────────────────────────────── */}
+      {/* ── P&L Chart ───────────────────────────────────────────── */}
       <div className="table-container" style={{ marginBottom: 28 }}>
         <div className="table-header-bar">
           <h3>P&amp;L Over Time</h3>
@@ -476,29 +525,21 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
               <AreaChart data={chartData} margin={{ top: 4, right: 24, left: 0, bottom: 0 }}>
                 <defs>
                   <linearGradient id="pnlGradient" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor={chartColor} stopOpacity={0.22} />
+                    <stop offset="5%"  stopColor={chartColor} stopOpacity={0.22} />
                     <stop offset="95%" stopColor={chartColor} stopOpacity={0} />
                   </linearGradient>
                 </defs>
-                <CartesianGrid
-                  strokeDasharray="3 3"
-                  stroke="rgba(255,255,255,0.04)"
-                  vertical={false}
-                />
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" vertical={false} />
                 <XAxis
                   dataKey="date"
                   tickFormatter={fmtDate}
                   tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
-                  axisLine={false}
-                  tickLine={false}
-                  interval="preserveStartEnd"
+                  axisLine={false} tickLine={false} interval="preserveStartEnd"
                 />
                 <YAxis
                   tickFormatter={(v) => `$${v >= 0 ? '' : '-'}${Math.abs(v).toLocaleString()}`}
                   tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
-                  axisLine={false}
-                  tickLine={false}
-                  width={72}
+                  axisLine={false} tickLine={false} width={72}
                 />
                 <Tooltip content={<ChartTooltip />} />
                 <ReferenceLine y={0} stroke="rgba(255,255,255,0.12)" strokeDasharray="4 4" />
@@ -517,7 +558,7 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
         </div>
       </div>
 
-      {/* ── Stat cards ──────────────────────────────────────────────────── */}
+      {/* ── Stat cards ──────────────────────────────────────────── */}
       <div className="stat-grid">
         <div className="card">
           <div className="card-label">Net Liquidation</div>
@@ -525,7 +566,7 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
             {loading ? '—' : fmt(account.NetLiquidation ?? 0)}
           </div>
           <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
-             {loading ? '' : fmt(account.NetLiquidation_AUD ?? 0, 'A$')}
+            {loading ? '' : <>{fmt(account.NetLiquidation_AUD ?? (account.NetLiquidation ?? 0) * usdToAud, 'A$')}<AudLabel fxData={fxData} /></>}
           </div>
         </div>
         <div className="card">
@@ -534,12 +575,15 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
             {loading ? '—' : fmt(account.AvailableFunds ?? 0)}
           </div>
           <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
-             {loading ? '' : fmt(account.AvailableFunds_AUD ?? 0, 'A$')}
+            {loading ? '' : <>{fmt(account.AvailableFunds_AUD ?? (account.AvailableFunds ?? 0) * usdToAud, 'A$')}<AudLabel fxData={fxData} /></>}
           </div>
         </div>
         <div className="card">
           <div className="card-label">Open Positions Value</div>
           <div className="card-value">{loading ? '—' : fmt(totalValue)}</div>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+            {loading ? '' : <>{fmt(totalValue * usdToAud, 'A$')}<AudLabel fxData={fxData} /></>}
+          </div>
         </div>
         <div className="card">
           <div className="card-label">Unrealised P&amp;L</div>
@@ -550,16 +594,17 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
               </span>
             )}
           </div>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+            {loading ? '' : <>{fmtSigned(unrealisedPnl * usdToAud)} AUD<AudLabel fxData={fxData} /></>}
+          </div>
         </div>
       </div>
 
-      {/* ── Positions table ─────────────────────────────────────────────── */}
+      {/* ── Positions table ─────────────────────────────────────── */}
       <div className="table-container">
         <div className="table-header-bar">
           <h3>Open Positions ({positions.length})</h3>
-          <span
-            className={`badge ${data?.mode === 'live' ? 'live' : 'paper'}`}
-          >
+          <span className={`badge ${data?.mode === 'live' ? 'live' : 'paper'}`}>
             {data?.mode === 'live' ? '🔴 LIVE' : '🟡 PAPER'}
           </span>
         </div>
@@ -578,22 +623,41 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
             <thead>
               <tr>
                 <th>Ticker</th>
+                <th>Status</th>
                 <th>Shares</th>
                 <th>Avg Cost</th>
                 <th>Current Price</th>
-                <th>Market Value</th>
-                <th>P&amp;L</th>
+                <th>Market Value (AUD)</th>
+                <th>Unrealised P&amp;L</th>
+                <th>Partial Gain</th>
               </tr>
             </thead>
             <tbody>
               {positions.map((pos) => (
                 <tr key={pos.ticker}>
                   <td className="ticker">{pos.ticker}</td>
+                  <td>
+                    <span className={`badge ${pos.trade_status === 'sold_half' ? 'sold-half' : 'open'}`}>
+                      {pos.trade_status === 'sold_half' ? '½ Sold' : '● Open'}
+                    </span>
+                  </td>
                   <td className="mono">{pos.shares.toLocaleString()}</td>
                   <td className="mono">{fmt(pos.avg_cost)}</td>
                   <td className="mono">{fmt(pos.current_price)}</td>
-                  <td className="mono">{fmt(pos.market_value)}</td>
+                  <td className="mono">
+                    {fmt(pos.market_value * usdToAud, 'A$')}
+                    <AudLabel fxData={fxData} />
+                  </td>
                   <PnlCell val={pos.pnl} pct={pos.pnl_pct} />
+                  <td className="mono">
+                    {pos.realised_partial_pnl !== 0 ? (
+                      <span className={pos.realised_partial_pnl >= 0 ? 'positive' : 'negative'}>
+                        {fmtSigned(pos.realised_partial_pnl)}
+                      </span>
+                    ) : (
+                      <span style={{ color: 'var(--text-muted)' }}>—</span>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>

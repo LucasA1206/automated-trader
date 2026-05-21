@@ -17,31 +17,42 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 def init_db():
     """Create all tables and seed default settings."""
     Base.metadata.create_all(bind=engine)
-    
-    # Safely migrate existing trades table to add 'mode' column
+
+    # ── Schema migrations (idempotent — each wrapped in try/except) ────────────
+
+    # Add 'mode' column to trades (legacy migration)
     try:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE trades ADD COLUMN mode VARCHAR(20) DEFAULT 'paper' NOT NULL"))
     except Exception:
-        pass  # Column likely already exists
+        pass  # Column already exists
 
-    # Safely migrate existing trades table to add 'fees' column
+    # Add 'fees' column to trades (legacy migration)
     try:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE trades ADD COLUMN fees FLOAT DEFAULT 0.0"))
     except Exception:
-        pass  # Column likely already exists
+        pass  # Column already exists
 
+    # Add 'realised_partial_pnl' column — banks partial gains from +10% half-sells
+    # so they are never lost when the remaining half is closed.
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE trades ADD COLUMN realised_partial_pnl FLOAT DEFAULT 0.0"))
+    except Exception:
+        pass  # Column already exists
+
+    # ── Default settings seed ──────────────────────────────────────────────────
     db = SessionLocal()
     try:
         defaults = {
-            "trading_mode": "paper",      # paper | live
-            "account_type": "trading_cash",   # trading_cash | investment_cash
-            "paper_strategy": "cash",         # cash | margin comparison preset
-            "daily_budget_pct": "50",         # derived from paper_strategy
-            "max_positions": "3",             # derived from paper_strategy
-            "scan_enabled": "true",       # pause/resume auto scanning
-            "trader_enabled": "true",     # Master switch
+            "trading_mode": "paper",           # paper | live
+            "account_type": "trading_cash",    # trading_cash | investment_cash
+            "paper_strategy": "cash",          # cash | margin comparison preset
+            "daily_budget_pct": "50",          # % of available cash per daily cycle
+            "max_positions": "3",              # max picks per scan
+            "scan_enabled": "true",            # pause/resume auto scanning
+            "trader_enabled": "true",          # Master switch
             "margin_upgrade_alerted": "false",
         }
         for key, value in defaults.items():

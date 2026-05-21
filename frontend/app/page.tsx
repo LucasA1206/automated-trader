@@ -8,8 +8,9 @@ import PortfolioTab from '@/components/PortfolioTab';
 import TradeHistoryTab from '@/components/TradeHistoryTab';
 import SystemLogsTab from '@/components/SystemLogsTab';
 import SettingsTab from '@/components/SettingsTab';
+import AIPicksTab from '@/components/AIPicksTab';
 
-export type Tab = 'portfolio' | 'trades' | 'logs' | 'settings';
+export type Tab = 'portfolio' | 'trades' | 'ai-picks' | 'logs' | 'settings';
 
 export default function Home() {
   const { token, username, logout, authFetch } = useAuth();
@@ -54,7 +55,7 @@ export default function Home() {
           <h1>Blitz Trader</h1>
         </div>
       </div>
-      
+
       {isMobileMenuOpen && (
         <div className="mobile-overlay" onClick={() => setIsMobileMenuOpen(false)}></div>
       )}
@@ -63,7 +64,7 @@ export default function Home() {
         activeTab={activeTab}
         setActiveTab={(tab) => {
           setActiveTab(tab);
-          setIsMobileMenuOpen(false); // Close menu on tab selection
+          setIsMobileMenuOpen(false);
         }}
         tradingMode={tradingMode}
         username={username ?? undefined}
@@ -71,10 +72,11 @@ export default function Home() {
         isOpen={isMobileMenuOpen}
       />
       <main className="main-content">
-        {activeTab === 'portfolio' && <PortfolioTab authFetch={authFetch} />}
-        {activeTab === 'trades' && <TradeHistoryTab authFetch={authFetch} />}
-        {activeTab === 'logs' && <SystemLogsTab authFetch={authFetch} />}
-        {activeTab === 'settings' && (
+        {activeTab === 'portfolio'  && <PortfolioTab authFetch={authFetch} />}
+        {activeTab === 'trades'     && <TradeHistoryTab authFetch={authFetch} />}
+        {activeTab === 'ai-picks'   && <AIPicksTab authFetch={authFetch} />}
+        {activeTab === 'logs'       && <SystemLogsTab authFetch={authFetch} />}
+        {activeTab === 'settings'   && (
           <SettingsTab
             onModeChange={(mode) => setTradingMode(mode)}
             authFetch={authFetch}

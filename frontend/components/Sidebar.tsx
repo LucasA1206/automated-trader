@@ -14,6 +14,7 @@ interface Props {
 const navItems: { id: Tab; icon: string; label: string }[] = [
   { id: 'portfolio', icon: '📊', label: 'Portfolio' },
   { id: 'trades', icon: '📋', label: 'Trade History' },
+  { id: 'ai-picks', icon: '🤖', label: 'AI Picks' },
   { id: 'logs', icon: '🖥️', label: 'System Logs' },
   { id: 'settings', icon: '⚙️', label: 'Settings' },
 ];
