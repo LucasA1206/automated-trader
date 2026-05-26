@@ -91,20 +91,108 @@ _nasdaq_ticker_cache: list[str] = []
 _nasdaq_ticker_fetched_at: datetime | None = None
 _NASDAQ_CACHE_TTL_HOURS = 24  # Refresh at most once per day
 
+# Symbols with these single-char suffixes are warrants, rights, preferred shares etc.
+_SPECIAL_SUFFIX_CHARS = set("WRUPQZ")
+
+
+def _parse_nasdaqtrader_file(text: str, source_label: str) -> list[str]:
+    """
+    Parse a nasdaqtrader.com pipe-delimited symbol directory file.
+
+    Both nasdaqlisted.txt and otherlisted.txt share the same format:
+      Column 0: Symbol
+      Column 6 (nasdaqlisted) / Column 6 (otherlisted): ETF flag (Y/N)
+
+    The last line of each file is a file-creation timestamp row starting with
+    'File Creation Time' — we skip it.
+
+    Returns a cleaned list of common-stock ticker symbols.
+    """
+    lines = text.strip().splitlines()
+    if not lines:
+        return []
+
+    header = lines[0]  # noqa — kept for reference but not used
+    tickers: list[str] = []
+    raw_count = skipped_etf = skipped_special = skipped_test = 0
+
+    for line in lines[1:]:
+        # Skip the file-creation timestamp footer row
+        if line.startswith("File Creation Time"):
+            continue
+
+        parts = line.split("|")
+        if len(parts) < 2:
+            continue
+
+        symbol = parts[0].strip().upper()
+        if not symbol:
+            continue
+
+        raw_count += 1
+
+        # ── ETF flag check (column 6 when present) ───────────────────────────
+        etf_flag = parts[6].strip().upper() if len(parts) > 6 else ""
+        if etf_flag == "Y":
+            skipped_etf += 1
+            continue
+
+        # ── Filter out non-standard symbols ──────────────────────────────────
+        # Warrants, preferred, rights, when-issued etc. typically contain
+        # special chars or have a suffix letter after a space
+        if any(c in symbol for c in (".", "+", "-", "^", "=", "/")):
+            skipped_special += 1
+            continue
+        if symbol.startswith("$"):
+            skipped_special += 1
+            continue
+        # Reject symbols with embedded spaces (e.g. "AAPL WS" = warrant)
+        if " " in symbol:
+            skipped_special += 1
+            continue
+        # Common warrant/preferred suffix patterns: AAPLW, AAPLR, AAPLP, etc.
+        # Only apply if symbol > 4 chars and ends in one of the special chars
+        if len(symbol) > 4 and symbol[-1] in _SPECIAL_SUFFIX_CHARS:
+            # Allow if last char forms part of a known ticker (e.g. GOOGL, PANW)
+            # Check: if base (without last char) is unlikely to be a ticker, skip
+            # Simple heuristic: reject if last char is appended to a 4+ char base
+            base = symbol[:-1]
+            if len(base) >= 4:
+                skipped_special += 1
+                continue
+
+        # Test securities
+        if symbol.lower().endswith("test"):
+            skipped_test += 1
+            continue
+
+        tickers.append(symbol)
+
+    logger.info(
+        f"[{source_label}] Parsed {raw_count} rows → kept {len(tickers)} "
+        f"(skipped: {skipped_etf} ETFs, {skipped_special} special, {skipped_test} test)"
+    )
+    return tickers
+
 
 def fetch_full_nasdaq_tickers() -> list[str]:
     """
     Fetch the complete list of NASDAQ-listed tickers from NASDAQ's public FTP directory.
 
-    Source: ftp.nasdaqtrader.com/symboldirectory/nasdaqlisted.txt
-    This is a free, unauthenticated text file updated each trading day.
-    Falls back to the curated _FALLBACK_UNIVERSE list if the fetch fails.
+    Sources (both fetched and merged):
+      1. nasdaqlisted.txt  — NASDAQ Global Select / Global / Capital Market stocks
+      2. otherlisted.txt   — NYSE, NYSE MKT, ARCA, BATS stocks also quoted on NASDAQ
 
-    Filters applied:
-    - Exclude test securities (symbol ends with 'test' or starts with '$')
-    - Exclude ETFs (market_category not in ['Q', 'G', 'S', 'M'])
-    - Exclude special warrant/preferred symbols (contain '.', '+', '-')
-    Returns at most 5,000 tickers; in practice NASDAQ has ~3,300 common stocks.
+    Both files are free, unauthenticated, and updated every trading day.
+    Falls back to the curated _FALLBACK_UNIVERSE if all fetches fail.
+
+    Filters applied (via _parse_nasdaqtrader_file):
+      - ETF flag = Y → skip
+      - Special chars (. + - ^ = /) → skip (warrants, rights, preferred)
+      - Symbols starting with $ → skip
+      - Symbols with spaces → skip (e.g. when-issued)
+      - 5+-char symbols ending in W/R/U/P/Q/Z → likely warrant/right, skip
+      - Symbols ending in 'test' → test securities, skip
     """
     global _nasdaq_ticker_cache, _nasdaq_ticker_fetched_at
 
@@ -118,43 +206,88 @@ def fetch_full_nasdaq_tickers() -> list[str]:
         logger.info(f"Using cached NASDAQ ticker list ({len(_nasdaq_ticker_cache)} tickers).")
         return _nasdaq_ticker_cache
 
+    # ── Source 1: NASDAQ-listed securities ───────────────────────────────────
+    nasdaq_tickers: list[str] = []
     try:
-        url = "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        lines = resp.text.strip().splitlines()
-
-        tickers: list[str] = []
-        for line in lines[1:]:  # Skip header row
-            parts = line.split("|")
-            if len(parts) < 3:
-                continue
-            symbol = parts[0].strip()
-            etf_flag = parts[6].strip() if len(parts) > 6 else ""
-
-            # Skip ETFs, test symbols, special characters
-            if not symbol:
-                continue
-            if "." in symbol or "+" in symbol or "$" in symbol:
-                continue
-            if symbol.lower().endswith("test"):
-                continue
-            if etf_flag.upper() == "Y":  # ETF flag
-                continue
-            tickers.append(symbol)
-
-        if len(tickers) < 100:
-            raise ValueError(f"Suspiciously few tickers returned: {len(tickers)}")
-
-        _nasdaq_ticker_cache = tickers
-        _nasdaq_ticker_fetched_at = datetime.now(timezone.utc)
-        logger.info(f"Fetched {len(tickers)} NASDAQ tickers from nasdaqtrader.com.")
-        return tickers
-
+        url1 = "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+        logger.info(f"Fetching NASDAQ universe from {url1} ...")
+        resp1 = requests.get(url1, timeout=20)
+        resp1.raise_for_status()
+        nasdaq_tickers = _parse_nasdaqtrader_file(resp1.text, "nasdaqlisted")
+        logger.info(f"nasdaqlisted.txt: {len(nasdaq_tickers)} common-stock symbols loaded.")
     except Exception as e:
-        logger.warning(f"Failed to fetch NASDAQ ticker list ({e}). Using fallback universe "
-                       f"({len(_FALLBACK_UNIVERSE)} tickers).")
+        logger.warning(f"nasdaqlisted.txt fetch failed ({e}). Trying DataHub fallback...")
+        # ── Source 1b: DataHub CDN mirror of nasdaqlisted (updated daily) ────
+        try:
+            url1b = "https://datahub.io/core/nasdaq-listings/r/nasdaq-listed-symbols.csv"
+            resp1b = requests.get(url1b, timeout=20)
+            resp1b.raise_for_status()
+            # Parse CSV (Symbol,Company Name,...,ETF,...)
+            lines = resp1b.text.strip().splitlines()
+            _header = lines[0].lower().split(",")
+            sym_idx = 0   # column 0 is always Symbol
+            etf_idx = _header.index("etf") if "etf" in _header else 7
+            for line in lines[1:]:
+                if line.startswith("File Creation Time"):
+                    continue
+                # Handle quoted CSV fields
+                import csv as _csv
+                row = next(_csv.reader([line]))
+                if len(row) < 2:
+                    continue
+                symbol = row[sym_idx].strip().upper()
+                if not symbol:
+                    continue
+                etf_flag = row[etf_idx].strip().upper() if len(row) > etf_idx else ""
+                if etf_flag == "Y":
+                    continue
+                if any(c in symbol for c in (".", "+", "-", "^", "=", "/")):
+                    continue
+                if symbol.startswith("$") or " " in symbol:
+                    continue
+                if len(symbol) > 4 and symbol[-1] in _SPECIAL_SUFFIX_CHARS and len(symbol[:-1]) >= 4:
+                    continue
+                if symbol.lower().endswith("test"):
+                    continue
+                nasdaq_tickers.append(symbol)
+            logger.info(f"DataHub fallback: {len(nasdaq_tickers)} NASDAQ tickers loaded.")
+        except Exception as e2:
+            logger.warning(f"DataHub fallback also failed: {e2}")
+
+    # ── Source 2: Other-listed securities (NYSE, ARCA, BATS, etc.) ────────────
+    other_tickers: list[str] = []
+    try:
+        url2 = "https://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+        logger.info(f"Fetching other-listed securities from {url2} ...")
+        resp2 = requests.get(url2, timeout=20)
+        resp2.raise_for_status()
+        other_tickers = _parse_nasdaqtrader_file(resp2.text, "otherlisted")
+        logger.info(f"otherlisted.txt: {len(other_tickers)} common-stock symbols loaded.")
+    except Exception as e:
+        logger.warning(f"otherlisted.txt fetch failed: {e}")
+
+    # ── Merge, deduplicate, validate ─────────────────────────────────────────
+    seen: set[str] = set()
+    merged: list[str] = []
+    for t in nasdaq_tickers + other_tickers:
+        if t not in seen:
+            seen.add(t)
+            merged.append(t)
+
+    if len(merged) < 100:
+        logger.warning(
+            f"Only {len(merged)} tickers after merge — suspiciously low. "
+            f"Falling back to curated universe ({len(_FALLBACK_UNIVERSE)} tickers)."
+        )
         return _FALLBACK_UNIVERSE
+
+    _nasdaq_ticker_cache = merged
+    _nasdaq_ticker_fetched_at = datetime.now(timezone.utc)
+    logger.info(
+        f"\u2705 Full ticker universe ready: {len(merged)} unique symbols "
+        f"({len(nasdaq_tickers)} NASDAQ + {len(other_tickers)} other, deduplicated)."
+    )
+    return merged
 
 
 # ─── News fetching ────────────────────────────────────────────────────────────
@@ -804,18 +937,28 @@ Each recommendation MUST reference specific data points from the data above.
         return []
 
 
-def run_daily_scan() -> list[dict]:
+def run_daily_scan() -> tuple[list[dict], list[dict]]:
     """
-    Main entry point: scans the full NASDAQ market and returns AI-ranked stock picks.
+    Main entry point: scans the full NASDAQ market and returns AI-ranked stock picks
+    PLUS the pre-filtered screener candidates for use as a guaranteed fallback.
+
+    Returns a 2-tuple:
+      (ai_recommendations, screened_candidates)
+
+      ai_recommendations  — Gemini-ranked picks, may be empty if AI fails / returns nothing.
+      screened_candidates — Pre-filtered technical candidates ranked by composite score.
+                            Always populated (used as guaranteed buy fallback).
 
     Pipeline:
-    1. Fetch the complete NASDAQ ticker universe (dynamic, ~3,300 tickers)
-    2. Check market regime (QQQ health)
-    3. Dynamic-screen full universe → best 75 by composite momentum/volume score
-    4. Fetch news for those 75 (highest-scored first)
-    5. Fetch detailed technicals for the 75
-    6. Pre-filter obvious losers (low volume, earnings this week, already ran 20%+)
-    7. Send everything to Gemini for final AI ranking
+    1. Fetch the complete NASDAQ ticker universe (dynamic, ~3,300+ tickers)
+    2. Fetch broad market headlines
+    3. Check market regime (QQQ health)
+    4. Dynamic-screen full universe → best 75 by composite momentum/volume score
+    5. Fetch news for those 75 (highest-scored first)
+    6. Fetch detailed technicals for the 75
+    7. Pre-filter obvious losers (low volume, earnings this week, already ran 20%+)
+    8. Send everything to Gemini for final AI ranking
+    9. Return AI picks + pre-filtered screener list as fallback
     """
     logger.info("═══ Starting daily market scan ═══")
 
@@ -888,6 +1031,30 @@ def run_daily_scan() -> list[dict]:
     # Step 7: Pre-filter — remove obvious disqualifications before AI analysis
     filtered_technicals = pre_filter_candidates(technicals)
 
+    # Build the screener fallback list — pre-filtered candidates ranked by score.
+    # The scored_hot_list preserves composite-score order; we match against
+    # filtered_technicals to honour the same exclusion rules.
+    filtered_tickers_set = {t["ticker"] for t in filtered_technicals}
+    screened_candidates: list[dict] = []
+    for ticker, score in scored_hot_list:
+        if ticker in filtered_tickers_set:
+            # Find the matching technical dict for this ticker
+            tech = next((t for t in filtered_technicals if t["ticker"] == ticker), {})
+            screened_candidates.append({
+                "ticker": ticker,
+                "score": round(score, 2),
+                "reason": (
+                    f"Top screener pick (score={score:.1f}). "
+                    f"Price=${tech.get('price', '?')}, "
+                    f"RSI={tech.get('rsi_14', '?')}, "
+                    f"5d mom={tech.get('mom_5d', '?')}%, "
+                    f"vol vs 20d avg={tech.get('vol_vs_avg_20', '?')}x. "
+                    f"No AI catalyst data — selected by technical screener as best available."
+                ),
+                "confidence": 0.0,         # Indicates screener pick, not AI pick
+                "position_size_pct": 0.0,  # Will be set to equal split in jobs.py
+            })
+
     logger.info(
         f"Sending {len(all_news)} articles + {len(filtered_technicals)} filtered technical "
         f"profiles (from {len(technicals)} total) to Gemini ({regime} regime)..."
@@ -897,6 +1064,7 @@ def run_daily_scan() -> list[dict]:
     recommendations = analyse_with_gemini(all_news, filtered_technicals, market_regime)
 
     picks = [f"{r['ticker']}({r['confidence']:.0%})" for r in recommendations]
-    logger.info(f"═══ Scan complete. {len(recommendations)} stock(s) recommended: {picks} ═══")
+    logger.info(f"═══ Scan complete. AI: {len(recommendations)} pick(s): {picks} | "
+                f"Screener fallback: {len(screened_candidates)} candidates ═══")
 
-    return recommendations
+    return recommendations, screened_candidates

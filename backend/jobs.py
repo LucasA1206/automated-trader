@@ -6,6 +6,10 @@ from models import Trade, SystemLog, AIPick
 from ai_analyst import run_daily_scan, verify_ticker_momentum
 from trader import IBKRClient
 
+# Minimum number of stocks to buy each week.
+# If AI returns fewer picks, we fill the gap with the top screener candidates.
+MIN_WEEKLY_BUYS = 3
+
 logger = logging.getLogger(__name__)
 
 
@@ -172,28 +176,59 @@ def job_morning_scan_and_buy():
                               f"Account: {account_type}, Strategy: {strategy_label}, "
                               f"Budget: ${daily_budget:,.2f}")
 
-        # Step 1: AI Scan
-        recommendations = run_daily_scan()
-        if not recommendations:
-            log_event(db, "scan", "No stocks recommended by AI today. No trades placed.")
-            client.disconnect()
-            return
+        # Step 1: AI Scan — returns (ai_picks, screener_fallback_candidates)
+        recommendations, screened_candidates = run_daily_scan()
 
-        # Sort by highest confidence — AI already filters for quality
+        # Sort AI picks by confidence (highest first)
         recommendations.sort(key=lambda r: r.get("confidence", 0), reverse=True)
 
-        tickers_str = ", ".join(
-            f"{r['ticker']}({r.get('confidence', 0):.0%})" for r in recommendations
-        )
-        log_event(db, "scan", f"AI recommended {len(recommendations)} stock(s): {tickers_str}")
+        if recommendations:
+            tickers_str = ", ".join(
+                f"{r['ticker']}({r.get('confidence', 0):.0%})" for r in recommendations
+            )
+            log_event(db, "scan", f"AI recommended {len(recommendations)} stock(s): {tickers_str}")
+        else:
+            log_event(db, "scan",
+                      "⚠️ AI returned no recommendations. Will use top screener candidates "
+                      f"to guarantee {MIN_WEEKLY_BUYS} buy(s).")
 
         # Persist all AI picks to DB for the UI to display
         today_date = datetime.now(timezone.utc).date()
-        _persist_ai_picks(db, recommendations, today_date)
+        if recommendations:
+            _persist_ai_picks(db, recommendations, today_date)
 
-        # Step 2: Cap to configured max positions
+        # ── Guarantee minimum buys ────────────────────────────────────────────
+        # Start with the configured cap of AI picks.
         pick_limit = min(max_positions, len(recommendations))
-        picks = recommendations[:pick_limit]
+        picks = list(recommendations[:pick_limit])
+
+        # If we still have fewer than MIN_WEEKLY_BUYS, top up with the best screener
+        # candidates that aren't already in the AI picks list.
+        ai_ticker_set = {r["ticker"] for r in picks}
+        fallback_used: list[dict] = []
+        if len(picks) < MIN_WEEKLY_BUYS and screened_candidates:
+            needed = MIN_WEEKLY_BUYS - len(picks)
+            for candidate in screened_candidates:
+                if len(fallback_used) >= needed:
+                    break
+                if candidate["ticker"] not in ai_ticker_set:
+                    fallback_used.append(candidate)
+                    ai_ticker_set.add(candidate["ticker"])
+
+            if fallback_used:
+                fallback_str = ", ".join(c["ticker"] for c in fallback_used)
+                log_event(db, "scan",
+                          f"📊 Screener fallback: adding {len(fallback_used)} top-scored "
+                          f"candidate(s) to reach minimum {MIN_WEEKLY_BUYS} buys: {fallback_str}")
+                picks.extend(fallback_used)
+
+        # If we still have nothing (very rare — screener also empty), bail
+        if not picks:
+            log_event(db, "scan",
+                      "❌ No picks from AI or screener. Market data may be unavailable. "
+                      "No trades placed today.")
+            client.disconnect()
+            return
 
         # Distribute budget according to position_size_pct if available,
         # otherwise split evenly
