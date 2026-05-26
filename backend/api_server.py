@@ -477,10 +477,30 @@ def update_settings(body: SettingsBulkUpdate, db: Session = Depends(get_db)):
 # ─── Manual Triggers ───────────────────────────────────────────────────────
 @app.post("/api/scan", dependencies=[Depends(require_auth)])
 def trigger_scan(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    """Manually triggers the morning scan & buy job in the background."""
-    from jobs import job_morning_scan_and_buy
-    background_tasks.add_task(job_morning_scan_and_buy)
-    return {"status": "triggered", "message": "Market scan started in background"}
+    """Manually triggers the morning scan & buy job in the background.
+
+    The AI scan runs immediately regardless of the time of day.
+    If the market is currently open, buy orders are placed right away.
+    If the market is closed, buy orders are queued and will be placed
+    automatically when NYSE opens next (09:30 ET, next weekday).
+    """
+    from jobs import job_manual_scan_with_deferred_buy, is_market_open
+    market_open = is_market_open()
+    background_tasks.add_task(job_manual_scan_with_deferred_buy)
+    if market_open:
+        return {
+            "status": "triggered",
+            "message": "Market scan started — buy orders will be placed immediately (market is open).",
+            "deferred": False,
+        }
+    return {
+        "status": "triggered",
+        "message": (
+            "Market scan started — the AI scan will run now, but buy orders are deferred "
+            "until market open (09:30 ET next weekday)."
+        ),
+        "deferred": True,
+    }
 
 
 @app.post("/api/sell-all", dependencies=[Depends(require_auth)])

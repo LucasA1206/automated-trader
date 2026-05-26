@@ -1,16 +1,57 @@
 import logging
 import threading
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timezone, timedelta
 from database import SessionLocal, get_setting
 from models import Trade, SystemLog, AIPick
 from ai_analyst import run_daily_scan, verify_ticker_momentum
 from trader import IBKRClient
+
+import pytz
 
 # Minimum number of stocks to buy each week.
 # If AI returns fewer picks, we fill the gap with the top screener candidates.
 MIN_WEEKLY_BUYS = 3
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Market-hours helpers (NYSE / ET)
+# ---------------------------------------------------------------------------
+_ET = pytz.timezone("America/New_York")
+_MARKET_OPEN_HOUR = 9
+_MARKET_OPEN_MINUTE = 30
+_MARKET_CLOSE_HOUR = 16  # 4 PM ET
+
+
+def is_market_open() -> bool:
+    """Return True if NYSE is currently open (Mon–Fri, 09:30–16:00 ET)."""
+    now_et = datetime.now(_ET)
+    if now_et.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    open_time = now_et.replace(hour=_MARKET_OPEN_HOUR, minute=_MARKET_OPEN_MINUTE, second=0, microsecond=0)
+    close_time = now_et.replace(hour=_MARKET_CLOSE_HOUR, minute=0, second=0, microsecond=0)
+    return open_time <= now_et < close_time
+
+
+def seconds_until_market_open() -> float:
+    """
+    Return the number of seconds until the next NYSE open (09:30 ET Mon–Fri).
+    Returns 0 if the market is currently open.
+    """
+    if is_market_open():
+        return 0
+    now_et = datetime.now(_ET)
+    # Find the next market-open datetime
+    candidate = now_et.replace(hour=_MARKET_OPEN_HOUR, minute=_MARKET_OPEN_MINUTE, second=0, microsecond=0)
+    if candidate <= now_et:
+        # Already past today's open — move to the next calendar day
+        candidate += timedelta(days=1)
+    # Skip weekends
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    delta = (candidate - now_et).total_seconds()
+    return max(delta, 0)
 
 
 def _build_strategy_plan(
@@ -117,6 +158,254 @@ def _persist_ai_picks(db, recommendations: list[dict], scan_date) -> None:
 # Jobs
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Internal helper — reusable scan phase
+# ---------------------------------------------------------------------------
+
+def _run_scan_phase(db, log_prefix: str = "morning") -> tuple[list[dict], list[float], dict] | None:
+    """
+    Runs the AI scan + screener fallback and computes per-pick budgets.
+    Returns (picks, budgets, meta) where meta contains mode/strategy info,
+    or None if the scan should be aborted (disabled, no funds, no picks).
+
+    Does NOT connect to IBKR itself — the caller is responsible for the
+    client lifecycle when they are ready to place orders.
+    """
+    trader_enabled = get_setting(db, "trader_enabled", "true")
+    if trader_enabled.lower() != "true":
+        log_event(db, "system", "Trader is globally disabled. Skipping scan.")
+        return None
+
+    scan_enabled = get_setting(db, "scan_enabled", "true")
+    if scan_enabled.lower() != "true":
+        log_event(db, "system", "Auto-scan is disabled. Skipping scan.")
+        return None
+
+    trading_mode = get_setting(db, "trading_mode", "paper")
+    account_type = get_setting(db, "account_type", "trading_cash")
+    paper_strategy = get_setting(db, "paper_strategy", "cash")
+
+    try:
+        budget_pct = float(get_setting(db, "daily_budget_pct", "100"))
+    except ValueError:
+        budget_pct = 100.0
+
+    try:
+        max_positions_setting = int(get_setting(db, "max_positions", "5"))
+    except ValueError:
+        max_positions_setting = 5
+
+    # Connect briefly to IBKR only to check available funds
+    client = IBKRClient(trading_mode=trading_mode)
+    connected = client.connect()
+    if not connected:
+        log_event(db, "ibkr", "Failed to connect to IB Gateway. Aborting scan.", "ERROR")
+        return None
+
+    client.start_keepalive(interval=30)
+    account = client.get_account_summary()
+    available_cash = account.get("AvailableFunds", 0)
+    net_liq = account.get("NetLiquidation", 0)
+    client.disconnect()
+
+    if available_cash <= 0:
+        log_event(db, "ibkr", f"No available funds (${available_cash:.2f}). Aborting.", "ERROR")
+        return None
+
+    daily_budget, max_positions, strategy_label = _build_strategy_plan(
+        trading_mode, paper_strategy, available_cash, net_liq, budget_pct, max_positions_setting
+    )
+
+    log_event(db, "scan", f"Starting {log_prefix} scan. Mode: {trading_mode}, "
+                          f"Account: {account_type}, Strategy: {strategy_label}, "
+                          f"Budget: ${daily_budget:,.2f}")
+
+    # AI Scan — returns (ai_picks, screener_fallback_candidates)
+    recommendations, screened_candidates = run_daily_scan()
+
+    # Sort AI picks by confidence (highest first)
+    recommendations.sort(key=lambda r: r.get("confidence", 0), reverse=True)
+
+    if recommendations:
+        tickers_str = ", ".join(
+            f"{r['ticker']}({r.get('confidence', 0):.0%})" for r in recommendations
+        )
+        log_event(db, "scan", f"AI recommended {len(recommendations)} stock(s): {tickers_str}")
+    else:
+        log_event(db, "scan",
+                  "⚠️ AI returned no recommendations. Will use top screener candidates "
+                  f"to guarantee {MIN_WEEKLY_BUYS} buy(s).")
+
+    # Persist all AI picks to DB for the UI to display
+    today_date = datetime.now(timezone.utc).date()
+    if recommendations:
+        _persist_ai_picks(db, recommendations, today_date)
+
+    # ── Guarantee minimum buys ────────────────────────────────────────────
+    pick_limit = min(max_positions, len(recommendations))
+    picks = list(recommendations[:pick_limit])
+
+    ai_ticker_set = {r["ticker"] for r in picks}
+    fallback_used: list[dict] = []
+    if len(picks) < MIN_WEEKLY_BUYS and screened_candidates:
+        needed = MIN_WEEKLY_BUYS - len(picks)
+        for candidate in screened_candidates:
+            if len(fallback_used) >= needed:
+                break
+            if candidate["ticker"] not in ai_ticker_set:
+                fallback_used.append(candidate)
+                ai_ticker_set.add(candidate["ticker"])
+
+        if fallback_used:
+            fallback_str = ", ".join(c["ticker"] for c in fallback_used)
+            log_event(db, "scan",
+                      f"📊 Screener fallback: adding {len(fallback_used)} top-scored "
+                      f"candidate(s) to reach minimum {MIN_WEEKLY_BUYS} buys: {fallback_str}")
+            picks.extend(fallback_used)
+
+    if not picks:
+        log_event(db, "scan",
+                  "❌ No picks from AI or screener. Market data may be unavailable. "
+                  "No trades will be placed.")
+        return None
+
+    # Distribute budget according to position_size_pct if available, otherwise split evenly
+    total_pct = sum(r.get("position_size_pct", 0) for r in picks)
+    budgets: list[float] = []
+    if total_pct > 0:
+        for r in picks:
+            weight = r.get("position_size_pct", 0) / total_pct
+            budgets.append(daily_budget * weight)
+    else:
+        budgets = [daily_budget / len(picks)] * len(picks)
+
+    meta = {
+        "trading_mode": trading_mode,
+        "net_liq": net_liq,
+        "available_cash": available_cash,
+        "daily_budget": daily_budget,
+    }
+
+    log_event(db, "system",
+              f"Net Liq: ${net_liq:,.2f} | Available cash: ${available_cash:,.2f} | "
+              f"Today's budget: ${daily_budget:,.2f} | "
+              f"Buying {len(picks)} stock(s)")
+
+    return picks, budgets, meta
+
+
+def _place_buy_orders(db, client: IBKRClient, picks: list[dict], budgets: list[float], trading_mode: str) -> None:
+    """Place buy orders for all picks. Expects an already-connected IBKRClient."""
+    for rec, budget_for_trade in zip(picks, budgets):
+        ticker = rec["ticker"]
+        reason = rec.get("reason", "")
+        confidence = rec.get("confidence", 0)
+        pos_size = rec.get("position_size_pct", 0)
+
+        log_event(db, "buy",
+                  f"Placing BUY order for {ticker} "
+                  f"(confidence={confidence:.0%}, size={pos_size:.0f}%): {reason}")
+
+        # Pre-buy momentum gate
+        if not verify_ticker_momentum(ticker):
+            log_event(db, "buy",
+                      f"⚠️ Skipped {ticker} — failed pre-buy momentum check "
+                      f"(down >3% over recent sessions despite AI recommendation)")
+            continue
+
+        result = client.place_buy_order(ticker, budget_for_trade)
+
+        if result["success"]:
+            trade = Trade(
+                ticker=ticker,
+                shares=result["shares"],
+                buy_price=result["price"],
+                buy_time=datetime.now(timezone.utc),
+                status="open",
+                order_id=result.get("order_id"),
+                ai_reason=reason,
+                mode=trading_mode,
+                fees=result.get("fees", 0.0),
+                realised_partial_pnl=0.0,
+            )
+            db.add(trade)
+            db.commit()
+            log_event(db, "buy",
+                      f"✅ Bought {result['shares']} shares of {ticker} "
+                      f"@ ${result['price']:.2f} "
+                      f"(Total: ${result['total_cost']:,.2f})")
+        else:
+            log_event(db, "buy",
+                      f"❌ Buy failed for {ticker}: {result.get('error')}", "ERROR")
+
+
+# ---------------------------------------------------------------------------
+# Deferred buy — waits for market open, then places queued orders
+# ---------------------------------------------------------------------------
+
+def job_deferred_buy(picks: list[dict], budgets: list[float], trading_mode: str) -> None:
+    """
+    Called in a background thread when a manual scan is triggered outside market hours.
+    Sleeps until NYSE opens (09:30 ET, next weekday), then places the pre-computed
+    buy orders. A fresh DB session and IBKR connection are opened at that point.
+    """
+    wait_secs = seconds_until_market_open()
+    if wait_secs > 0:
+        open_et = datetime.now(_ET) + timedelta(seconds=wait_secs)
+        logger.info(
+            "Deferred buy: market is closed. Sleeping %.0f s until %s ET.",
+            wait_secs,
+            open_et.strftime("%Y-%m-%d %H:%M"),
+        )
+        db_notify = SessionLocal()
+        try:
+            log_event(
+                db_notify, "scan",
+                f"⏳ Buy orders deferred — market is closed. "
+                f"Will execute at {open_et.strftime('%Y-%m-%d %H:%M ET')} "
+                f"for {len(picks)} stock(s): "
+                + ", ".join(r['ticker'] for r in picks)
+            )
+        finally:
+            db_notify.close()
+
+        time.sleep(wait_secs)
+
+    db = SessionLocal()
+    try:
+        # Re-check settings haven't been changed while we waited
+        trader_enabled = get_setting(db, "trader_enabled", "true")
+        if trader_enabled.lower() != "true":
+            log_event(db, "system", "Trader disabled — cancelling deferred buy orders.")
+            return
+
+        log_event(db, "scan",
+                  f"🔔 Market opened — placing {len(picks)} deferred buy order(s): "
+                  + ", ".join(r['ticker'] for r in picks))
+
+        client = IBKRClient(trading_mode=trading_mode)
+        if not client.connect():
+            log_event(db, "ibkr",
+                      "Deferred buy: failed to connect to IB Gateway at market open.", "ERROR")
+            return
+
+        client.start_keepalive(interval=30)
+        _place_buy_orders(db, client, picks, budgets, trading_mode)
+        client.disconnect()
+    except Exception as e:
+        logger.exception("Deferred buy job crashed: %s", e)
+        try:
+            log_event(db, "system", f"Deferred buy crashed: {e}", "ERROR")
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Public job entry points
+# ---------------------------------------------------------------------------
+
 def job_morning_scan_and_buy():
     """
     Runs at 09:30 ET weekdays:
@@ -126,174 +415,67 @@ def job_morning_scan_and_buy():
     """
     db = SessionLocal()
     try:
-        trader_enabled = get_setting(db, "trader_enabled", "true")
-        if trader_enabled.lower() != "true":
-            log_event(db, "system", "Trader is globally disabled. Skipping morning job.")
+        result = _run_scan_phase(db, log_prefix="morning")
+        if result is None:
             return
+        picks, budgets, meta = result
+        trading_mode = meta["trading_mode"]
 
-        scan_enabled = get_setting(db, "scan_enabled", "true")
-        if scan_enabled.lower() != "true":
-            log_event(db, "system", "Auto-scan is disabled. Skipping morning job.")
-            return
-
-        trading_mode = get_setting(db, "trading_mode", "paper")
-        account_type = get_setting(db, "account_type", "trading_cash")
-        paper_strategy = get_setting(db, "paper_strategy", "cash")
-
-        try:
-            budget_pct = float(get_setting(db, "daily_budget_pct", "100"))
-        except ValueError:
-            budget_pct = 100.0
-
-        try:
-            max_positions_setting = int(get_setting(db, "max_positions", "5"))
-        except ValueError:
-            max_positions_setting = 5
-
-        # Connect to IBKR to get account balance
         client = IBKRClient(trading_mode=trading_mode)
-        connected = client.connect()
-        if not connected:
+        if not client.connect():
             log_event(db, "ibkr", "Failed to connect to IB Gateway. Aborting trades.", "ERROR")
             return
 
         client.start_keepalive(interval=30)
-
-        account = client.get_account_summary()
-        available_cash = account.get("AvailableFunds", 0)
-        net_liq = account.get("NetLiquidation", 0)
-
-        if available_cash <= 0:
-            log_event(db, "ibkr", f"No available funds (${available_cash:.2f}). Aborting.", "ERROR")
-            client.disconnect()
-            return
-
-        daily_budget, max_positions, strategy_label = _build_strategy_plan(
-            trading_mode, paper_strategy, available_cash, net_liq, budget_pct, max_positions_setting
-        )
-
-        log_event(db, "scan", f"Starting morning scan. Mode: {trading_mode}, "
-                              f"Account: {account_type}, Strategy: {strategy_label}, "
-                              f"Budget: ${daily_budget:,.2f}")
-
-        # Step 1: AI Scan — returns (ai_picks, screener_fallback_candidates)
-        recommendations, screened_candidates = run_daily_scan()
-
-        # Sort AI picks by confidence (highest first)
-        recommendations.sort(key=lambda r: r.get("confidence", 0), reverse=True)
-
-        if recommendations:
-            tickers_str = ", ".join(
-                f"{r['ticker']}({r.get('confidence', 0):.0%})" for r in recommendations
-            )
-            log_event(db, "scan", f"AI recommended {len(recommendations)} stock(s): {tickers_str}")
-        else:
-            log_event(db, "scan",
-                      "⚠️ AI returned no recommendations. Will use top screener candidates "
-                      f"to guarantee {MIN_WEEKLY_BUYS} buy(s).")
-
-        # Persist all AI picks to DB for the UI to display
-        today_date = datetime.now(timezone.utc).date()
-        if recommendations:
-            _persist_ai_picks(db, recommendations, today_date)
-
-        # ── Guarantee minimum buys ────────────────────────────────────────────
-        # Start with the configured cap of AI picks.
-        pick_limit = min(max_positions, len(recommendations))
-        picks = list(recommendations[:pick_limit])
-
-        # If we still have fewer than MIN_WEEKLY_BUYS, top up with the best screener
-        # candidates that aren't already in the AI picks list.
-        ai_ticker_set = {r["ticker"] for r in picks}
-        fallback_used: list[dict] = []
-        if len(picks) < MIN_WEEKLY_BUYS and screened_candidates:
-            needed = MIN_WEEKLY_BUYS - len(picks)
-            for candidate in screened_candidates:
-                if len(fallback_used) >= needed:
-                    break
-                if candidate["ticker"] not in ai_ticker_set:
-                    fallback_used.append(candidate)
-                    ai_ticker_set.add(candidate["ticker"])
-
-            if fallback_used:
-                fallback_str = ", ".join(c["ticker"] for c in fallback_used)
-                log_event(db, "scan",
-                          f"📊 Screener fallback: adding {len(fallback_used)} top-scored "
-                          f"candidate(s) to reach minimum {MIN_WEEKLY_BUYS} buys: {fallback_str}")
-                picks.extend(fallback_used)
-
-        # If we still have nothing (very rare — screener also empty), bail
-        if not picks:
-            log_event(db, "scan",
-                      "❌ No picks from AI or screener. Market data may be unavailable. "
-                      "No trades placed today.")
-            client.disconnect()
-            return
-
-        # Distribute budget according to position_size_pct if available,
-        # otherwise split evenly
-        total_pct = sum(r.get("position_size_pct", 0) for r in picks)
-        budgets: list[float] = []
-        if total_pct > 0:
-            for r in picks:
-                weight = r.get("position_size_pct", 0) / total_pct
-                budgets.append(daily_budget * weight)
-        else:
-            budgets = [daily_budget / len(picks)] * len(picks)
-
-        log_event(db, "system",
-              f"Net Liq: ${net_liq:,.2f} | Available cash: ${available_cash:,.2f} | "
-              f"Today's budget: ${daily_budget:,.2f} | "
-              f"Buying {len(picks)} stock(s)")
-
-        # Step 3: Place buy orders
-        for rec, budget_for_trade in zip(picks, budgets):
-            ticker = rec["ticker"]
-            reason = rec.get("reason", "")
-            confidence = rec.get("confidence", 0)
-            pos_size = rec.get("position_size_pct", 0)
-
-            log_event(db, "buy",
-                      f"Placing BUY order for {ticker} "
-                      f"(confidence={confidence:.0%}, size={pos_size:.0f}%): {reason}")
-
-            # Pre-buy momentum gate
-            if not verify_ticker_momentum(ticker):
-                log_event(db, "buy",
-                          f"⚠️ Skipped {ticker} — failed pre-buy momentum check "
-                          f"(down >3% over recent sessions despite AI recommendation)")
-                continue
-
-            result = client.place_buy_order(ticker, budget_for_trade)
-
-            if result["success"]:
-                trade = Trade(
-                    ticker=ticker,
-                    shares=result["shares"],
-                    buy_price=result["price"],
-                    buy_time=datetime.now(timezone.utc),
-                    status="open",
-                    order_id=result.get("order_id"),
-                    ai_reason=reason,
-                    mode=trading_mode,
-                    fees=result.get("fees", 0.0),
-                    realised_partial_pnl=0.0,
-                )
-                db.add(trade)
-                db.commit()
-                log_event(db, "buy",
-                          f"✅ Bought {result['shares']} shares of {ticker} "
-                          f"@ ${result['price']:.2f} "
-                          f"(Total: ${result['total_cost']:,.2f})")
-            else:
-                log_event(db, "buy",
-                          f"❌ Buy failed for {ticker}: {result.get('error')}", "ERROR")
-
+        _place_buy_orders(db, client, picks, budgets, trading_mode)
         client.disconnect()
 
     except Exception as e:
         logger.exception(f"Morning scan job crashed: {e}")
         log_event(db, "system", f"Morning scan crashed: {e}", "ERROR")
+    finally:
+        db.close()
+
+
+def job_manual_scan_with_deferred_buy():
+    """
+    Entry point for manual scans triggered via the API.
+    - Runs the AI scan immediately (any time of day).
+    - If the market is currently open: places buy orders immediately.
+    - If the market is closed: persists the AI picks and queues a background
+      thread that will place orders when NYSE opens next.
+    """
+    db = SessionLocal()
+    try:
+        result = _run_scan_phase(db, log_prefix="manual")
+        if result is None:
+            return
+        picks, budgets, meta = result
+        trading_mode = meta["trading_mode"]
+
+        if is_market_open():
+            # Market is open — place orders right now
+            log_event(db, "scan", "Market is open — placing buy orders immediately.")
+            client = IBKRClient(trading_mode=trading_mode)
+            if not client.connect():
+                log_event(db, "ibkr", "Failed to connect to IB Gateway. Aborting trades.", "ERROR")
+                return
+            client.start_keepalive(interval=30)
+            _place_buy_orders(db, client, picks, budgets, trading_mode)
+            client.disconnect()
+        else:
+            # Market is closed — hand off to the deferred-buy thread
+            t = threading.Thread(
+                target=job_deferred_buy,
+                args=(picks, budgets, trading_mode),
+                daemon=True,
+                name="deferred-buy",
+            )
+            t.start()
+
+    except Exception as e:
+        logger.exception(f"Manual scan job crashed: {e}")
+        log_event(db, "system", f"Manual scan crashed: {e}", "ERROR")
     finally:
         db.close()
 
