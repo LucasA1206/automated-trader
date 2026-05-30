@@ -600,19 +600,40 @@ def job_afternoon_sell():
         db.close()
 
 
+def _trigger_rescan_if_all_closed(db) -> bool:
+    """
+    Check if all tracked positions are now closed. If so, trigger a new stock scan
+    so fresh opportunities are found mid-week after all positions have been exited.
+    Returns True if a re-scan was triggered.
+    """
+    remaining_open = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).count()
+    if remaining_open == 0:
+        log_event(db, "scan",
+                  "🔄 All positions closed — triggering automatic re-scan to find new stocks.")
+        t = threading.Thread(
+            target=job_manual_scan_with_deferred_buy,
+            daemon=True,
+            name="auto-rescan",
+        )
+        t.start()
+        return True
+    return False
+
+
 def job_monitor_swing_trades():
     """
     Runs periodically during market hours.
     Checks all open positions:
     - If price drops >= 5% from buy_price (stop-loss): sell ALL, record final P&L.
-    - If price rises >= 10% from buy_price (take-profit) AND status == 'open':
-        sell HALF, bank the gain to realised_partial_pnl, set status = 'sold_half'.
+    - If price rises >= 10% from buy_price (take-profit): sell ALL shares, record final P&L.
+
+    After any full exit (stop-loss or take-profit), if all positions are now closed
+    a new stock scan is automatically triggered to find fresh opportunities.
 
     P&L rules:
-    - Take-profit partial sell → writes to trade.realised_partial_pnl (NEVER to trade.pnl).
-      trade.pnl is reserved for the final close.
-    - Stop-loss full sell → final pnl = (sell_price - buy_price) * all_live_shares
-                                       + trade.realised_partial_pnl
+    - Take-profit full sell → final pnl = (sell_price - buy_price) * all_live_shares
+    - Stop-loss full sell   → final pnl = (sell_price - buy_price) * all_live_shares
+                                         + trade.realised_partial_pnl (if any banked)
     """
     db = SessionLocal()
     try:
@@ -630,6 +651,8 @@ def job_monitor_swing_trades():
         live_tickers = {p["ticker"]: p for p in live_positions}
 
         open_trades = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
+
+        any_fully_closed = False
 
         for trade in open_trades:
             ticker = trade.ticker
@@ -658,7 +681,6 @@ def job_monitor_swing_trades():
                     remaining_pnl = (sell_price - buy_price) * live_shares
                     total_pnl = remaining_pnl + partial_already_realised
 
-                    original_cost = buy_price * trade.shares if trade.shares else 1
                     pnl_pct = ((sell_price - buy_price) / buy_price * 100)
 
                     trade.sell_price = sell_price
@@ -675,35 +697,42 @@ def job_monitor_swing_trades():
                     log_event(db, "sell",
                               f"📉 Stop-loss closed {ticker}: "
                               f"P&L ${total_pnl:+.2f}{partial_note}")
+                    any_fully_closed = True
 
-            # ── Take Profit (>= 10% rise, only on first trigger) ───────────────
+            # ── Take Profit (>= 10% rise) — sell ALL shares and close ──────────
             elif current_price >= buy_price * 1.10 and trade.status == "open":
-                shares_to_sell = int(live_shares / 2)
-                if shares_to_sell > 0:
+                log_event(db, "sell",
+                          f"🚀 Take Profit triggered for {ticker} "
+                          f"(rose >= 10%). Selling ALL {live_shares} shares.")
+                result = client.place_sell_order(ticker, live_shares)
+                if result["success"]:
+                    sell_price = result["price"]
+                    sell_fees = result.get("fees", 0.0)
+
+                    total_pnl = (sell_price - buy_price) * live_shares
+                    pnl_pct = ((sell_price - buy_price) / buy_price * 100)
+
+                    trade.sell_price = sell_price
+                    trade.sell_time = datetime.now(timezone.utc)
+                    trade.status = "closed"
+                    trade.pnl = round(total_pnl, 2)
+                    trade.pnl_pct = round(pnl_pct, 2)
+                    trade.fees = round((trade.fees or 0.0) + sell_fees, 4)
+                    db.commit()
+
                     log_event(db, "sell",
-                              f"🚀 Take Profit triggered for {ticker} "
-                              f"(rose >= 10%). Selling half: {shares_to_sell} shares.")
-                    result = client.place_sell_order(ticker, shares_to_sell)
-                    if result["success"]:
-                        sell_price = result["price"]
-
-                        # Bank this partial gain — never written to trade.pnl
-                        partial_gain = (sell_price - buy_price) * shares_to_sell
-                        sell_fees = result.get("fees", 0.0)
-
-                        trade.status = "sold_half"
-                        trade.realised_partial_pnl = round(
-                            (trade.realised_partial_pnl or 0.0) + partial_gain, 2
-                        )
-                        trade.fees = round((trade.fees or 0.0) + sell_fees, 4)
-                        db.commit()
-
-                        log_event(db, "sell",
-                                  f"🚀 Take-profit: sold {shares_to_sell} shares of {ticker} "
-                                  f"@ ${sell_price:.2f} | Partial gain banked: "
-                                  f"+${partial_gain:.2f} | Status: sold_half")
+                              f"🚀 Take-profit: sold ALL {live_shares} shares of {ticker} "
+                              f"@ ${sell_price:.2f} | P&L: +${total_pnl:.2f} "
+                              f"({pnl_pct:+.2f}%) | Fees: ${sell_fees:.2f}")
+                    any_fully_closed = True
 
         client.disconnect()
+
+        # If any position was fully exited, check whether all are now closed
+        # and kick off a fresh scan if so.
+        if any_fully_closed:
+            _trigger_rescan_if_all_closed(db)
+
     except Exception as e:
         logger.exception(f"Swing trade monitor crashed: {e}")
     finally:
