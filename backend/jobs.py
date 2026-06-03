@@ -70,6 +70,11 @@ def _build_strategy_plan(
         return available_cash * fraction, db_max_positions, f"paper margin simulation / {db_max_positions} stocks / {db_budget_pct}% budget"
     return available_cash * fraction, db_max_positions, f"paper cash simulation / {db_max_positions} stocks / {db_budget_pct}% budget"
 
+
+def _count_open_positions(db) -> int:
+    """Return the number of currently open/sold_half trades in the DB."""
+    return db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).count()
+
 # ---------------------------------------------------------------------------
 # Persistent keepalive — a single IBKRClient that stays connected between jobs
 # ---------------------------------------------------------------------------
@@ -162,11 +167,14 @@ def _persist_ai_picks(db, recommendations: list[dict], scan_date) -> None:
 # Internal helper — reusable scan phase
 # ---------------------------------------------------------------------------
 
-def _run_scan_phase(db, log_prefix: str = "morning") -> tuple[list[dict], list[float], dict] | None:
+def _run_scan_phase(db, log_prefix: str = "morning", num_picks: int | None = None) -> tuple[list[dict], list[float], dict] | None:
     """
     Runs the AI scan + screener fallback and computes per-pick budgets.
     Returns (picks, budgets, meta) where meta contains mode/strategy info,
     or None if the scan should be aborted (disabled, no funds, no picks).
+
+    If num_picks is provided, limits the number of stocks to buy to that value
+    (used for daily replacement scans where only some slots need filling).
 
     Does NOT connect to IBKR itself — the caller is responsible for the
     client lifecycle when they are ready to place orders.
@@ -216,9 +224,13 @@ def _run_scan_phase(db, log_prefix: str = "morning") -> tuple[list[dict], list[f
         trading_mode, paper_strategy, available_cash, net_liq, budget_pct, max_positions_setting
     )
 
+    # If caller specifies how many picks to buy, use that as the cap
+    effective_pick_limit = num_picks if num_picks is not None else max_positions
+
     log_event(db, "scan", f"Starting {log_prefix} scan. Mode: {trading_mode}, "
                           f"Account: {account_type}, Strategy: {strategy_label}, "
-                          f"Budget: ${daily_budget:,.2f}")
+                          f"Budget: ${daily_budget:,.2f}, "
+                          f"Slots to fill: {effective_pick_limit}")
 
     # AI Scan — returns (ai_picks, screener_fallback_candidates)
     recommendations, screened_candidates = run_daily_scan()
@@ -241,14 +253,21 @@ def _run_scan_phase(db, log_prefix: str = "morning") -> tuple[list[dict], list[f
     if recommendations:
         _persist_ai_picks(db, recommendations, today_date)
 
-    # ── Guarantee minimum buys ────────────────────────────────────────────
-    pick_limit = min(max_positions, len(recommendations))
+    # ── Select picks up to the effective limit ────────────────────────────
+    pick_limit = min(effective_pick_limit, len(recommendations))
     picks = list(recommendations[:pick_limit])
 
-    ai_ticker_set = {r["ticker"] for r in picks}
+    # Exclude tickers we already hold open positions for
+    open_tickers = set(
+        t.ticker for t in db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
+    )
+    picks = [p for p in picks if p["ticker"] not in open_tickers]
+
+    ai_ticker_set = {r["ticker"] for r in picks} | open_tickers
     fallback_used: list[dict] = []
-    if len(picks) < MIN_WEEKLY_BUYS and screened_candidates:
-        needed = MIN_WEEKLY_BUYS - len(picks)
+    min_buys = min(MIN_WEEKLY_BUYS, effective_pick_limit)
+    if len(picks) < min_buys and screened_candidates:
+        needed = min_buys - len(picks)
         for candidate in screened_candidates:
             if len(fallback_used) >= needed:
                 break
@@ -260,8 +279,11 @@ def _run_scan_phase(db, log_prefix: str = "morning") -> tuple[list[dict], list[f
             fallback_str = ", ".join(c["ticker"] for c in fallback_used)
             log_event(db, "scan",
                       f"📊 Screener fallback: adding {len(fallback_used)} top-scored "
-                      f"candidate(s) to reach minimum {MIN_WEEKLY_BUYS} buys: {fallback_str}")
+                      f"candidate(s) to reach minimum {min_buys} buys: {fallback_str}")
             picks.extend(fallback_used)
+
+    # Final trim to effective limit (fallback may have added extras)
+    picks = picks[:effective_pick_limit]
 
     if not picks:
         log_event(db, "scan",
@@ -295,22 +317,46 @@ def _run_scan_phase(db, log_prefix: str = "morning") -> tuple[list[dict], list[f
 
 
 def _place_buy_orders(db, client: IBKRClient, picks: list[dict], budgets: list[float], trading_mode: str) -> None:
-    """Place buy orders for all picks. Expects an already-connected IBKRClient."""
-    for rec, budget_for_trade in zip(picks, budgets):
+    """Place buy orders for all picks. Expects an already-connected IBKRClient.
+
+    Budget redistribution: when a stock is rejected (momentum check failure or
+    order error), its budget is redistributed equally across the remaining
+    un-attempted picks so the full daily budget is always deployed.
+    """
+    # Work with a mutable copy so we can adjust future budgets in-place
+    budgets = list(budgets)
+    remaining_budget = 0.0  # Accumulates budget from rejected/failed stocks
+
+    for i, rec in enumerate(picks):
         ticker = rec["ticker"]
         reason = rec.get("reason", "")
         confidence = rec.get("confidence", 0)
         pos_size = rec.get("position_size_pct", 0)
 
+        budget_for_trade = budgets[i]
+
+        # Redistribute any leftover budget from previously rejected stocks
+        if remaining_budget > 0:
+            remaining_picks_count = len(picks) - i  # this pick + future picks
+            extra_per_pick = remaining_budget / remaining_picks_count
+            budget_for_trade += extra_per_pick
+            # Also adjust future budgets so the redistribution cascades correctly
+            for j in range(i + 1, len(picks)):
+                budgets[j] += extra_per_pick
+            remaining_budget = 0.0
+
         log_event(db, "buy",
                   f"Placing BUY order for {ticker} "
-                  f"(confidence={confidence:.0%}, size={pos_size:.0f}%): {reason}")
+                  f"(confidence={confidence:.0%}, size={pos_size:.0f}%, "
+                  f"budget=${budget_for_trade:,.2f}): {reason}")
 
         # Pre-buy momentum gate
         if not verify_ticker_momentum(ticker):
             log_event(db, "buy",
                       f"⚠️ Skipped {ticker} — failed pre-buy momentum check "
-                      f"(down >3% over recent sessions despite AI recommendation)")
+                      f"(down >3% over recent sessions despite AI recommendation). "
+                      f"Redistributing ${budget_for_trade:,.2f} to remaining picks.")
+            remaining_budget += budget_for_trade
             continue
 
         result = client.place_buy_order(ticker, budget_for_trade)
@@ -336,7 +382,14 @@ def _place_buy_orders(db, client: IBKRClient, picks: list[dict], budgets: list[f
                       f"(Total: ${result['total_cost']:,.2f})")
         else:
             log_event(db, "buy",
-                      f"❌ Buy failed for {ticker}: {result.get('error')}", "ERROR")
+                      f"❌ Buy failed for {ticker}: {result.get('error')}. "
+                      f"Redistributing ${budget_for_trade:,.2f} to remaining picks.", "ERROR")
+            remaining_budget += budget_for_trade
+
+    if remaining_budget > 0:
+        log_event(db, "buy",
+                  f"⚠️ ${remaining_budget:,.2f} of budget could not be deployed "
+                  f"(all remaining picks were rejected or failed).")
 
 
 # ---------------------------------------------------------------------------
@@ -408,14 +461,37 @@ def job_deferred_buy(picks: list[dict], budgets: list[float], trading_mode: str)
 
 def job_morning_scan_and_buy():
     """
-    Runs at 09:30 ET weekdays:
-    1. Checks if scan is enabled
-    2. Runs AI stock scan
-    3. Buys top picks using configured budget %
+    Runs at 09:30 ET every weekday (Mon–Fri).
+
+    Checks how many position slots are available (max_positions minus current
+    open/sold_half trades) and scans for that many replacement stocks.
+
+    If the portfolio is already full, the scan is skipped entirely.
+    This means:
+    - Monday: typically a full scan for max_positions stocks (portfolio is empty after Friday sell)
+    - Tue–Fri: only scans if stocks were sold via take-profit or stop-loss the previous day
     """
     db = SessionLocal()
     try:
-        result = _run_scan_phase(db, log_prefix="morning")
+        try:
+            max_positions = int(get_setting(db, "max_positions", "5"))
+        except ValueError:
+            max_positions = 5
+
+        current_open = _count_open_positions(db)
+        slots_to_fill = max_positions - current_open
+
+        if slots_to_fill <= 0:
+            log_event(db, "scan",
+                      f"Portfolio is full ({current_open}/{max_positions} positions open). "
+                      f"Skipping morning scan.")
+            return
+
+        log_event(db, "scan",
+                  f"📊 {current_open}/{max_positions} positions open — "
+                  f"scanning for {slots_to_fill} replacement stock(s).")
+
+        result = _run_scan_phase(db, log_prefix="morning", num_picks=slots_to_fill)
         if result is None:
             return
         picks, budgets, meta = result
@@ -600,24 +676,10 @@ def job_afternoon_sell():
         db.close()
 
 
-def _trigger_rescan_if_all_closed(db) -> bool:
-    """
-    Check if all tracked positions are now closed. If so, trigger a new stock scan
-    so fresh opportunities are found mid-week after all positions have been exited.
-    Returns True if a re-scan was triggered.
-    """
-    remaining_open = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).count()
-    if remaining_open == 0:
-        log_event(db, "scan",
-                  "🔄 All positions closed — triggering automatic re-scan to find new stocks.")
-        t = threading.Thread(
-            target=job_manual_scan_with_deferred_buy,
-            daemon=True,
-            name="auto-rescan",
-        )
-        t.start()
-        return True
-    return False
+# _trigger_rescan_if_all_closed() has been removed.
+# Instead of triggering an immediate rescan when positions close, the system
+# now waits until the next morning scan (09:30 ET) which checks how many
+# position slots need filling and scans for that many replacement stocks.
 
 
 def job_monitor_swing_trades():
@@ -627,8 +689,9 @@ def job_monitor_swing_trades():
     - If price drops >= 5% from buy_price (stop-loss): sell ALL, record final P&L.
     - If price rises >= 10% from buy_price (take-profit): sell ALL shares, record final P&L.
 
-    After any full exit (stop-loss or take-profit), if all positions are now closed
-    a new stock scan is automatically triggered to find fresh opportunities.
+    After any full exit, the system logs how many slots are now open.
+    Replacement stocks will be bought at the next morning scan (09:30 ET)
+    rather than triggering an immediate rescan.
 
     P&L rules:
     - Take-profit full sell → final pnl = (sell_price - buy_price) * all_live_shares
@@ -728,10 +791,20 @@ def job_monitor_swing_trades():
 
         client.disconnect()
 
-        # If any position was fully exited, check whether all are now closed
-        # and kick off a fresh scan if so.
+        # Positions sold via take-profit or stop-loss will be replaced at the
+        # next morning scan (09:30 ET). The morning job checks how many slots
+        # are available and scans for that many replacement stocks.
         if any_fully_closed:
-            _trigger_rescan_if_all_closed(db)
+            remaining_open = _count_open_positions(db)
+            try:
+                max_pos = int(get_setting(db, "max_positions", "5"))
+            except ValueError:
+                max_pos = 5
+            slots_available = max_pos - remaining_open
+            log_event(db, "scan",
+                      f"📋 {slots_available} position slot(s) now open "
+                      f"({remaining_open}/{max_pos} held). "
+                      f"Replacement stocks will be bought at next morning scan (09:30 ET).")
 
     except Exception as e:
         logger.exception(f"Swing trade monitor crashed: {e}")
