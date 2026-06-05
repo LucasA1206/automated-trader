@@ -64,6 +64,7 @@ def create_scheduler() -> BackgroundScheduler:
         name="Monitor Swing Trades",
         replace_existing=True,
         misfire_grace_time=60,
+        max_instances=1,       # Prevent concurrent runs that can duplicate sells
     )
 
     return scheduler

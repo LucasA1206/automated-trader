@@ -72,8 +72,8 @@ def _build_strategy_plan(
 
 
 def _count_open_positions(db) -> int:
-    """Return the number of currently open/sold_half trades in the DB."""
-    return db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).count()
+    """Return the number of currently open/sold_half/closing trades in the DB."""
+    return db.query(Trade).filter(Trade.status.in_(["open", "sold_half", "closing"])).count()
 
 # ---------------------------------------------------------------------------
 # Persistent keepalive — a single IBKRClient that stays connected between jobs
@@ -126,7 +126,11 @@ def log_event(db, category: str, message: str, level: str = "INFO"):
 
 
 def _reconcile_stale_db_trades(db, live_tickers: set[str], log_fn) -> None:
-    """Close any DB trades marked 'open'/'sold_half' for tickers no longer held in IBKR."""
+    """Close any DB trades marked 'open'/'sold_half' for tickers no longer held in IBKR.
+
+    Trades with status 'closing' are excluded — they have a sell order in-flight
+    and will be finalised by the monitor that initiated the sell.
+    """
     open_trades = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
     for trade in open_trades:
         if trade.ticker not in live_tickers:
@@ -613,6 +617,13 @@ def job_afternoon_sell():
             ticker = position["ticker"]
             live_shares = position["shares"]  # Actual shares currently held (may be halved)
 
+            # Guard: skip short or zero positions
+            if live_shares <= 0:
+                log_event(db, "sell",
+                          f"⚠️ Skipping {ticker} in afternoon sell — live shares is "
+                          f"{live_shares} (short or zero position).")
+                continue
+
             log_event(db, "sell",
                       f"Placing SELL order for {live_shares} shares of {ticker}...")
             result = client.place_sell_order(ticker, live_shares)
@@ -730,8 +741,34 @@ def job_monitor_swing_trades():
             if not buy_price:
                 continue
 
+            # Guard: skip short or zero positions — selling these would
+            # flip the order direction at IBKR (SELL -N = BUY N).
+            if live_shares <= 0:
+                log_event(db, "sell",
+                          f"⚠️ Skipping {ticker} — live shares is {live_shares} "
+                          f"(short or zero position, not a valid sell target).")
+                continue
+
+            # Guard: re-read the trade from the DB in case a concurrent
+            # monitor run already closed it (stale portfolio data can linger
+            # for several minutes after a sell fills).
+            db.refresh(trade)
+            if trade.status not in ("open", "sold_half"):
+                logger.info(
+                    "Monitor: skipping %s — status changed to '%s' "
+                    "(likely closed by a concurrent run).",
+                    ticker, trade.status,
+                )
+                continue
+
             # ── Stop Loss (>= 5% drop from buy price) ──────────────────────────
             if current_price <= buy_price * 0.95:
+                # Mark as "closing" BEFORE placing the order so concurrent runs
+                # see this and skip the trade (idempotent sell guard).
+                previous_status = trade.status
+                trade.status = "closing"
+                db.commit()
+
                 log_event(db, "sell",
                           f"📉 Stop Loss triggered for {ticker} "
                           f"(dropped >= 5%). Selling all {live_shares} shares.")
@@ -761,9 +798,20 @@ def job_monitor_swing_trades():
                               f"📉 Stop-loss closed {ticker}: "
                               f"P&L ${total_pnl:+.2f}{partial_note}")
                     any_fully_closed = True
+                else:
+                    # Sell failed — revert to previous status so the next run retries
+                    trade.status = previous_status
+                    db.commit()
+                    log_event(db, "sell",
+                              f"❌ Stop-loss sell failed for {ticker}: "
+                              f"{result.get('error')}. Will retry next cycle.", "ERROR")
 
             # ── Take Profit (>= 10% rise) — sell ALL shares and close ──────────
             elif current_price >= buy_price * 1.10 and trade.status == "open":
+                # Mark as "closing" BEFORE placing the order (idempotent guard).
+                trade.status = "closing"
+                db.commit()
+
                 log_event(db, "sell",
                           f"🚀 Take Profit triggered for {ticker} "
                           f"(rose >= 10%). Selling ALL {live_shares} shares.")
@@ -788,6 +836,13 @@ def job_monitor_swing_trades():
                               f"@ ${sell_price:.2f} | P&L: +${total_pnl:.2f} "
                               f"({pnl_pct:+.2f}%) | Fees: ${sell_fees:.2f}")
                     any_fully_closed = True
+                else:
+                    # Sell failed — revert to "open" so the next run retries
+                    trade.status = "open"
+                    db.commit()
+                    log_event(db, "sell",
+                              f"❌ Take-profit sell failed for {ticker}: "
+                              f"{result.get('error')}. Will retry next cycle.", "ERROR")
 
         client.disconnect()
 
