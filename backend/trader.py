@@ -439,13 +439,28 @@ class IBKRClient:
         Returns fill price.
         """
         try:
+            # Guard: ensure share quantity is always positive.
+            # A negative value would flip the order direction at IBKR (SELL -N = BUY N).
+            raw_shares = shares
+            shares = abs(int(shares))
+            if shares <= 0:
+                msg = f"Invalid share quantity for {ticker}: raw={raw_shares}, resolved={shares}"
+                logger.error(msg)
+                return {"success": False, "ticker": ticker, "error": msg}
+            if raw_shares < 0:
+                logger.warning(
+                    "place_sell_order(%s): received negative shares (%s), "
+                    "using abs value %d. This indicates a short position or upstream bug.",
+                    ticker, raw_shares, shares,
+                )
+
             if not self.ib.isConnected():
                 self.connect()
 
             contract = Stock(ticker, "SMART", "USD")
             self.ib.qualifyContracts(contract)
 
-            order = MarketOrder("SELL", int(shares))
+            order = MarketOrder("SELL", shares)
             trade = self.ib.placeOrder(contract, order)
             
             # Wait up to 10 seconds for fill

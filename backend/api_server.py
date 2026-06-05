@@ -533,6 +533,18 @@ def sell_all_ibkr(db: Session = Depends(get_db)):
         for pos in positions:
             ticker = pos["ticker"]
             live_shares = pos["shares"]
+
+            # Guard: skip short or zero positions
+            if live_shares <= 0:
+                logger.warning(
+                    "[SELL-ALL] Skipping %s — live shares is %s "
+                    "(short or zero position).", ticker, live_shares)
+                results.append({
+                    "success": False, "ticker": ticker,
+                    "error": f"Skipped: non-positive share count ({live_shares})"
+                })
+                continue
+
             logger.info(f"[SELL-ALL] Placing sell order for {live_shares} shares of {ticker}...")
             result = client.place_sell_order(ticker, live_shares)
             results.append(result)
