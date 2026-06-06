@@ -206,6 +206,9 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
   const [pnlLoading, setPnlLoading] = useState(true);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [chartMode, setChartMode] = useState<ChartMode>('cumulative');
+  const [sellingTicker, setSellingTicker] = useState<string | null>(null);
+  const [confirmTicker, setConfirmTicker] = useState<string | null>(null);
+  const [sellResult, setSellResult] = useState<{ ticker: string; message: string; success: boolean } | null>(null);
 
   // ── Fetch live portfolio ──────────────────────────────────────────────────
   const fetchPortfolio = useCallback(async () => {
@@ -250,6 +253,46 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
       /* silently fail */
     }
   }, [authFetch]);
+
+  // ── Sell a single stock ───────────────────────────────────────────────────
+  const sellStock = useCallback(async (ticker: string) => {
+    setSellingTicker(ticker);
+    setConfirmTicker(null);
+    setSellResult(null);
+    try {
+      const res = await authFetch('/api/sell-stock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ticker }),
+      });
+      const json = await res.json();
+      if (json.deferred) {
+        setSellResult({ ticker, message: json.message, success: true });
+      } else if (json.status === 'ok') {
+        setSellResult({
+          ticker,
+          message: `Sold ${json.result?.shares ?? ''} shares of ${ticker} @ $${(json.result?.price ?? 0).toFixed(2)}`,
+          success: true,
+        });
+        // Refresh portfolio after a brief delay to let IBKR sync
+        setTimeout(() => { fetchPortfolio(); fetchPnlHistory(); }, 2000);
+      } else {
+        setSellResult({
+          ticker,
+          message: json.result?.error || json.detail || 'Sell order failed',
+          success: false,
+        });
+      }
+    } catch (err) {
+      setSellResult({
+        ticker,
+        message: `Network error: ${err instanceof Error ? err.message : 'unknown'}`,
+        success: false,
+      });
+    } finally {
+      setSellingTicker(null);
+    }
+  }, [authFetch, fetchPortfolio, fetchPnlHistory]);
 
   useEffect(() => {
     fetchPortfolio();
@@ -327,6 +370,34 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
           </button>
         </div>
       </div>
+
+      {/* ── Sell result banner ─────────────────────────────────────────── */}
+      {sellResult && (
+        <div style={{
+          display: 'flex', alignItems: 'flex-start', gap: 12,
+          padding: '12px 16px', borderRadius: 10, marginBottom: 16,
+          background: sellResult.success
+            ? 'rgba(34,197,94,0.08)' : 'rgba(239,68,68,0.08)',
+          border: `1px solid ${sellResult.success
+            ? 'rgba(34,197,94,0.2)' : 'rgba(239,68,68,0.2)'}`,
+        }}>
+          <span style={{ fontSize: 14, flexShrink: 0 }}>
+            {sellResult.success ? '✅' : '❌'}
+          </span>
+          <div style={{ fontSize: 12, color: sellResult.success ? 'var(--accent-green)' : 'var(--accent-red)', flex: 1 }}>
+            <strong>{sellResult.ticker}:</strong> {sellResult.message}
+          </div>
+          <button
+            onClick={() => setSellResult(null)}
+            style={{
+              background: 'none', border: 'none', color: 'var(--text-muted)',
+              cursor: 'pointer', fontSize: 14, padding: 0, flexShrink: 0,
+            }}
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* ── Stale FX rate warning ─────────────────────────────────────── */}
       {fxData?.stale && (
@@ -640,6 +711,7 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
                 <th>Market Value (AUD)</th>
                 <th>Unrealised P&amp;L</th>
                 <th>Partial Gain</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -666,6 +738,47 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
                       </span>
                     ) : (
                       <span style={{ color: 'var(--text-muted)' }}>—</span>
+                    )}
+                  </td>
+                  <td>
+                    {confirmTicker === pos.ticker ? (
+                      <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                        <button
+                          id={`btn-confirm-sell-${pos.ticker}`}
+                          className="btn btn-danger"
+                          style={{
+                            padding: '4px 12px', fontSize: 11, fontWeight: 700,
+                            borderRadius: 6, minWidth: 60,
+                          }}
+                          onClick={() => sellStock(pos.ticker)}
+                          disabled={sellingTicker === pos.ticker}
+                        >
+                          {sellingTicker === pos.ticker ? '…' : 'Confirm'}
+                        </button>
+                        <button
+                          className="btn btn-outline"
+                          style={{
+                            padding: '4px 8px', fontSize: 11, borderRadius: 6,
+                          }}
+                          onClick={() => setConfirmTicker(null)}
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        id={`btn-sell-${pos.ticker}`}
+                        className="btn btn-outline"
+                        style={{
+                          padding: '4px 12px', fontSize: 11, fontWeight: 600,
+                          borderRadius: 6, color: 'var(--accent-red)',
+                          borderColor: 'rgba(239,68,68,0.3)',
+                        }}
+                        onClick={() => setConfirmTicker(pos.ticker)}
+                        disabled={sellingTicker !== null}
+                      >
+                        Sell
+                      </button>
                     )}
                   </td>
                 </tr>
