@@ -400,6 +400,117 @@ def _place_buy_orders(db, client: IBKRClient, picks: list[dict], budgets: list[f
 # Deferred buy — waits for market open, then places queued orders
 # ---------------------------------------------------------------------------
 
+def job_deferred_sell_single(ticker: str, trading_mode: str) -> None:
+    """
+    Called in a background thread when a manual sell is triggered outside market hours.
+    Sleeps until NYSE opens (09:30 ET, next weekday), then sells all shares of the
+    given ticker. A fresh DB session and IBKR connection are opened at that point.
+    """
+    wait_secs = seconds_until_market_open()
+    if wait_secs > 0:
+        open_et = datetime.now(_ET) + timedelta(seconds=wait_secs)
+        logger.info(
+            "Deferred sell (%s): market is closed. Sleeping %.0f s until %s ET.",
+            ticker, wait_secs, open_et.strftime("%Y-%m-%d %H:%M"),
+        )
+        db_notify = SessionLocal()
+        try:
+            log_event(
+                db_notify, "sell",
+                f"⏳ Sell order for {ticker} deferred — market is closed. "
+                f"Will execute at {open_et.strftime('%Y-%m-%d %H:%M ET')}."
+            )
+        finally:
+            db_notify.close()
+
+        time.sleep(wait_secs)
+
+    db = SessionLocal()
+    try:
+        # Re-check settings haven't been changed while we waited
+        trader_enabled = get_setting(db, "trader_enabled", "true")
+        if trader_enabled.lower() != "true":
+            log_event(db, "system", f"Trader disabled — cancelling deferred sell for {ticker}.")
+            return
+
+        log_event(db, "sell",
+                  f"🔔 Market opened — placing deferred sell order for {ticker}.")
+
+        client = IBKRClient(trading_mode=trading_mode)
+        if not client.connect():
+            log_event(db, "ibkr",
+                      f"Deferred sell ({ticker}): failed to connect to IB Gateway at market open.", "ERROR")
+            return
+
+        client.start_keepalive(interval=30)
+
+        # Find the live position for this ticker
+        live_positions = client.get_positions()
+        target_pos = None
+        for pos in live_positions:
+            if pos["ticker"] == ticker:
+                target_pos = pos
+                break
+
+        if not target_pos or target_pos["shares"] <= 0:
+            log_event(db, "sell",
+                      f"⚠️ Deferred sell ({ticker}): no live position found in IBKR. "
+                      f"The position may have already been sold.", "WARNING")
+            client.disconnect()
+            return
+
+        live_shares = target_pos["shares"]
+        result = client.place_sell_order(ticker, live_shares)
+
+        if result.get("success"):
+            sell_price = result["price"]
+            sell_fees = result.get("fees", 0.0)
+
+            trade = (
+                db.query(Trade)
+                .filter(
+                    Trade.ticker == ticker,
+                    Trade.status.in_(["open", "sold_half"]),
+                    Trade.mode == trading_mode,
+                )
+                .order_by(Trade.buy_time.desc())
+                .first()
+            )
+            if trade:
+                buy_price = trade.buy_price or 0.0
+                partial_already_realised = trade.realised_partial_pnl or 0.0
+                remaining_pnl = (sell_price - buy_price) * live_shares
+                total_pnl = remaining_pnl + partial_already_realised
+                original_cost = buy_price * trade.shares if trade.shares else 1
+                pnl_pct = (total_pnl / original_cost * 100) if original_cost else 0.0
+
+                trade.sell_price = sell_price
+                trade.sell_time = datetime.now(timezone.utc)
+                trade.status = "closed"
+                trade.pnl = round(total_pnl, 2)
+                trade.pnl_pct = round(pnl_pct, 2)
+                trade.fees = round((trade.fees or 0.0) + sell_fees, 4)
+                db.commit()
+
+            emoji = "🟢" if (trade and (trade.pnl or 0) >= 0) else "🔴"
+            log_event(db, "sell",
+                      f"{emoji} Deferred sell filled: sold {live_shares} shares of {ticker} "
+                      f"@ ${sell_price:.2f} | Fees: ${sell_fees:.2f}")
+        else:
+            log_event(db, "sell",
+                      f"❌ Deferred sell failed for {ticker}: {result.get('error')}", "ERROR")
+
+        client.disconnect()
+    except Exception as e:
+        logger.exception("Deferred sell job crashed (%s): %s", ticker, e)
+        try:
+            log_event(db, "system", f"Deferred sell crashed ({ticker}): {e}", "ERROR")
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
 def job_deferred_buy(picks: list[dict], budgets: list[float], trading_mode: str) -> None:
     """
     Called in a background thread when a manual scan is triggered outside market hours.

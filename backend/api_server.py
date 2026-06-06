@@ -604,7 +604,145 @@ def sell_all_ibkr(db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class SellStockRequest(BaseModel):
+    ticker: str
+
+
+@app.post("/api/sell-stock", dependencies=[Depends(require_auth)])
+def sell_single_stock(body: SellStockRequest, db: Session = Depends(get_db)):
+    """
+    Sells all shares of a single stock position.
+
+    - If the market is currently open: executes immediately (synchronous).
+    - If the market is closed: queues a deferred sell that will fire at NYSE open
+      (09:30 ET next weekday). Returns immediately with deferred=true.
+    """
+    from jobs import is_market_open, job_deferred_sell_single
+
+    ticker = body.ticker.upper().strip()
+    if not ticker:
+        raise HTTPException(status_code=400, detail="Ticker is required")
+
+    trading_mode = get_setting(db, "trading_mode", "paper")
+
+    if not is_market_open():
+        # Defer the sell until market opens
+        import threading
+        t = threading.Thread(
+            target=job_deferred_sell_single,
+            args=(ticker, trading_mode),
+            daemon=True,
+            name=f"deferred-sell-{ticker}",
+        )
+        t.start()
+
+        db.add(SystemLog(
+            timestamp=datetime.now(timezone.utc),
+            level="INFO",
+            category="sell",
+            message=f"📋 Manual sell for {ticker} queued — will execute at market open.",
+        ))
+        db.commit()
+
+        return {
+            "status": "deferred",
+            "ticker": ticker,
+            "deferred": True,
+            "message": (
+                f"Market is closed. Sell order for {ticker} has been queued and "
+                f"will execute automatically when NYSE opens (09:30 ET next weekday)."
+            ),
+        }
+
+    # Market is open — sell immediately
+    try:
+        client = IBKRClient(trading_mode=trading_mode)
+        connected = client.connect(retries=2, delay=3)
+        if not connected:
+            raise HTTPException(status_code=503, detail="Could not connect to IB Gateway")
+
+        positions = client.get_positions()
+        target_pos = None
+        for pos in positions:
+            if pos["ticker"] == ticker:
+                target_pos = pos
+                break
+
+        if not target_pos:
+            client.disconnect()
+            raise HTTPException(status_code=404, detail=f"No open position found for {ticker}")
+
+        live_shares = target_pos["shares"]
+        if live_shares <= 0:
+            client.disconnect()
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot sell {ticker}: non-positive share count ({live_shares})"
+            )
+
+        result = client.place_sell_order(ticker, live_shares)
+
+        if result.get("success"):
+            sell_price = result["price"]
+            sell_fees = result.get("fees", 0.0)
+
+            trade = (
+                db.query(Trade)
+                .filter(
+                    Trade.ticker == ticker,
+                    Trade.status.in_(["open", "sold_half"]),
+                    Trade.mode == trading_mode,
+                )
+                .order_by(Trade.buy_time.desc())
+                .first()
+            )
+            if trade:
+                buy_price = trade.buy_price or 0.0
+                partial_already_realised = trade.realised_partial_pnl or 0.0
+                remaining_pnl = (sell_price - buy_price) * live_shares
+                total_pnl = remaining_pnl + partial_already_realised
+                original_cost = buy_price * trade.shares if trade.shares else 1
+                pnl_pct = (total_pnl / original_cost * 100) if original_cost else 0.0
+
+                trade.sell_price = sell_price
+                trade.sell_time = datetime.now(timezone.utc)
+                trade.status = "closed"
+                trade.pnl = round(total_pnl, 2)
+                trade.pnl_pct = round(pnl_pct, 2)
+                trade.fees = round((trade.fees or 0.0) + sell_fees, 4)
+                db.commit()
+
+        level = "INFO" if result.get("success") else "ERROR"
+        msg = (
+            f"✅ Manual sell: sold {result.get('shares')} shares of {ticker} @ ${result.get('price', 0):.2f}"
+            if result.get("success")
+            else f"❌ Manual sell failed for {ticker}: {result.get('error')}"
+        )
+        db.add(SystemLog(
+            timestamp=datetime.now(timezone.utc),
+            level=level,
+            category="sell",
+            message=msg,
+        ))
+        db.commit()
+
+        client.disconnect()
+        return {
+            "status": "ok" if result.get("success") else "error",
+            "ticker": ticker,
+            "deferred": False,
+            "result": result,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"sell-stock error ({ticker}): {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ─── P&L History ───────────────────────────────────────────────────────────
+
 @app.get("/api/pnl-history", dependencies=[Depends(require_auth)])
 def get_pnl_history(db: Session = Depends(get_db)):
     """
