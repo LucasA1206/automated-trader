@@ -452,7 +452,7 @@ def job_deferred_sell_single(ticker: str, trading_mode: str) -> None:
                 target_pos = pos
                 break
 
-        if not target_pos or target_pos["shares"] <= 0:
+        if not target_pos or target_pos["shares"] == 0:
             log_event(db, "sell",
                       f"⚠️ Deferred sell ({ticker}): no live position found in IBKR. "
                       f"The position may have already been sold.", "WARNING")
@@ -460,6 +460,7 @@ def job_deferred_sell_single(ticker: str, trading_mode: str) -> None:
             return
 
         live_shares = target_pos["shares"]
+        # place_sell_order auto-routes to buy-to-cover if live_shares < 0 (short position)
         result = client.place_sell_order(ticker, live_shares)
 
         if result.get("success"):
@@ -726,17 +727,19 @@ def job_afternoon_sell():
 
         for position in live_positions:
             ticker = position["ticker"]
-            live_shares = position["shares"]  # Actual shares currently held (may be halved)
+            live_shares = position["shares"]  # may be negative for short positions
 
-            # Guard: skip short or zero positions
-            if live_shares <= 0:
+            is_short = live_shares < 0
+            order_desc = f"BUY-TO-COVER {abs(live_shares)}" if is_short else f"SELL {live_shares}"
+
+            if live_shares == 0:
                 log_event(db, "sell",
-                          f"⚠️ Skipping {ticker} in afternoon sell — live shares is "
-                          f"{live_shares} (short or zero position).")
+                          f"⚠️ Skipping {ticker} in afternoon sell — zero share count.")
                 continue
 
             log_event(db, "sell",
-                      f"Placing SELL order for {live_shares} shares of {ticker}...")
+                      f"Placing {order_desc} order for {ticker}...")
+            # place_sell_order transparently handles short positions (negative shares)
             result = client.place_sell_order(ticker, live_shares)
 
             if result["success"]:
@@ -852,12 +855,10 @@ def job_monitor_swing_trades():
             if not buy_price:
                 continue
 
-            # Guard: skip short or zero positions — selling these would
-            # flip the order direction at IBKR (SELL -N = BUY N).
-            if live_shares <= 0:
+            # Guard: skip zero positions — selling zero is a no-op.
+            if live_shares == 0:
                 log_event(db, "sell",
-                          f"⚠️ Skipping {ticker} — live shares is {live_shares} "
-                          f"(short or zero position, not a valid sell target).")
+                          f"⚠️ Skipping {ticker} — live shares is 0 (nothing to close).")
                 continue
 
             # Guard: re-read the trade from the DB in case a concurrent

@@ -534,18 +534,19 @@ def sell_all_ibkr(db: Session = Depends(get_db)):
             ticker = pos["ticker"]
             live_shares = pos["shares"]
 
-            # Guard: skip short or zero positions
-            if live_shares <= 0:
+            # Skip zero positions — nothing to do.
+            if live_shares == 0:
                 logger.warning(
-                    "[SELL-ALL] Skipping %s — live shares is %s "
-                    "(short or zero position).", ticker, live_shares)
+                    "[SELL-ALL] Skipping %s — zero share count.", ticker)
                 results.append({
                     "success": False, "ticker": ticker,
-                    "error": f"Skipped: non-positive share count ({live_shares})"
+                    "error": "Skipped: zero share count"
                 })
                 continue
 
-            logger.info(f"[SELL-ALL] Placing sell order for {live_shares} shares of {ticker}...")
+            action = "BUY-TO-COVER" if live_shares < 0 else "SELL"
+            logger.info(f"[SELL-ALL] Placing {action} order for {abs(live_shares)} shares of {ticker}...")
+            # place_sell_order handles negative shares (short positions) transparently
             result = client.place_sell_order(ticker, live_shares)
             results.append(result)
 
@@ -673,12 +674,14 @@ def sell_single_stock(body: SellStockRequest, db: Session = Depends(get_db)):
             raise HTTPException(status_code=404, detail=f"No open position found for {ticker}")
 
         live_shares = target_pos["shares"]
-        if live_shares <= 0:
+        # Zero means nothing to close
+        if live_shares == 0:
             client.disconnect()
             raise HTTPException(
                 status_code=400,
-                detail=f"Cannot sell {ticker}: non-positive share count ({live_shares})"
+                detail=f"Cannot close {ticker}: zero share count"
             )
+        # Negative shares = short position — place_sell_order routes to buy-to-cover automatically
 
         result = client.place_sell_order(ticker, live_shares)
 
