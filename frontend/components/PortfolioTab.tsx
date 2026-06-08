@@ -715,19 +715,33 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
               </tr>
             </thead>
             <tbody>
-              {positions.map((pos) => (
+              {positions.map((pos) => {
+                const isShort = pos.shares < 0;
+                return (
                 <tr key={pos.ticker}>
                   <td className="ticker">{pos.ticker}</td>
                   <td>
-                    <span className={`badge ${pos.trade_status === 'sold_half' ? 'sold-half' : 'open'}`}>
-                      {pos.trade_status === 'sold_half' ? '½ Sold' : '● Open'}
-                    </span>
+                    {isShort ? (
+                      <span className="badge" style={{
+                        background: 'rgba(139,92,246,0.15)',
+                        color: '#a78bfa',
+                        border: '1px solid rgba(139,92,246,0.3)',
+                      }}>
+                        ⬇ SHORT
+                      </span>
+                    ) : (
+                      <span className={`badge ${pos.trade_status === 'sold_half' ? 'sold-half' : 'open'}`}>
+                        {pos.trade_status === 'sold_half' ? '½ Sold' : '● Open'}
+                      </span>
+                    )}
                   </td>
-                  <td className="mono">{pos.shares.toLocaleString()}</td>
+                  <td className="mono" style={{ color: isShort ? '#a78bfa' : undefined }}>
+                    {isShort ? `${pos.shares.toLocaleString()} (short)` : pos.shares.toLocaleString()}
+                  </td>
                   <td className="mono">{fmt(pos.avg_cost)}</td>
                   <td className="mono">{fmt(pos.current_price)}</td>
                   <td className="mono">
-                    {fmt(pos.market_value * usdToAud, 'A$')}
+                    {fmt(Math.abs(pos.market_value) * usdToAud, isShort ? '-A$' : 'A$')}
                     <AudLabel fxData={fxData} />
                   </td>
                   <PnlCell val={pos.pnl} pct={pos.pnl_pct} />
@@ -771,18 +785,20 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
                         className="btn btn-outline"
                         style={{
                           padding: '4px 12px', fontSize: 11, fontWeight: 600,
-                          borderRadius: 6, color: 'var(--accent-red)',
-                          borderColor: 'rgba(239,68,68,0.3)',
+                          borderRadius: 6,
+                          color: isShort ? '#a78bfa' : 'var(--accent-red)',
+                          borderColor: isShort ? 'rgba(139,92,246,0.3)' : 'rgba(239,68,68,0.3)',
                         }}
                         onClick={() => setConfirmTicker(pos.ticker)}
                         disabled={sellingTicker !== null}
                       >
-                        Sell
+                        {isShort ? 'Close Short' : 'Sell'}
                       </button>
                     )}
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         )}

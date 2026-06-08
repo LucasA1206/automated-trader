@@ -397,18 +397,34 @@ class IBKRClient:
 
             order = MarketOrder("BUY", shares)
             trade = self.ib.placeOrder(contract, order)
-            
-            # Wait up to 10 seconds for fill
+
+            # Wait up to 30 seconds for fill.
+            # Market orders are typically filled in <1 s during market hours,
+            # but the IBKR paper gateway can be slow and sometimes routes through
+            # multiple legs.  We poll every 0.5 s and stop as soon as the order
+            # is either Filled, or terminally rejected (Cancelled/Inactive).
             filled = False
-            for _ in range(20):
+            terminal_statuses = {"Cancelled", "Inactive"}
+            for _ in range(60):   # 60 × 0.5 s = 30 s max
                 self.ib.sleep(0.5)
-                if trade.orderStatus.status == "Filled":
+                status = trade.orderStatus.status
+                if status == "Filled":
                     filled = True
                     break
-                    
+                if status in terminal_statuses:
+                    # Order was definitively rejected — no point waiting further
+                    break
+                # PreSubmitted / Submitted / PendingSubmit → still working, keep waiting
+
             if not filled:
-                self.ib.cancelOrder(order)
-                return {"success": False, "ticker": ticker, "error": f"Order did not fill. Status: {trade.orderStatus.status}"}
+                status = trade.orderStatus.status
+                # Only try to cancel if it isn't already in a terminal state
+                if status not in terminal_statuses and status != "Filled":
+                    try:
+                        self.ib.cancelOrder(order)
+                    except Exception:
+                        pass
+                return {"success": False, "ticker": ticker, "error": f"Order did not fill. Status: {status}"}
 
             fill_price = price  # fallback
             fees = 0.0
@@ -435,24 +451,29 @@ class IBKRClient:
 
     def place_sell_order(self, ticker: str, shares: float) -> dict:
         """
-        Places a market sell order for the given ticker and number of shares.
+        Places a market SELL order (long position close) for the given ticker.
+
+        If `shares` is negative this is a short position — the method
+        automatically routes to place_buy_to_cover_order() so the caller
+        never has to distinguish between the two cases.
+
         Returns fill price.
         """
+        # Short-position guard: negative shares means we are short — close by buying.
+        if shares < 0:
+            logger.info(
+                "place_sell_order(%s): detected short position (%s shares). "
+                "Routing to buy-to-cover.",
+                ticker, shares,
+            )
+            return self.place_buy_to_cover_order(ticker, abs(shares))
+
         try:
-            # Guard: ensure share quantity is always positive.
-            # A negative value would flip the order direction at IBKR (SELL -N = BUY N).
-            raw_shares = shares
-            shares = abs(int(shares))
+            shares = int(shares)
             if shares <= 0:
-                msg = f"Invalid share quantity for {ticker}: raw={raw_shares}, resolved={shares}"
+                msg = f"Invalid share quantity for {ticker}: resolved={shares}"
                 logger.error(msg)
                 return {"success": False, "ticker": ticker, "error": msg}
-            if raw_shares < 0:
-                logger.warning(
-                    "place_sell_order(%s): received negative shares (%s), "
-                    "using abs value %d. This indicates a short position or upstream bug.",
-                    ticker, raw_shares, shares,
-                )
 
             if not self.ib.isConnected():
                 self.connect()
@@ -462,18 +483,27 @@ class IBKRClient:
 
             order = MarketOrder("SELL", shares)
             trade = self.ib.placeOrder(contract, order)
-            
-            # Wait up to 10 seconds for fill
+
+            # Wait up to 30 seconds for fill (same logic as place_buy_order).
             filled = False
-            for _ in range(20):
+            terminal_statuses = {"Cancelled", "Inactive"}
+            for _ in range(60):   # 60 × 0.5 s = 30 s max
                 self.ib.sleep(0.5)
-                if trade.orderStatus.status == "Filled":
+                status = trade.orderStatus.status
+                if status == "Filled":
                     filled = True
                     break
-                    
+                if status in terminal_statuses:
+                    break
+
             if not filled:
-                self.ib.cancelOrder(order)
-                return {"success": False, "ticker": ticker, "error": f"Order did not fill. Status: {trade.orderStatus.status}"}
+                status = trade.orderStatus.status
+                if status not in terminal_statuses and status != "Filled":
+                    try:
+                        self.ib.cancelOrder(order)
+                    except Exception:
+                        pass
+                return {"success": False, "ticker": ticker, "error": f"Order did not fill. Status: {status}"}
 
             fill_price = 0.0
             fees = 0.0
@@ -502,4 +532,84 @@ class IBKRClient:
             }
         except Exception as e:
             logger.error(f"Sell order failed for {ticker}: {e}")
+            return {"success": False, "ticker": ticker, "error": str(e)}
+
+    def place_buy_to_cover_order(self, ticker: str, shares: float) -> dict:
+        """
+        Closes a short position by placing a BUY order for `shares` shares.
+
+        This is the mirror image of place_sell_order().  Call this directly
+        when you know the position is short, or let place_sell_order() route
+        here automatically when it receives a negative share count.
+        """
+        try:
+            shares = int(abs(shares))   # safety — always positive
+            if shares <= 0:
+                msg = f"Invalid share quantity for {ticker}: resolved={shares}"
+                logger.error(msg)
+                return {"success": False, "ticker": ticker, "error": msg}
+
+            if not self.ib.isConnected():
+                self.connect()
+
+            contract = Stock(ticker, "SMART", "USD")
+            self.ib.qualifyContracts(contract)
+
+            # BUY order to close the short
+            order = MarketOrder("BUY", shares)
+            trade = self.ib.placeOrder(contract, order)
+
+            # Wait up to 30 seconds for fill
+            filled = False
+            terminal_statuses = {"Cancelled", "Inactive"}
+            for _ in range(60):   # 60 × 0.5 s = 30 s max
+                self.ib.sleep(0.5)
+                status = trade.orderStatus.status
+                if status == "Filled":
+                    filled = True
+                    break
+                if status in terminal_statuses:
+                    break
+
+            if not filled:
+                status = trade.orderStatus.status
+                if status not in terminal_statuses and status != "Filled":
+                    try:
+                        self.ib.cancelOrder(order)
+                    except Exception:
+                        pass
+                return {"success": False, "ticker": ticker, "error": f"Buy-to-cover did not fill. Status: {status}"}
+
+            fill_price = 0.0
+            fees = 0.0
+            if trade.fills:
+                fill_price = safe_float(trade.fills[-1].execution.price)
+                fees = sum(
+                    safe_float(f.commissionReport.commission)
+                    for f in trade.fills
+                    if getattr(f, 'commissionReport', None) and getattr(f.commissionReport, 'commission', None) is not None
+                )
+            else:
+                self.ib.reqMarketDataType(3)
+                mkt = self.ib.reqMktData(contract, "", True, False)
+                self.ib.sleep(2)
+                fill_price = safe_float(mkt.last) or safe_float(mkt.close)
+                self.ib.cancelMktData(contract)
+
+            logger.info(
+                "buy-to-cover filled: %s x %d @ %.4f",
+                ticker, shares, fill_price,
+            )
+            return {
+                "success": True,
+                "ticker": ticker,
+                "shares": shares,
+                "price": round(fill_price, 4),
+                "fees": round(fees, 4),
+                # positive = cash paid to close the short (cost not proceeds)
+                "total_proceeds": round(fill_price * shares, 2),
+                "order_type": "buy_to_cover",
+            }
+        except Exception as e:
+            logger.error(f"Buy-to-cover failed for {ticker}: {e}")
             return {"success": False, "ticker": ticker, "error": str(e)}
