@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from database import get_db, init_db, get_setting, set_setting, SessionLocal
-from models import Trade, SystemLog, Setting, AIPick
+from models import Trade, SystemLog, Setting, AIPick, AccountSnapshot
 from scheduler import create_scheduler, get_next_job_times
 from trader import IBKRClient
 from auth import require_auth, validate_credentials, create_access_token
@@ -746,60 +746,130 @@ def sell_single_stock(body: SellStockRequest, db: Session = Depends(get_db)):
 
 # ─── P&L History ───────────────────────────────────────────────────────────
 
+# Starting capital in AUD (A$7,900 deposited at account open)
+STARTING_CAPITAL_AUD = 7_900.0
+
+
 @app.get("/api/pnl-history", dependencies=[Depends(require_auth)])
 def get_pnl_history(db: Session = Depends(get_db)):
     """
-    Returns daily realized P&L from closed trades, cumulative P&L over time,
-    and the all-time realized P&L total.
+    Returns daily and cumulative P&L from either:
+      1. AccountSnapshot records (preferred) — computes P&L from actual daily
+         NetLiquidation movements, so the chart truly reflects account performance.
+      2. DB closed-trade records (fallback) — used for days before snapshots
+         started being collected.
 
-    Includes realised_partial_pnl in all totals so partial sells are never lost.
+    Cumulative P&L is always relative to the A$7,900 starting capital.
+    The 'daily_pnl' field is that day's gain/loss only (not running total).
+    The 'cumulative_pnl' field is the running sum from starting capital.
     """
     trading_mode = get_setting(db, "trading_mode", "paper")
 
-    # All closed trades with a sell_time and pnl in current mode
+    # ── 1. Snapshot-based data (preferred) ────────────────────────────────────
+    snapshots = (
+        db.query(AccountSnapshot)
+        .order_by(AccountSnapshot.date.asc())
+        .all()
+    )
+
+    # ── 2. Fallback: trade-based data for days without snapshots ───────────────
     closed_trades = (
         db.query(Trade)
-        .filter(Trade.status == "closed", Trade.sell_time.isnot(None), Trade.pnl.isnot(None), Trade.mode == trading_mode)
+        .filter(
+            Trade.status == "closed",
+            Trade.sell_time.isnot(None),
+            Trade.pnl.isnot(None),
+            Trade.mode == trading_mode,
+        )
         .order_by(Trade.sell_time.asc())
         .all()
     )
 
     from collections import defaultdict
-    daily: dict[str, float] = defaultdict(float)
-    daily_cost: dict[str, float] = defaultdict(float)
-    daily_fees: dict[str, float] = defaultdict(float)
+    daily_trade: dict[str, float] = defaultdict(float)
+    daily_trade_cost: dict[str, float] = defaultdict(float)
+    daily_trade_fees: dict[str, float] = defaultdict(float)
     for t in closed_trades:
         day = t.sell_time.strftime("%Y-%m-%d")
-        daily[day] += t.pnl  # t.pnl already includes realised_partial_pnl (fixed in jobs.py)
-        daily_fees[day] += (t.fees or 0.0)
+        daily_trade[day] += t.pnl
+        daily_trade_fees[day] += (t.fees or 0.0)
         if t.buy_price is not None and t.shares is not None:
-            daily_cost[day] += (t.buy_price * t.shares)
+            daily_trade_cost[day] += (t.buy_price * t.shares)
 
-    sorted_days = sorted(daily.keys())
-    cumulative = 0.0
-    cumulative_cost = 0.0
-    cumulative_fees = 0.0
+    # Days covered by snapshots
+    snapshot_dates = {str(s.date) for s in snapshots}
+
+    # ── Build the chart data ───────────────────────────────────────────────────
     chart_data = []
-    for day in sorted_days:
-        cumulative += daily[day]
-        cumulative_cost += daily_cost[day]
-        cumulative_fees += daily_fees[day]
 
-        day_pnl  = daily[day]
-        day_fees = daily_fees[day]
-        day_cost = daily_cost[day]
-        daily_pct     = (day_pnl  / day_cost       * 100) if day_cost       > 0 else 0.0
-        cumulative_pct = (cumulative / cumulative_cost * 100) if cumulative_cost > 0 else 0.0
+    # --- Snapshot-based segment ---
+    if snapshots:
+        # Determine baseline for the very first snapshot.
+        # We convert A$7,900 to USD using the FX rate stored in the first snapshot
+        # (or a fallback of 1.55 if not available).
+        first_fx = snapshots[0].fx_rate or 1.55
+        starting_capital_usd = STARTING_CAPITAL_AUD / first_fx
 
-        chart_data.append({
-            "date": day,
-            "daily_pnl": round(day_pnl, 2),
-            "cumulative_pnl": round(cumulative, 2),
-            "daily_pct": round(daily_pct, 2),
-            "cumulative_pct": round(cumulative_pct, 2),
-            "daily_fees": round(day_fees, 2),
-            "cumulative_fees": round(cumulative_fees, 2),
-        })
+        prev_net_liq = starting_capital_usd
+        cumulative = 0.0
+
+        for snap in snapshots:
+            day = str(snap.date)
+            daily_pnl = snap.net_liq_usd - prev_net_liq
+            cumulative += daily_pnl
+
+            # Percentage calculations
+            daily_pct = (daily_pnl / prev_net_liq * 100) if prev_net_liq > 0 else 0.0
+            cumulative_pct = (cumulative / starting_capital_usd * 100) if starting_capital_usd > 0 else 0.0
+
+            # Include fees from trade records for this day (if any)
+            day_fees = daily_trade_fees.get(day, 0.0)
+
+            chart_data.append({
+                "date": day,
+                "daily_pnl": round(daily_pnl, 2),
+                "cumulative_pnl": round(cumulative, 2),
+                "net_liq_usd": round(snap.net_liq_usd, 2),
+                "daily_pct": round(daily_pct, 2),
+                "cumulative_pct": round(cumulative_pct, 2),
+                "daily_fees": round(day_fees, 2),
+                "cumulative_fees": 0.0,  # not tracked cumulatively in snapshot mode
+                "source": "snapshot",
+            })
+
+            prev_net_liq = snap.net_liq_usd
+
+    # --- Trade-based fallback for days NOT covered by snapshots ---
+    fallback_days = sorted(d for d in daily_trade.keys() if d not in snapshot_dates)
+    if fallback_days:
+        # Cumulative offset: if we have snapshot data, the fallback days are
+        # all in the past (before snapshots started), so prepend them.
+        # Compute their own running cumulative from zero (relative to position cost).
+        fallback_cumulative = 0.0
+        fallback_cumulative_cost = 0.0
+        fallback_points = []
+        for day in fallback_days:
+            day_pnl = daily_trade[day]
+            day_fees = daily_trade_fees[day]
+            day_cost = daily_trade_cost[day]
+            fallback_cumulative += day_pnl
+            fallback_cumulative_cost += day_cost
+            daily_pct = (day_pnl / day_cost * 100) if day_cost > 0 else 0.0
+            cumulative_pct = (fallback_cumulative / fallback_cumulative_cost * 100) if fallback_cumulative_cost > 0 else 0.0
+            fallback_points.append({
+                "date": day,
+                "daily_pnl": round(day_pnl, 2),
+                "cumulative_pnl": round(fallback_cumulative, 2),
+                "net_liq_usd": None,
+                "daily_pct": round(daily_pct, 2),
+                "cumulative_pct": round(cumulative_pct, 2),
+                "daily_fees": round(day_fees, 2),
+                "cumulative_fees": round(sum(daily_trade_fees[d] for d in fallback_days if d <= day), 2),
+                "source": "trades",
+            })
+
+        # Prepend fallback points before snapshot points (they're older dates)
+        chart_data = fallback_points + chart_data
 
     all_time_realized = round(sum(t.pnl for t in closed_trades), 2)
     all_time_fees = round(sum((t.fees or 0.0) for t in closed_trades), 2)
@@ -815,7 +885,17 @@ def get_pnl_history(db: Session = Depends(get_db)):
         "winning_trades": winners,
         "losing_trades": losers,
         "all_time_fees": all_time_fees,
+        "has_snapshots": len(snapshots) > 0,
     }
+
+
+@app.post("/api/trigger-snapshot", dependencies=[Depends(require_auth)])
+def trigger_snapshot(background_tasks: BackgroundTasks):
+    """Manually triggers a NetLiquidation snapshot (useful for testing or if the
+    scheduled job was missed). Runs in the background."""
+    from jobs import job_snapshot_net_liq
+    background_tasks.add_task(job_snapshot_net_liq)
+    return {"status": "triggered", "message": "NetLiq snapshot job started in background."}
 
 
 # ─── Entrypoint ───────────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Boolean, Date
+from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Boolean, Date, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from datetime import datetime, timezone
 
@@ -77,3 +77,25 @@ class Setting(Base):
 
     def __repr__(self):
         return f"<Setting {self.key}={self.value}>"
+
+
+class AccountSnapshot(Base):
+    """Daily end-of-day NetLiquidation snapshot.
+
+    One row per calendar day (enforced by unique constraint on `date`).
+    Captured by job_snapshot_net_liq() at ~15:45 ET after positions are sold.
+    Used to compute the P&L Over Time chart from real account value movements
+    rather than relying on the DB trade P&L fields.
+    """
+    __tablename__ = "account_snapshots"
+    __table_args__ = (UniqueConstraint("date", name="uq_account_snapshots_date"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(Date, nullable=False, index=True)
+    net_liq_usd = Column(Float, nullable=False)
+    net_liq_aud = Column(Float, nullable=True)
+    fx_rate = Column(Float, nullable=True)       # USD → AUD rate at snapshot time
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    def __repr__(self):
+        return f"<AccountSnapshot date={self.date} net_liq_usd={self.net_liq_usd}>"

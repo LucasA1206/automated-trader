@@ -2,7 +2,8 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text
-from models import Base, Setting
+from models import Base, Setting, AccountSnapshot  # noqa: F401 – AccountSnapshot triggers table creation
+
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./blitz_trader.db")
 

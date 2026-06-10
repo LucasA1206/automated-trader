@@ -14,7 +14,7 @@ def create_scheduler() -> BackgroundScheduler:
     Creates and configures the APScheduler instance.
     Jobs run in Eastern Time (NYSE market hours).
     """
-    from jobs import job_morning_scan_and_buy, job_afternoon_sell
+    from jobs import job_morning_scan_and_buy, job_afternoon_sell, job_snapshot_net_liq
 
     scheduler = BackgroundScheduler(timezone=ET)
 
@@ -39,13 +39,29 @@ def create_scheduler() -> BackgroundScheduler:
     scheduler.add_job(
         func=job_afternoon_sell,
         trigger=CronTrigger(
-            day_of_week="fri",
+            day_of_week="mon-fri",
             hour=15,
             minute=30,
             timezone=ET,
         ),
         id="afternoon_sell",
         name="Afternoon Sell-All",
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
+
+    # 15:45 ET Mon-Fri — capture end-of-day NetLiquidation snapshot
+    # Runs 15 minutes after the sell-all so positions are settled.
+    scheduler.add_job(
+        func=job_snapshot_net_liq,
+        trigger=CronTrigger(
+            day_of_week="mon-fri",
+            hour=15,
+            minute=45,
+            timezone=ET,
+        ),
+        id="snapshot_net_liq",
+        name="Daily NetLiq Snapshot",
         replace_existing=True,
         misfire_grace_time=300,
     )

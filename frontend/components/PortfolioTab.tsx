@@ -58,10 +58,12 @@ interface DailyPnlPoint {
   date: string;
   daily_pnl: number;
   cumulative_pnl: number;
+  net_liq_usd?: number | null;
   daily_pct?: number;
   cumulative_pct?: number;
   daily_fees?: number;
   cumulative_fees?: number;
+  source?: 'snapshot' | 'trades';
 }
 
 interface PnlHistory {
@@ -71,6 +73,7 @@ interface PnlHistory {
   winning_trades: number;
   losing_trades: number;
   all_time_fees?: number;
+  has_snapshots?: boolean;
 }
 
 interface ExchangeRateData {
@@ -118,12 +121,17 @@ function PnlCell({ val, pct }: { val: number; pct: number }) {
 
 // ─── Custom Chart Tooltip ─────────────────────────────────────────────────────
 
-function ChartTooltip({ active, payload, label }: {
+function ChartTooltip({ active, payload, label, chartMode }: {
   active?: boolean;
   payload?: { value: number; name: string; color: string; payload: DailyPnlPoint }[];
   label?: string;
+  chartMode?: ChartMode;
 }) {
   if (!active || !payload || !payload.length) return null;
+  const p = payload[0];
+  const point = p.payload;
+  const isSnapshot = point.source === 'snapshot';
+
   return (
     <div style={{
       background: 'rgba(13,20,32,0.95)',
@@ -132,48 +140,68 @@ function ChartTooltip({ active, payload, label }: {
       padding: '10px 14px',
       backdropFilter: 'blur(12px)',
       boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+      minWidth: 180,
     }}>
       <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>
         {label ? fmtDate(label) : ''}
+        {isSnapshot && (
+          <span style={{ marginLeft: 6, fontSize: 10, color: 'var(--accent-blue)', opacity: 0.7 }}>● live</span>
+        )}
       </div>
-      {payload.map((p, i) => {
-        const isPos = p.value >= 0;
-        const isDaily = p.name === 'daily_pnl';
-        const pct = isDaily ? p.payload.daily_pct : p.payload.cumulative_pct;
-        const pctStr = pct !== undefined ? ` (${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%)` : '';
-        const fees = isDaily ? (p.payload.daily_fees || 0) : (p.payload.cumulative_fees || 0);
 
-        if (isDaily) {
-          const dayGross = p.value + fees;
-          return (
-            <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: dayGross >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
-                Day: {fmtSigned(dayGross)}{pctStr}
-              </div>
-              <div style={{ fontSize: 13, fontWeight: 600, color: p.value >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
-                Profit: {fmtSigned(p.value)}
-              </div>
-              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
-                Fees: {fmt(fees)}
-              </div>
+      {chartMode === 'cumulative' ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          {/* Running gain/loss from starting capital */}
+          <div style={{ fontSize: 13, fontWeight: 600, color: p.value >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
+            Total Change: {fmtSigned(p.value)}
+            {point.cumulative_pct !== undefined && (
+              <span style={{ fontSize: 11, opacity: 0.75 }}> ({point.cumulative_pct >= 0 ? '+' : ''}{point.cumulative_pct.toFixed(2)}%)</span>
+            )}
+          </div>
+          {/* Actual portfolio value (snapshot mode only) */}
+          {isSnapshot && point.net_liq_usd != null && (
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', fontFamily: "'JetBrains Mono', monospace" }}>
+              Portfolio: {fmt(point.net_liq_usd)} USD
             </div>
-          );
-        } else {
-          return (
-            <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: isPos ? 'var(--accent-green)' : 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
-                Total: {fmtSigned(p.value)}{pctStr}
-              </div>
-              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
-                Fees: {fmt(fees)}
-              </div>
+          )}
+          {/* Day's move */}
+          <div style={{ fontSize: 12, color: point.daily_pnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', opacity: 0.8, fontFamily: "'JetBrains Mono', monospace" }}>
+            Day: {fmtSigned(point.daily_pnl)}
+            {point.daily_pct !== undefined && (
+              <span style={{ fontSize: 11, opacity: 0.75 }}> ({point.daily_pct >= 0 ? '+' : ''}{point.daily_pct.toFixed(2)}%)</span>
+            )}
+          </div>
+          {(point.daily_fees ?? 0) > 0 && (
+            <div style={{ fontSize: 11, color: 'var(--accent-red)', opacity: 0.7, fontFamily: "'JetBrains Mono', monospace" }}>
+              Fees: {fmt(point.daily_fees ?? 0)}
             </div>
-          );
-        }
-      })}
+          )}
+        </div>
+      ) : (
+        // Daily mode — just show that day's gain/loss
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: p.value >= 0 ? 'var(--accent-green)' : 'var(--accent-red)', fontFamily: "'JetBrains Mono', monospace" }}>
+            Day's Change: {fmtSigned(p.value)}
+            {point.daily_pct !== undefined && (
+              <span style={{ fontSize: 11, opacity: 0.75 }}> ({point.daily_pct >= 0 ? '+' : ''}{point.daily_pct.toFixed(2)}%)</span>
+            )}
+          </div>
+          {isSnapshot && point.net_liq_usd != null && (
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', fontFamily: "'JetBrains Mono', monospace" }}>
+              Portfolio: {fmt(point.net_liq_usd)} USD
+            </div>
+          )}
+          {(point.daily_fees ?? 0) > 0 && (
+            <div style={{ fontSize: 11, color: 'var(--accent-red)', opacity: 0.7, fontFamily: "'JetBrains Mono', monospace" }}>
+              Fees: {fmt(point.daily_fees ?? 0)}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
+
 
 // ─── AUD Freshness Label ──────────────────────────────────────────────────────
 
@@ -622,7 +650,7 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
                   tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
                   axisLine={false} tickLine={false} width={72}
                 />
-                <Tooltip content={<ChartTooltip />} />
+                <Tooltip content={<ChartTooltip chartMode={chartMode} />} />
                 <ReferenceLine y={0} stroke="rgba(255,255,255,0.12)" strokeDasharray="4 4" />
                 <Area
                   type="monotone"

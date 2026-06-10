@@ -3,7 +3,7 @@ import threading
 import time
 from datetime import datetime, timezone, timedelta
 from database import SessionLocal, get_setting
-from models import Trade, SystemLog, AIPick
+from models import Trade, SystemLog, AIPick, AccountSnapshot
 from ai_analyst import run_daily_scan, verify_ticker_momentum
 from trader import IBKRClient
 
@@ -141,6 +141,49 @@ def _reconcile_stale_db_trades(db, live_tickers: set[str], log_fn) -> None:
             log_fn(db, "sell",
                    f"⚠️ Reconciled stale DB record for {trade.ticker} "
                    f"(marked closed — not found in live IBKR positions).")
+
+
+def _sync_untracked_ibkr_positions(db, live_positions: list[dict], trading_mode: str, log_fn) -> None:
+    """Ensure every live IBKR position has a matching open Trade in the DB.
+
+    If a position exists in IBKR but not the DB (e.g. the buy order was marked
+    'cancelled' due to a timeout but actually filled — a known IBKR paper bug),
+    a synthetic Trade record is inserted so that the monitor and sell jobs can
+    apply take-profit / stop-loss and properly record P&L.
+    """
+    open_tickers = set(
+        t.ticker for t in db.query(Trade).filter(
+            Trade.status.in_(["open", "sold_half", "closing"]),
+            Trade.mode == trading_mode,
+        ).all()
+    )
+    for pos in live_positions:
+        ticker = pos["ticker"]
+        if ticker in open_tickers:
+            continue
+        # This position is live in IBKR but has no DB record — create one.
+        avg_cost = pos.get("avg_cost") or pos.get("current_price", 0)
+        shares = pos.get("shares", 0)
+        if shares == 0:
+            continue
+        ghost_trade = Trade(
+            ticker=ticker,
+            shares=shares,
+            buy_price=avg_cost,
+            buy_time=datetime.now(timezone.utc),
+            status="open",
+            mode=trading_mode,
+            fees=0.0,
+            realised_partial_pnl=0.0,
+            ai_reason="[Auto-registered: position found in IBKR but missing from DB]",
+        )
+        db.add(ghost_trade)
+        db.commit()
+        log_fn(db, "system",
+               f"⚠️ Untracked IBKR position detected: {ticker} "
+               f"({shares} shares @ avg ${avg_cost:.2f}). "
+               f"Created synthetic DB record so monitoring/take-profit can track it.",
+               "WARNING")
 
 
 def _persist_ai_picks(db, recommendations: list[dict], scan_date) -> None:
@@ -719,6 +762,9 @@ def job_afternoon_sell():
                   f"Found {len(live_positions)} live position(s) in IBKR: "
                   f"{', '.join(p['ticker'] for p in live_positions)}")
 
+        # Sync any positions held in IBKR that have no DB record before selling.
+        _sync_untracked_ibkr_positions(db, live_positions, trading_mode, log_event)
+
         # Build lookup of DB open trades by ticker
         open_trades = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
         db_trades_by_ticker = {t.ticker: t for t in open_trades}
@@ -837,6 +883,10 @@ def job_monitor_swing_trades():
         client.start_keepalive(interval=30)
         live_positions = client.get_positions()
         live_tickers = {p["ticker"]: p for p in live_positions}
+
+        # Sync any positions held in IBKR that have no DB record (e.g. buy order
+        # was reported as cancelled but actually filled — common IBKR paper bug).
+        _sync_untracked_ibkr_positions(db, live_positions, trading_mode, log_event)
 
         open_trades = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
 
@@ -975,5 +1025,73 @@ def job_monitor_swing_trades():
 
     except Exception as e:
         logger.exception(f"Swing trade monitor crashed: {e}")
+    finally:
+        db.close()
+
+
+def job_snapshot_net_liq() -> None:
+    """
+    Runs at 15:45 ET Mon–Fri (15 minutes after the afternoon sell).
+
+    Captures a daily end-of-day NetLiquidation snapshot in the account_snapshots
+    table.  This data is used by /api/pnl-history to compute the P&L Over Time
+    chart from actual account-value movements rather than DB trade P&L fields.
+
+    If a snapshot for today already exists it is UPDATED (upsert) so re-runs
+    (e.g. manual triggers) always reflect the latest value.
+    """
+    db = SessionLocal()
+    try:
+        trading_mode = get_setting(db, "trading_mode", "paper")
+
+        client = IBKRClient(trading_mode=trading_mode)
+        if not client.connect():
+            log_event(db, "ibkr",
+                      "Snapshot job: could not connect to IB Gateway — skipping today's snapshot.",
+                      "WARNING")
+            return
+
+        client.start_keepalive(interval=30)
+        account = client.get_account_summary()
+        client.disconnect()
+
+        net_liq_usd = account.get("NetLiquidation", 0)
+        net_liq_aud = account.get("NetLiquidation_AUD", None)
+        # fx_rate: USD→AUD (from IBKR account data)
+        fx_rate = account.get("ExchangeRate_USD", None)
+
+        if not net_liq_usd:
+            log_event(db, "system",
+                      "Snapshot job: NetLiquidation is 0 or missing — skipping snapshot.",
+                      "WARNING")
+            return
+
+        today = datetime.now(timezone.utc).date()
+
+        # Upsert: update today's record if it already exists
+        existing = db.query(AccountSnapshot).filter(AccountSnapshot.date == today).first()
+        if existing:
+            existing.net_liq_usd = net_liq_usd
+            existing.net_liq_aud = net_liq_aud
+            existing.fx_rate = fx_rate
+        else:
+            db.add(AccountSnapshot(
+                date=today,
+                net_liq_usd=net_liq_usd,
+                net_liq_aud=net_liq_aud,
+                fx_rate=fx_rate,
+            ))
+        db.commit()
+
+        log_event(db, "system",
+                  f"📸 Daily snapshot saved: Net Liq = ${net_liq_usd:,.2f} USD"
+                  + (f" / A${net_liq_aud:,.2f} AUD" if net_liq_aud else ""))
+
+    except Exception as e:
+        logger.exception("Snapshot job crashed: %s", e)
+        try:
+            log_event(db, "system", f"Snapshot job crashed: {e}", "ERROR")
+        except Exception:
+            pass
     finally:
         db.close()
