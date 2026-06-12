@@ -892,13 +892,77 @@ def job_monitor_swing_trades():
 
         any_fully_closed = False
 
+        # ── Fetch fresh delayed tick prices for all live tickers ───────────────
+        # get_positions() uses IBKR's portfolio snapshot, where marketPrice is
+        # frequently NaN/0 (especially at market open or after a stale cache
+        # flush). safe_float() silently converts NaN → avg_cost, so
+        # current_price ends up equal to buy_price and SL/TP never triggers.
+        # We batch-request delayed tick data (type 3) for every ticker now so
+        # all threshold comparisons use a real, current market price.
+        from ib_insync import Stock as _Stock
+        fresh_prices: dict[str, float] = {}
+        tick_reqs: dict[str, object] = {}
+        try:
+            client.ib.reqMarketDataType(3)  # delayed — no live subscription needed
+            for _ticker in live_tickers:
+                try:
+                    _contract = _Stock(_ticker, "SMART", "USD")
+                    client.ib.qualifyContracts(_contract)
+                    tick_reqs[_ticker] = client.ib.reqMktData(_contract, "", False, False)
+                except Exception as _exc:
+                    logger.warning("Monitor: could not subscribe to tick data for %s: %s", _ticker, _exc)
+
+            # Wait up to 8 s for all prices to arrive
+            for _ in range(16):   # 16 × 0.5 s = 8 s
+                client.ib.sleep(0.5)
+                if all(
+                    safe_float(t.last) > 0 or safe_float(t.close) > 0
+                    for t in tick_reqs.values()
+                ):
+                    break
+
+            for _ticker, _mkt in tick_reqs.items():
+                _tick_price = safe_float(_mkt.last) or safe_float(_mkt.close)
+                _portfolio_price = live_tickers[_ticker]["current_price"]
+                if _tick_price > 0:
+                    fresh_prices[_ticker] = _tick_price
+                    if _portfolio_price > 0 and abs(_tick_price - _portfolio_price) / _portfolio_price > 0.01:
+                        logger.info(
+                            "Monitor: %s tick price $%.4f differs from portfolio snapshot $%.4f — "
+                            "using fresh tick price for SL/TP evaluation.",
+                            _ticker, _tick_price, _portfolio_price,
+                        )
+                else:
+                    # Tick unavailable — fall back to portfolio snapshot
+                    fresh_prices[_ticker] = _portfolio_price
+                    logger.warning(
+                        "Monitor: no fresh tick price for %s (last=%.4f, close=%.4f). "
+                        "Falling back to portfolio snapshot $%.4f.",
+                        _ticker, safe_float(_mkt.last), safe_float(_mkt.close), _portfolio_price,
+                    )
+
+            # Cancel all subscriptions
+            for _ticker in list(tick_reqs.keys()):
+                try:
+                    _contract = _Stock(_ticker, "SMART", "USD")
+                    client.ib.cancelMktData(_contract)
+                except Exception:
+                    pass
+        except Exception as _exc:
+            logger.warning(
+                "Monitor: fresh tick-price batch failed (%s). "
+                "Falling back to portfolio snapshot prices for all tickers.", _exc,
+            )
+            fresh_prices = {_t: _p["current_price"] for _t, _p in live_tickers.items()}
+
         for trade in open_trades:
             ticker = trade.ticker
             if ticker not in live_tickers:
                 continue
 
             pos = live_tickers[ticker]
-            current_price = pos["current_price"]
+            # Use fresh tick price; fall back to portfolio snapshot if unavailable
+            current_price = fresh_prices.get(ticker, pos["current_price"])
             live_shares = pos["shares"]
             buy_price = trade.buy_price
 
@@ -923,6 +987,12 @@ def job_monitor_swing_trades():
                 )
                 continue
 
+            pct_change = (current_price - buy_price) / buy_price * 100
+            logger.info(
+                "Monitor: %s — buy=$%.4f  current=$%.4f  change=%.2f%%",
+                ticker, buy_price, current_price, pct_change,
+            )
+
             # ── Stop Loss (>= 5% drop from buy price) ──────────────────────────
             if current_price <= buy_price * 0.95:
                 # Mark as "closing" BEFORE placing the order so concurrent runs
@@ -933,7 +1003,8 @@ def job_monitor_swing_trades():
 
                 log_event(db, "sell",
                           f"📉 Stop Loss triggered for {ticker} "
-                          f"(dropped >= 5%). Selling all {live_shares} shares.")
+                          f"(buy=${buy_price:.4f}, now=${current_price:.4f}, "
+                          f"change={pct_change:.2f}%). Selling all {live_shares} shares.")
                 result = client.place_sell_order(ticker, live_shares)
                 if result["success"]:
                     sell_price = result["price"]
@@ -976,7 +1047,8 @@ def job_monitor_swing_trades():
 
                 log_event(db, "sell",
                           f"🚀 Take Profit triggered for {ticker} "
-                          f"(rose >= 10%). Selling ALL {live_shares} shares.")
+                          f"(buy=${buy_price:.4f}, now=${current_price:.4f}, "
+                          f"change={pct_change:.2f}%). Selling ALL {live_shares} shares.")
                 result = client.place_sell_order(ticker, live_shares)
                 if result["success"]:
                     sell_price = result["price"]
