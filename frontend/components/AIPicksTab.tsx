@@ -109,6 +109,9 @@ export default function AIPicksTab({ authFetch }: { authFetch: AuthFetch }) {
 
   useEffect(() => {
     fetchPicks();
+    // Auto-refresh every 30 seconds so new picks from a manual scan appear promptly
+    const interval = setInterval(fetchPicks, 30_000);
+    return () => clearInterval(interval);
   }, [fetchPicks]);
 
   const totalAlloc = data?.picks.reduce((s, p) => s + p.position_size_pct, 0) ?? 0;

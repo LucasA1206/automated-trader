@@ -237,6 +237,8 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
   const [sellingTicker, setSellingTicker] = useState<string | null>(null);
   const [confirmTicker, setConfirmTicker] = useState<string | null>(null);
   const [sellResult, setSellResult] = useState<{ ticker: string; message: string; success: boolean } | null>(null);
+  const [resettingPnl, setResettingPnl] = useState(false);
+  const [resetResult, setResetResult] = useState<{ message: string; success: boolean } | null>(null);
 
   // ── Fetch live portfolio ──────────────────────────────────────────────────
   const fetchPortfolio = useCallback(async () => {
@@ -321,6 +323,36 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
       setSellingTicker(null);
     }
   }, [authFetch, fetchPortfolio, fetchPnlHistory]);
+
+  // ── Reset P&L history and start fresh ────────────────────────────────────
+  const resetPnlHistory = useCallback(async () => {
+    if (!window.confirm(
+      'This will delete all P&L chart history and start tracking fresh from tonight.\n\nThis cannot be undone. Continue?'
+    )) return;
+
+    setResettingPnl(true);
+    setResetResult(null);
+    try {
+      // Step 1: Delete all snapshots
+      const resetRes = await authFetch('/api/reset-pnl-history', { method: 'POST' });
+      const resetJson = await resetRes.json();
+      if (resetJson.status !== 'ok') throw new Error(resetJson.detail || 'Reset failed');
+
+      // Step 2: Take a fresh snapshot immediately so chart has a baseline
+      await authFetch('/api/trigger-snapshot', { method: 'POST' });
+
+      setResetResult({ message: 'P&L history reset. Chart will update shortly (allow ~10s for snapshot).', success: true });
+      // Refresh chart data after a delay to let the snapshot job complete
+      setTimeout(() => fetchPnlHistory(), 10000);
+    } catch (err) {
+      setResetResult({
+        message: `Reset failed: ${err instanceof Error ? err.message : 'unknown error'}`,
+        success: false,
+      });
+    } finally {
+      setResettingPnl(false);
+    }
+  }, [authFetch, fetchPnlHistory]);
 
   useEffect(() => {
     fetchPortfolio();
@@ -600,7 +632,7 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
       <div className="table-container" style={{ marginBottom: 28 }}>
         <div className="table-header-bar">
           <h3>P&amp;L Over Time</h3>
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
             <button
               id="chart-mode-cumulative"
               className={`filter-btn ${chartMode === 'cumulative' ? 'active' : ''}`}
@@ -615,8 +647,35 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
             >
               Daily
             </button>
+            <button
+              id="btn-reset-pnl"
+              className="btn btn-outline"
+              title="Delete all chart history and start tracking from tonight"
+              onClick={resetPnlHistory}
+              disabled={resettingPnl}
+              style={{ fontSize: 11, padding: '4px 10px', color: 'var(--accent-red)', borderColor: 'rgba(239,68,68,0.3)', marginLeft: 4 }}
+            >
+              {resettingPnl ? '⏳ Resetting…' : '🔄 Reset Chart'}
+            </button>
           </div>
         </div>
+
+        {/* Reset result banner */}
+        {resetResult && (
+          <div style={{
+            display: 'flex', alignItems: 'flex-start', gap: 10,
+            padding: '10px 16px', margin: '0 0 0 0',
+            background: resetResult.success ? 'rgba(34,197,94,0.07)' : 'rgba(239,68,68,0.07)',
+            border: `1px solid ${resetResult.success ? 'rgba(34,197,94,0.2)' : 'rgba(239,68,68,0.2)'}`,
+            borderTop: 'none',
+          }}>
+            <span style={{ fontSize: 13, flexShrink: 0 }}>{resetResult.success ? '✅' : '❌'}</span>
+            <div style={{ fontSize: 12, color: resetResult.success ? 'var(--accent-green)' : 'var(--accent-red)', flex: 1 }}>
+              {resetResult.message}
+            </div>
+            <button onClick={() => setResetResult(null)} style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: 13, padding: 0 }}>✕</button>
+          </div>
+        )}
 
         <div style={{ padding: '24px 8px 16px' }}>
           {pnlLoading ? (
@@ -624,10 +683,13 @@ export default function PortfolioTab({ authFetch }: { authFetch: AuthFetch }) {
               <div className="skeleton" style={{ width: '100%', height: 260, borderRadius: 8 }} />
             </div>
           ) : chartData.length === 0 ? (
-            <div className="empty-state" style={{ height: 260 }}>
-              <div className="icon">📈</div>
-              <p>No closed trades yet</p>
-              <p style={{ fontSize: 12 }}>P&amp;L chart will appear once trades are closed.</p>
+            <div className="empty-state" style={{ height: 280 }}>
+              <div className="icon">📊</div>
+              <p>No P&amp;L history yet</p>
+              <p style={{ fontSize: 12, maxWidth: 340, textAlign: 'center', lineHeight: 1.6 }}>
+                Click <strong>🔄 Reset Chart</strong> above to start tracking from tonight&apos;s portfolio value.
+                The chart updates each weekday at ~15:45 ET after positions are settled.
+              </p>
             </div>
           ) : (
             <ResponsiveContainer width="100%" height={260}>

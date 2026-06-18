@@ -35,17 +35,19 @@ def create_scheduler() -> BackgroundScheduler:
         misfire_grace_time=300,  # 5min grace window
     )
 
-    # 15:30 ET Mon-Fri — sell all positions (30min before close)
+    # 15:30 ET Friday only — sell all positions (30min before close)
+    # Strategy: buy Monday morning, hold through the week, sell on Friday.
+    # Intra-week exits are handled by job_monitor_swing_trades (stop-loss / take-profit).
     scheduler.add_job(
         func=job_afternoon_sell,
         trigger=CronTrigger(
-            day_of_week="mon-fri",
+            day_of_week="fri",
             hour=15,
             minute=30,
             timezone=ET,
         ),
         id="afternoon_sell",
-        name="Afternoon Sell-All",
+        name="Friday Sell-All",
         replace_existing=True,
         misfire_grace_time=300,
     )
