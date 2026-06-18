@@ -644,15 +644,11 @@ def job_deferred_buy(picks: list[dict], budgets: list[float], trading_mode: str)
 
 def job_morning_scan_and_buy():
     """
-    Runs at 09:30 ET every weekday (Mon–Fri).
+    Runs at 09:15 ET every weekday (Mon–Fri).
 
     Checks how many position slots are available (max_positions minus current
     open/sold_half trades) and scans for that many replacement stocks.
-
-    If the portfolio is already full, the scan is skipped entirely.
-    This means:
-    - Monday: typically a full scan for max_positions stocks (portfolio is empty after Friday sell)
-    - Tue–Fri: only scans if stocks were sold via take-profit or stop-loss the previous day
+    Sleeps until 09:30 ET before connecting to IBKR and placing orders.
     """
     db = SessionLocal()
     try:
@@ -679,6 +675,19 @@ def job_morning_scan_and_buy():
             return
         picks, budgets, meta = result
         trading_mode = meta["trading_mode"]
+
+        # Sleep until market opens (09:30 ET)
+        wait_secs = seconds_until_market_open()
+        if wait_secs > 0:
+            open_et = datetime.now(_ET) + timedelta(seconds=wait_secs)
+            log_event(db, "scan",
+                      f"⏳ Scan complete. Sleeping {wait_secs:.0f} seconds until market opens "
+                      f"at {open_et.strftime('%H:%M:%S ET')} to place buy orders.")
+            time.sleep(wait_secs)
+
+        log_event(db, "scan",
+                  f"🔔 Market opened — placing {len(picks)} morning buy order(s): "
+                  + ", ".join(r['ticker'] for r in picks))
 
         client = IBKRClient(trading_mode=trading_mode)
         if not client.connect():
