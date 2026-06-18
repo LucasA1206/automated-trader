@@ -418,13 +418,24 @@ class IBKRClient:
 
             if not filled:
                 status = trade.orderStatus.status
-                # Only try to cancel if it isn't already in a terminal state
-                if status not in terminal_statuses and status != "Filled":
-                    try:
-                        self.ib.cancelOrder(order)
-                    except Exception:
-                        pass
-                return {"success": False, "ticker": ticker, "error": f"Order did not fill. Status: {status}"}
+                # ── IBKR Paper Bug Workaround ──────────────────────────────────────────
+                # The IBKR paper gateway sometimes reports "Cancelled" for orders that
+                # actually filled. Always check trade.fills before giving up — if the
+                # fills list is non-empty the order was filled despite the Cancelled status.
+                if trade.fills:
+                    logger.info(
+                        "place_buy_order(%s): status=%s but fills detected — treating as filled (IBKR paper bug).",
+                        ticker, status,
+                    )
+                    filled = True
+                else:
+                    # Only try to cancel if it isn't already in a terminal state
+                    if status not in terminal_statuses and status != "Filled":
+                        try:
+                            self.ib.cancelOrder(order)
+                        except Exception:
+                            pass
+                    return {"success": False, "ticker": ticker, "error": f"Order did not fill. Status: {status}"}
 
             fill_price = price  # fallback
             fees = 0.0

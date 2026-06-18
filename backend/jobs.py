@@ -5,7 +5,7 @@ from datetime import datetime, timezone, timedelta
 from database import SessionLocal, get_setting
 from models import Trade, SystemLog, AIPick, AccountSnapshot
 from ai_analyst import run_daily_scan, verify_ticker_momentum
-from trader import IBKRClient
+from trader import IBKRClient, safe_float
 
 import pytz
 
@@ -296,9 +296,9 @@ def _run_scan_phase(db, log_prefix: str = "morning", num_picks: int | None = Non
                   f"to guarantee {MIN_WEEKLY_BUYS} buy(s).")
 
     # Persist all AI picks to DB for the UI to display
+    # NOTE: We persist AFTER the fallback merge so the tab shows exactly
+    # what will be bought (AI picks + any screener fallback additions).
     today_date = datetime.now(timezone.utc).date()
-    if recommendations:
-        _persist_ai_picks(db, recommendations, today_date)
 
     # ── Select picks up to the effective limit ────────────────────────────
     pick_limit = min(effective_pick_limit, len(recommendations))
@@ -337,6 +337,22 @@ def _run_scan_phase(db, log_prefix: str = "morning", num_picks: int | None = Non
                   "❌ No picks from AI or screener. Market data may be unavailable. "
                   "No trades will be placed.")
         return None
+
+    # Persist the final buy list (AI + fallback) to ai_picks so the UI tab
+    # always reflects the stocks that were actually selected this scan.
+    # Mark screener fallback picks with a synthetic reason if they lack one.
+    picks_to_persist = []
+    for p in picks:
+        entry = dict(p)
+        if not entry.get("reason"):
+            entry["reason"] = "Selected via screener momentum fallback (AI returned insufficient picks)."
+        if not entry.get("confidence"):
+            entry["confidence"] = 0.5
+        if not entry.get("position_size_pct"):
+            # Assign an equal-split placeholder so the UI shows a sensible allocation
+            entry["position_size_pct"] = round(100.0 / len(picks), 1)
+        picks_to_persist.append(entry)
+    _persist_ai_picks(db, picks_to_persist, today_date)
 
     # Distribute budget according to position_size_pct if available, otherwise split evenly
     total_pct = sum(r.get("position_size_pct", 0) for r in picks)
@@ -431,6 +447,14 @@ def _place_buy_orders(db, client: IBKRClient, picks: list[dict], budgets: list[f
             log_event(db, "buy",
                       f"❌ Buy failed for {ticker}: {result.get('error')}. "
                       f"Redistributing ${budget_for_trade:,.2f} to remaining picks.", "ERROR")
+            # Immediately sync IBKR positions in case the order secretly filled
+            # (common IBKR paper bug where Cancelled orders actually went through).
+            # Use the already-connected client — no reconnect needed.
+            try:
+                _live_positions = client.get_positions()
+                _sync_untracked_ibkr_positions(db, _live_positions, trading_mode, log_event)
+            except Exception as _sync_exc:
+                logger.warning("Post-failure position sync failed: %s", _sync_exc)
             remaining_budget += budget_for_trade
 
     if remaining_budget > 0:

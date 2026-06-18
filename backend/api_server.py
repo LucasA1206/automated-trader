@@ -804,13 +804,14 @@ def get_pnl_history(db: Session = Depends(get_db)):
 
     # --- Snapshot-based segment ---
     if snapshots:
-        # Determine baseline for the very first snapshot.
-        # We convert A$7,900 to USD using the FX rate stored in the first snapshot
-        # (or a fallback of 1.55 if not available).
-        first_fx = snapshots[0].fx_rate or 1.55
-        starting_capital_usd = STARTING_CAPITAL_AUD / first_fx
+        # The first snapshot IS the baseline — it represents the account value
+        # at the start of tracking. Day-1 daily_pnl = 0 (no change yet).
+        # Subsequent days show the delta vs the previous day's snapshot.
+        # This avoids the phantom loss/gain from the AUD→USD conversion.
+        first_net_liq = snapshots[0].net_liq_usd
+        starting_capital_usd = first_net_liq  # Actual account value at tracking start
 
-        prev_net_liq = starting_capital_usd
+        prev_net_liq = first_net_liq
         cumulative = 0.0
 
         for snap in snapshots:
@@ -896,6 +897,42 @@ def trigger_snapshot(background_tasks: BackgroundTasks):
     from jobs import job_snapshot_net_liq
     background_tasks.add_task(job_snapshot_net_liq)
     return {"status": "triggered", "message": "NetLiq snapshot job started in background."}
+
+
+@app.post("/api/reset-pnl-history", dependencies=[Depends(require_auth)])
+def reset_pnl_history(db: Session = Depends(get_db)):
+    """
+    Deletes ALL AccountSnapshot records so the P&L chart can start fresh.
+
+    Use this when the existing snapshot history is incorrect or stale.
+    After calling this endpoint, trigger a new snapshot via /api/trigger-snapshot
+    to start tracking from the current account value.
+
+    WARNING: This is irreversible. Old chart data will be lost.
+    """
+    try:
+        deleted_count = db.query(AccountSnapshot).delete()
+        db.commit()
+        db.add(SystemLog(
+            timestamp=datetime.now(timezone.utc),
+            level="INFO",
+            category="system",
+            message=f"🗑️ P&L history reset: deleted {deleted_count} account snapshot(s). "
+                    f"Chart will start fresh from the next snapshot.",
+        ))
+        db.commit()
+        logger.info("P&L history reset: deleted %d snapshots.", deleted_count)
+        return {
+            "status": "ok",
+            "deleted_snapshots": deleted_count,
+            "message": (
+                f"Deleted {deleted_count} snapshot(s). "
+                "Trigger a new snapshot via /api/trigger-snapshot to begin fresh tracking."
+            ),
+        }
+    except Exception as e:
+        logger.error("reset-pnl-history error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─── Entrypoint ───────────────────────────────────────────────────────────
