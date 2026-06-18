@@ -379,16 +379,24 @@ def _run_scan_phase(db, log_prefix: str = "morning", num_picks: int | None = Non
     return picks, budgets, meta
 
 
-def _place_buy_orders(db, client: IBKRClient, picks: list[dict], budgets: list[float], trading_mode: str) -> None:
+def _place_buy_orders(db, client: IBKRClient, picks: list[dict], budgets: list[float], trading_mode: str, available_cash: float = 0.0) -> None:
     """Place buy orders for all picks. Expects an already-connected IBKRClient.
 
     Budget redistribution: when a stock is rejected (momentum check failure or
     order error), its budget is redistributed equally across the remaining
     un-attempted picks so the full daily budget is always deployed.
+
+    Cap: no single order will exceed 50% of available_cash to prevent
+    IBKR from rejecting orders due to insufficient funds when redistribution
+    pushes an order budget higher than the account can support.
     """
     # Work with a mutable copy so we can adjust future budgets in-place
     budgets = list(budgets)
     remaining_budget = 0.0  # Accumulates budget from rejected/failed stocks
+
+    # Cap per trade: no single order may exceed 50% of available cash.
+    # Falls back to the total daily budget if available_cash wasn't provided.
+    per_trade_cap = (available_cash * 0.50) if available_cash > 0 else float("inf")
 
     for i, rec in enumerate(picks):
         ticker = rec["ticker"]
@@ -407,6 +415,15 @@ def _place_buy_orders(db, client: IBKRClient, picks: list[dict], budgets: list[f
             for j in range(i + 1, len(picks)):
                 budgets[j] += extra_per_pick
             remaining_budget = 0.0
+
+        # Enforce per-trade cap (50% of available cash)
+        if budget_for_trade > per_trade_cap:
+            excess = budget_for_trade - per_trade_cap
+            budget_for_trade = per_trade_cap
+            remaining_budget += excess
+            log_event(db, "buy",
+                      f"⚠️ {ticker}: budget capped at 50% of available cash "
+                      f"(${per_trade_cap:,.2f}). Excess ${excess:,.2f} carried forward.")
 
         log_event(db, "buy",
                   f"Placing BUY order for {ticker} "
@@ -579,7 +596,7 @@ def job_deferred_sell_single(ticker: str, trading_mode: str) -> None:
         db.close()
 
 
-def job_deferred_buy(picks: list[dict], budgets: list[float], trading_mode: str) -> None:
+def job_deferred_buy(picks: list[dict], budgets: list[float], trading_mode: str, available_cash: float = 0.0) -> None:
     """
     Called in a background thread when a manual scan is triggered outside market hours.
     Sleeps until NYSE opens (09:30 ET, next weekday), then places the pre-computed
@@ -626,7 +643,7 @@ def job_deferred_buy(picks: list[dict], budgets: list[float], trading_mode: str)
             return
 
         client.start_keepalive(interval=30)
-        _place_buy_orders(db, client, picks, budgets, trading_mode)
+        _place_buy_orders(db, client, picks, budgets, trading_mode, available_cash=available_cash)
         client.disconnect()
     except Exception as e:
         logger.exception("Deferred buy job crashed: %s", e)
@@ -695,7 +712,7 @@ def job_morning_scan_and_buy():
             return
 
         client.start_keepalive(interval=30)
-        _place_buy_orders(db, client, picks, budgets, trading_mode)
+        _place_buy_orders(db, client, picks, budgets, trading_mode, available_cash=meta.get("available_cash", 0.0))
         client.disconnect()
 
     except Exception as e:
@@ -729,13 +746,13 @@ def job_manual_scan_with_deferred_buy():
                 log_event(db, "ibkr", "Failed to connect to IB Gateway. Aborting trades.", "ERROR")
                 return
             client.start_keepalive(interval=30)
-            _place_buy_orders(db, client, picks, budgets, trading_mode)
+            _place_buy_orders(db, client, picks, budgets, trading_mode, available_cash=meta.get("available_cash", 0.0))
             client.disconnect()
         else:
             # Market is closed — hand off to the deferred-buy thread
             t = threading.Thread(
                 target=job_deferred_buy,
-                args=(picks, budgets, trading_mode),
+                args=(picks, budgets, trading_mode, meta.get("available_cash", 0.0)),
                 daemon=True,
                 name="deferred-buy",
             )
