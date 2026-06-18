@@ -364,101 +364,130 @@ class IBKRClient:
         """
         Places a market buy order for the given ticker using the specified dollar budget.
         Returns trade details including shares bought and fill price.
+        Attempts placement up to 3 times in case of transient market-open rejections.
         """
-        try:
-            if not self.ib.isConnected():
-                self.connect()
+        max_attempts = 3
+        last_error = ""
+        
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if not self.ib.isConnected():
+                    self.connect()
 
-            contract = Stock(ticker, "SMART", "USD")
-            self.ib.qualifyContracts(contract)
+                contract = Stock(ticker, "SMART", "USD")
+                self.ib.qualifyContracts(contract)
 
-            # Request delayed market data (type 3) — no subscription needed.
-            # Poll up to 10 s so we survive the initial data-farm connection delay
-            # (Warning 2119 "Market data farm is connecting") that hits the first
-            # ticker in each scan session.
-            self.ib.reqMarketDataType(3)
-            mkt = self.ib.reqMktData(contract, "", True, False)
-            price = 0.0
-            for _ in range(20):   # 20 × 0.5 s = 10 s max
-                self.ib.sleep(0.5)
-                price = safe_float(mkt.last) or safe_float(mkt.close)
-                if price > 0:
-                    break
-            self.ib.cancelMktData(contract)
+                # Request delayed market data (type 3) — no subscription needed.
+                # Poll up to 10 s so we survive the initial data-farm connection delay
+                # (Warning 2119 "Market data farm is connecting") that hits the first
+                # ticker in each scan session.
+                self.ib.reqMarketDataType(3)
+                mkt = self.ib.reqMktData(contract, "", True, False)
+                price = 0.0
+                for _ in range(20):   # 20 × 0.5 s = 10 s max
+                    self.ib.sleep(0.5)
+                    price = safe_float(mkt.last) or safe_float(mkt.close)
+                    if price > 0:
+                        break
+                self.ib.cancelMktData(contract)
 
-            if not price or price <= 0:
-                raise ValueError(f"Could not determine market price for {ticker}")
+                if not price or price <= 0:
+                    raise ValueError(f"Could not determine market price for {ticker}")
 
-            shares = int(budget / price)
-            if shares < 1:
-                raise ValueError(
-                    f"Budget ${budget:.2f} is too small to buy 1 share of {ticker} at ${price:.2f}"
-                )
-
-            order = MarketOrder("BUY", shares)
-            trade = self.ib.placeOrder(contract, order)
-
-            # Wait up to 30 seconds for fill.
-            # Market orders are typically filled in <1 s during market hours,
-            # but the IBKR paper gateway can be slow and sometimes routes through
-            # multiple legs.  We poll every 0.5 s and stop as soon as the order
-            # is either Filled, or terminally rejected (Cancelled/Inactive).
-            filled = False
-            terminal_statuses = {"Cancelled", "Inactive"}
-            for _ in range(60):   # 60 × 0.5 s = 30 s max
-                self.ib.sleep(0.5)
-                status = trade.orderStatus.status
-                if status == "Filled":
-                    filled = True
-                    break
-                if status in terminal_statuses:
-                    # Order was definitively rejected — no point waiting further
-                    break
-                # PreSubmitted / Submitted / PendingSubmit → still working, keep waiting
-
-            if not filled:
-                status = trade.orderStatus.status
-                # ── IBKR Paper Bug Workaround ──────────────────────────────────────────
-                # The IBKR paper gateway sometimes reports "Cancelled" for orders that
-                # actually filled. Always check trade.fills before giving up — if the
-                # fills list is non-empty the order was filled despite the Cancelled status.
-                if trade.fills:
-                    logger.info(
-                        "place_buy_order(%s): status=%s but fills detected — treating as filled (IBKR paper bug).",
-                        ticker, status,
+                shares = int(budget / price)
+                if shares < 1:
+                    raise ValueError(
+                        f"Budget ${budget:.2f} is too small to buy 1 share of {ticker} at ${price:.2f}"
                     )
-                    filled = True
+
+                order = MarketOrder("BUY", shares)
+                logger.info(f"Placing market BUY order for {ticker} (attempt {attempt}/{max_attempts}): {shares} shares")
+                trade = self.ib.placeOrder(contract, order)
+
+                # Wait up to 30 seconds for fill.
+                # Market orders are typically filled in <1 s during market hours,
+                # but the IBKR paper gateway can be slow and sometimes routes through
+                # multiple legs.  We poll every 0.5 s and stop as soon as the order
+                # is either Filled, or terminally rejected (Cancelled/Inactive).
+                filled = False
+                terminal_statuses = {"Cancelled", "Inactive"}
+                for _ in range(60):   # 60 × 0.5 s = 30 s max
+                    self.ib.sleep(0.5)
+                    status = trade.orderStatus.status
+                    if status == "Filled":
+                        filled = True
+                        break
+                    if status in terminal_statuses:
+                        # Order was definitively rejected — no point waiting further
+                        break
+                    # PreSubmitted / Submitted / PendingSubmit → still working, keep waiting
+
+                if not filled:
+                    status = trade.orderStatus.status
+                    # ── IBKR Paper Bug Workaround ──────────────────────────────────────────
+                    # The IBKR paper gateway sometimes reports "Cancelled" for orders that
+                    # actually filled. Always check trade.fills before giving up — if the
+                    # fills list is non-empty the order was filled despite the Cancelled status.
+                    if trade.fills:
+                        logger.info(
+                            "place_buy_order(%s): status=%s but fills detected — treating as filled (IBKR paper bug).",
+                            ticker, status,
+                        )
+                        filled = True
+                    else:
+                        # Extract detailed messages from trade.log to explain why
+                        log_messages = [f"{entry.status}: {entry.message}" for entry in trade.log if entry.message]
+                        log_details = "; ".join(log_messages) if log_messages else "No specific log message"
+                        
+                        # Only try to cancel if it isn't already in a terminal state
+                        if status not in terminal_statuses and status != "Filled":
+                            try:
+                                self.ib.cancelOrder(order)
+                                self.ib.sleep(1.0)
+                            except Exception:
+                                pass
+                        
+                        error_msg = f"Order did not fill. Status: {status} ({log_details})"
+                        logger.warning(f"Attempt {attempt}/{max_attempts} failed for {ticker}: {error_msg}")
+                        last_error = error_msg
+                        
+                        if attempt < max_attempts:
+                            sleep_time = 2.0
+                            logger.info(f"Sleeping {sleep_time}s before retry for {ticker}...")
+                            self.ib.sleep(sleep_time)
+                            continue
+                        else:
+                            return {"success": False, "ticker": ticker, "error": error_msg}
+
+                if filled:
+                    fill_price = price  # fallback
+                    fees = 0.0
+                    if trade.fills:
+                        fill_price = trade.fills[-1].execution.price
+                        fees = sum(
+                            safe_float(f.commissionReport.commission)
+                            for f in trade.fills
+                            if getattr(f, 'commissionReport', None) and getattr(f.commissionReport, 'commission', None) is not None
+                        )
+
+                    return {
+                        "success": True,
+                        "ticker": ticker,
+                        "shares": shares,
+                        "price": round(safe_float(fill_price), 4),
+                        "fees": round(fees, 4),
+                        "total_cost": round(safe_float(fill_price) * shares, 2),
+                        "order_id": str(trade.order.orderId),
+                    }
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Attempt {attempt}/{max_attempts} crashed for {ticker}: {error_msg}")
+                last_error = error_msg
+                if attempt < max_attempts:
+                    self.ib.sleep(2.0)
+                    continue
                 else:
-                    # Only try to cancel if it isn't already in a terminal state
-                    if status not in terminal_statuses and status != "Filled":
-                        try:
-                            self.ib.cancelOrder(order)
-                        except Exception:
-                            pass
-                    return {"success": False, "ticker": ticker, "error": f"Order did not fill. Status: {status}"}
-
-            fill_price = price  # fallback
-            fees = 0.0
-            if trade.fills:
-                fill_price = trade.fills[-1].execution.price
-                fees = sum(
-                    safe_float(f.commissionReport.commission)
-                    for f in trade.fills
-                    if getattr(f, 'commissionReport', None) and getattr(f.commissionReport, 'commission', None) is not None
-                )
-
-            return {
-                "success": True,
-                "ticker": ticker,
-                "shares": shares,
-                "price": round(safe_float(fill_price), 4),
-                "fees": round(fees, 4),
-                "total_cost": round(safe_float(fill_price) * shares, 2),
-                "order_id": str(trade.order.orderId),
-            }
-        except Exception as e:
-            logger.error(f"Buy order failed for {ticker}: {e}")
-            return {"success": False, "ticker": ticker, "error": str(e)}
+                    return {"success": False, "ticker": ticker, "error": error_msg}
 
     def place_sell_order(self, ticker: str, shares: float) -> dict:
         """
@@ -509,12 +538,14 @@ class IBKRClient:
 
             if not filled:
                 status = trade.orderStatus.status
+                log_messages = [f"{entry.status}: {entry.message}" for entry in trade.log if entry.message]
+                log_details = "; ".join(log_messages) if log_messages else "No specific log message"
                 if status not in terminal_statuses and status != "Filled":
                     try:
                         self.ib.cancelOrder(order)
                     except Exception:
                         pass
-                return {"success": False, "ticker": ticker, "error": f"Order did not fill. Status: {status}"}
+                return {"success": False, "ticker": ticker, "error": f"Order did not fill. Status: {status} ({log_details})"}
 
             fill_price = 0.0
             fees = 0.0
@@ -584,12 +615,14 @@ class IBKRClient:
 
             if not filled:
                 status = trade.orderStatus.status
+                log_messages = [f"{entry.status}: {entry.message}" for entry in trade.log if entry.message]
+                log_details = "; ".join(log_messages) if log_messages else "No specific log message"
                 if status not in terminal_statuses and status != "Filled":
                     try:
                         self.ib.cancelOrder(order)
                     except Exception:
                         pass
-                return {"success": False, "ticker": ticker, "error": f"Buy-to-cover did not fill. Status: {status}"}
+                return {"success": False, "ticker": ticker, "error": f"Buy-to-cover did not fill. Status: {status} ({log_details})"}
 
             fill_price = 0.0
             fees = 0.0
