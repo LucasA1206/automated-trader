@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import math
 import time
 import logging
 import requests
@@ -565,6 +566,12 @@ def pre_filter_candidates(technicals: list[dict]) -> list[dict]:
         mom_20d = t.get("mom_20d")
         avg_vol = t.get("avg_daily_vol_20", 0) or 0
         earnings = t.get("earnings_this_week", False)
+
+        # Hard reject: no valid price data (NaN or zero) — cannot calculate
+        # share count and IBKR will have no price to work with either.
+        if not price or math.isnan(price) or price <= 0:
+            rejected.append(f"{ticker}(price=NaN/0)")
+            continue
 
         # Hard reject: insufficient liquidity (< 50k avg daily volume)
         if avg_vol > 0 and avg_vol < 50_000:
