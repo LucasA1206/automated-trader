@@ -401,6 +401,7 @@ class IBKRClient:
                     )
 
                 order = MarketOrder("BUY", shares)
+                order.tif = "DAY"  # Prevent IBKR order-preset TIF override (Error 10349)
                 logger.info(f"Placing market BUY order for {ticker} (attempt {attempt}/{max_attempts}): {shares} shares")
                 trade = self.ib.placeOrder(contract, order)
 
@@ -650,7 +651,9 @@ class IBKRClient:
             self.ib.qualifyContracts(contract)
 
             order = MarketOrder("SELL", shares)
+            order.tif = "DAY"  # Prevent IBKR order-preset TIF override (Error 10349)
             trade = self.ib.placeOrder(contract, order)
+
 
             # Wait up to 30 seconds for fill (same logic as place_buy_order).
             filled = False
@@ -727,6 +730,7 @@ class IBKRClient:
 
             # BUY order to close the short
             order = MarketOrder("BUY", shares)
+            order.tif = "DAY"  # Prevent IBKR order-preset TIF override (Error 10349)
             trade = self.ib.placeOrder(contract, order)
 
             # Wait up to 30 seconds for fill

@@ -16,6 +16,22 @@ MIN_WEEKLY_BUYS = 3
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Cross-job state guards
+# ---------------------------------------------------------------------------
+
+# Set when a deferred-buy thread is waiting for market open.
+# Cleared when the thread starts placing orders (or is superseded by the morning scan).
+# Prevents the morning scan and a pending deferred buy from both firing at 09:30 ET,
+# which would double the budget and trigger IBKR Error 201 (insufficient funds).
+_deferred_buy_pending = threading.Event()
+
+# Tickers that were rejected this session with a "No Trading Permission" or
+# "closing-only" error. We never retry these in the same process lifetime.
+# Cleared only on process restart (acceptable — permissions don't change mid-day).
+_session_rejected_tickers: set[str] = set()
+
+
+# ---------------------------------------------------------------------------
 # Market-hours helpers (NYSE / ET)
 # ---------------------------------------------------------------------------
 _ET = pytz.timezone("America/New_York")
@@ -310,7 +326,18 @@ def _run_scan_phase(db, log_prefix: str = "morning", num_picks: int | None = Non
     )
     picks = [p for p in picks if p["ticker"] not in open_tickers]
 
-    ai_ticker_set = {r["ticker"] for r in picks} | open_tickers
+    # Exclude tickers that were permanently rejected this session
+    # (e.g. "No Trading Permission" / closing-only — IBKR won't accept these today)
+    if _session_rejected_tickers:
+        before = len(picks)
+        picks = [p for p in picks if p["ticker"] not in _session_rejected_tickers]
+        dropped = before - len(picks)
+        if dropped:
+            log_event(db, "scan",
+                      f"🚫 Excluded {dropped} session-rejected ticker(s) from picks: "
+                      f"{', '.join(sorted(_session_rejected_tickers))}")
+
+    ai_ticker_set = {r["ticker"] for r in picks} | open_tickers | _session_rejected_tickers
     fallback_used: list[dict] = []
     min_buys = min(MIN_WEEKLY_BUYS, effective_pick_limit)
     if len(picks) < min_buys and screened_candidates:
@@ -321,6 +348,7 @@ def _run_scan_phase(db, log_prefix: str = "morning", num_picks: int | None = Non
             if candidate["ticker"] not in ai_ticker_set:
                 fallback_used.append(candidate)
                 ai_ticker_set.add(candidate["ticker"])
+
 
         if fallback_used:
             fallback_str = ", ".join(c["ticker"] for c in fallback_used)
@@ -461,9 +489,27 @@ def _place_buy_orders(db, client: IBKRClient, picks: list[dict], budgets: list[f
                       f"@ ${result['price']:.2f} "
                       f"(Total: ${result['total_cost']:,.2f})")
         else:
+            error_msg = result.get('error', '')
             log_event(db, "buy",
-                      f"❌ Buy failed for {ticker}: {result.get('error')}. "
+                      f"❌ Buy failed for {ticker}: {error_msg}. "
                       f"Redistributing ${budget_for_trade:,.2f} to remaining picks.", "ERROR")
+
+            # Detect permanent permission errors — these tickers cannot be traded
+            # today at all (IBKR "closing-only" / "No Trading Permission").
+            # Add to session reject set so we never attempt them again this session.
+            _PERM_REJECT_PHRASES = (
+                "no trading permission",
+                "customer ineligible",
+                "closing-only status",
+                "closing only",
+            )
+            if any(phrase in error_msg.lower() for phrase in _PERM_REJECT_PHRASES):
+                _session_rejected_tickers.add(ticker)
+                log_event(db, "buy",
+                          f"🚫 {ticker} added to session reject list — IBKR will not accept "
+                          f"new orders for this ticker (permission/closing-only). "
+                          f"It will be skipped in all future scans this session.")
+
             # Immediately sync IBKR positions in case the order secretly filled
             # (common IBKR paper bug where Cancelled orders actually went through).
             # Use the already-connected client — no reconnect needed.
@@ -601,9 +647,14 @@ def job_deferred_buy(picks: list[dict], budgets: list[float], trading_mode: str,
     Called in a background thread when a manual scan is triggered outside market hours.
     Sleeps until NYSE opens (09:30 ET, next weekday), then places the pre-computed
     buy orders. A fresh DB session and IBKR connection are opened at that point.
+
+    The caller (job_manual_scan_with_deferred_buy) sets _deferred_buy_pending BEFORE
+    starting this thread. This function must NOT re-set the flag — doing so would race
+    with the morning scan that may have already cleared it to signal a supersession.
     """
     wait_secs = seconds_until_market_open()
     if wait_secs > 0:
+
         open_et = datetime.now(_ET) + timedelta(seconds=wait_secs)
         logger.info(
             "Deferred buy: market is closed. Sleeping %.0f s until %s ET.",
@@ -624,8 +675,21 @@ def job_deferred_buy(picks: list[dict], budgets: list[float], trading_mode: str,
 
         time.sleep(wait_secs)
 
+    # Abort if the morning scan has already superseded this deferred buy.
+    # (The morning scan clears _deferred_buy_pending before it runs its own scan.)
+    if not _deferred_buy_pending.is_set():
+        db_abort = SessionLocal()
+        try:
+            log_event(db_abort, "scan",
+                      "⏭️ Deferred buy cancelled — superseded by the morning scan. "
+                      "Morning scan orders will be placed instead.")
+        finally:
+            db_abort.close()
+        return
+
     db = SessionLocal()
     try:
+
         # Re-check settings haven't been changed while we waited
         trader_enabled = get_setting(db, "trader_enabled", "true")
         if trader_enabled.lower() != "true":
@@ -653,10 +717,9 @@ def job_deferred_buy(picks: list[dict], budgets: list[float], trading_mode: str,
             pass
     finally:
         db.close()
+        _deferred_buy_pending.clear()  # Always clear on exit (success, error, or abort)
 
 
-# ---------------------------------------------------------------------------
-# Public job entry points
 # ---------------------------------------------------------------------------
 
 def job_morning_scan_and_buy():
@@ -686,6 +749,14 @@ def job_morning_scan_and_buy():
         log_event(db, "scan",
                   f"📊 {current_open}/{max_positions} positions open — "
                   f"scanning for {slots_to_fill} replacement stock(s).")
+
+        # Supersede any pending deferred buy from a manual scan — the morning scan
+        # is authoritative because it rechecks live position counts before buying.
+        if _deferred_buy_pending.is_set():
+            _deferred_buy_pending.clear()
+            log_event(db, "scan",
+                      "⏭️ Cleared pending deferred-buy thread — morning scan will "
+                      "place today's orders with fresh position data instead.")
 
         result = _run_scan_phase(db, log_prefix="morning", num_picks=slots_to_fill)
         if result is None:
@@ -749,7 +820,10 @@ def job_manual_scan_with_deferred_buy():
             _place_buy_orders(db, client, picks, budgets, trading_mode, available_cash=meta.get("available_cash", 0.0))
             client.disconnect()
         else:
-            # Market is closed — hand off to the deferred-buy thread
+            # Market is closed — hand off to the deferred-buy thread.
+            # Set the pending flag BEFORE starting the thread so the morning
+            # scan can detect and supersede it if needed.
+            _deferred_buy_pending.set()
             t = threading.Thread(
                 target=job_deferred_buy,
                 args=(picks, budgets, trading_mode, meta.get("available_cash", 0.0)),
