@@ -797,6 +797,13 @@ def job_afternoon_sell():
 
         client.start_keepalive(interval=30)
 
+        # Cancel ALL open orders first (stop-loss, take-profit, OCA brackets, etc.)
+        # so they cannot fire while — or after — we liquidate positions.
+        n_cancelled = client.cancel_all_open_orders()
+        log_event(db, "sell",
+                  f"Cancelled {n_cancelled} open order(s) (stop-loss/take-profit brackets) "
+                  f"before starting sell-all.")
+
         live_positions = client.get_positions()
         live_tickers = {p["ticker"] for p in live_positions}
 
