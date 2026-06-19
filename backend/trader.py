@@ -494,6 +494,58 @@ class IBKRClient:
                 else:
                     return {"success": False, "ticker": ticker, "error": error_msg}
 
+    def cancel_all_open_orders(self) -> int:
+        """
+        Cancels every open/pending order on the account, including OCA legs
+        (stop-loss and take-profit bracket orders).
+
+        Called before the afternoon sell-all job so that no residual OCA
+        orders can interfere with — or re-trigger after — the EOD liquidation.
+
+        Returns the number of orders that were cancelled.
+        """
+        try:
+            if not self.ib.isConnected():
+                self.connect()
+
+            open_orders = self.ib.reqAllOpenOrders()
+            self.ib.sleep(1.0)   # give the gateway a moment to return all orders
+
+            if not open_orders:
+                logger.info("cancel_all_open_orders: no open orders found.")
+                return 0
+
+            cancelled = 0
+            for trade in open_orders:
+                try:
+                    status = trade.orderStatus.status
+                    # Only cancel orders that are still active
+                    if status not in {"Filled", "Cancelled", "Inactive"}:
+                        self.ib.cancelOrder(trade.order)
+                        cancelled += 1
+                        logger.info(
+                            "Cancelled order %s for %s (status=%s, OCA=%s)",
+                            trade.order.orderId,
+                            getattr(trade.contract, "symbol", "?"),
+                            status,
+                            trade.order.ocaGroup or "none",
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not cancel order %s: %s",
+                        getattr(trade, "order", {}).orderId if hasattr(trade, "order") else "?",
+                        exc,
+                    )
+
+            # Wait a moment so cancellations propagate before we place sells
+            self.ib.sleep(2.0)
+            logger.info("cancel_all_open_orders: cancelled %d order(s).", cancelled)
+            return cancelled
+
+        except Exception as e:
+            logger.error("cancel_all_open_orders failed: %s", e)
+            return 0
+
     def place_bracket_orders(
         self,
         ticker: str,
