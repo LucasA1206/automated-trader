@@ -6,7 +6,7 @@ import asyncio
 import threading
 import logging
 from datetime import datetime, timezone
-from ib_insync import IB, Stock, MarketOrder, util
+from ib_insync import IB, Stock, MarketOrder, LimitOrder, StopOrder, util
 
 logger = logging.getLogger(__name__)
 
@@ -470,7 +470,10 @@ class IBKRClient:
                             if getattr(f, 'commissionReport', None) and getattr(f.commissionReport, 'commission', None) is not None
                         )
 
-                    return {
+                    # Place stop-loss (-5%) and take-profit (+10%) bracket orders
+                    bracket = self.place_bracket_orders(ticker, contract, shares, safe_float(fill_price))
+
+                    result = {
                         "success": True,
                         "ticker": ticker,
                         "shares": shares,
@@ -479,6 +482,8 @@ class IBKRClient:
                         "total_cost": round(safe_float(fill_price) * shares, 2),
                         "order_id": str(trade.order.orderId),
                     }
+                    result.update(bracket)
+                    return result
             except Exception as e:
                 error_msg = str(e)
                 logger.error(f"Attempt {attempt}/{max_attempts} crashed for {ticker}: {error_msg}")
@@ -488,6 +493,77 @@ class IBKRClient:
                     continue
                 else:
                     return {"success": False, "ticker": ticker, "error": error_msg}
+
+    def place_bracket_orders(
+        self,
+        ticker: str,
+        contract,
+        shares: int,
+        fill_price: float,
+        stop_pct: float = 0.05,
+        profit_pct: float = 0.10,
+    ) -> dict:
+        """
+        Places a GTC stop-loss and take-profit OCA pair after a buy fills.
+
+        Both legs are linked via an OCA (One Cancels All) group so that
+        whichever triggers first automatically cancels the other.
+
+        Args:
+            ticker:      Stock symbol (for logging).
+            contract:    Already-qualified IBKR contract object.
+            shares:      Number of shares that were bought.
+            fill_price:  Actual fill price of the buy order.
+            stop_pct:    Fraction below fill price for stop-loss  (default 0.05 = 5%).
+            profit_pct:  Fraction above fill price for take-profit (default 0.10 = 10%).
+
+        Returns a dict with stop/TP prices and order IDs (best-effort).
+        """
+        try:
+            stop_price   = round(fill_price * (1 - stop_pct),   4)
+            profit_price = round(fill_price * (1 + profit_pct), 4)
+
+            oca_group = f"OCA_{ticker}_{int(time.time())}"
+
+            # Take-profit leg — limit order sells when price rises to profit_price
+            tp_order = LimitOrder("SELL", shares, profit_price)
+            tp_order.tif       = "GTC"
+            tp_order.ocaGroup  = oca_group
+            tp_order.ocaType   = 1   # cancel remaining orders with block
+            tp_order.transmit  = True
+
+            # Stop-loss leg — stop order sells when price falls to stop_price
+            sl_order = StopOrder("SELL", shares, stop_price)
+            sl_order.tif       = "GTC"
+            sl_order.ocaGroup  = oca_group
+            sl_order.ocaType   = 1
+            sl_order.transmit  = True
+
+            tp_trade = self.ib.placeOrder(contract, tp_order)
+            sl_trade = self.ib.placeOrder(contract, sl_order)
+            self.ib.sleep(0.5)   # let the gateway acknowledge both legs
+
+            logger.info(
+                "Bracket orders placed for %s: TP=%.4f (orderId=%s), SL=%.4f (orderId=%s), OCA=%s",
+                ticker, profit_price, tp_trade.order.orderId,
+                stop_price,  sl_trade.order.orderId, oca_group,
+            )
+
+            return {
+                "stop_loss_price":     stop_price,
+                "take_profit_price":   profit_price,
+                "stop_loss_order_id":  str(sl_trade.order.orderId),
+                "take_profit_order_id": str(tp_trade.order.orderId),
+                "oca_group":           oca_group,
+            }
+        except Exception as e:
+            # Bracket failure is non-fatal — the buy already went through.
+            logger.error("Failed to place bracket orders for %s: %s", ticker, e)
+            return {
+                "stop_loss_price":     None,
+                "take_profit_price":   None,
+                "bracket_error":       str(e),
+            }
 
     def place_sell_order(self, ticker: str, shares: float) -> dict:
         """
