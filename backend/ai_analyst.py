@@ -369,7 +369,11 @@ def _compute_rsi(closes, period: int = 14) -> float | None:
 
 
 def _fetch_technicals_for_ticker(ticker: str) -> dict | None:
-    """Fetch price history and compute technical indicators for one ticker."""
+    """Fetch price history and compute technical indicators for one ticker.
+
+    Includes volatility metrics (ATR%, daily range, consecutive up days, etc.)
+    to support the low-volatility steady-uptrend stock selection strategy.
+    """
     try:
         tk = yf.Ticker(ticker)
         # 3-month daily data for trend detection, moving averages, and RSI
@@ -377,10 +381,12 @@ def _fetch_technicals_for_ticker(ticker: str) -> dict | None:
         if hist.empty or len(hist) < 5:
             return None
 
-        closes = hist["Close"]
+        closes  = hist["Close"]
+        highs   = hist["High"]
+        lows    = hist["Low"]
         volumes = hist["Volume"]
         latest_close = float(closes.iloc[-1])
-        prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else latest_close
+        prev_close   = float(closes.iloc[-2]) if len(closes) >= 2 else latest_close
 
         # Moving averages
         sma_5  = float(closes.rolling(5).mean().iloc[-1])  if len(closes) >= 5  else None
@@ -419,7 +425,80 @@ def _fetch_technicals_for_ticker(ticker: str) -> dict | None:
         # Day change & momentum
         day_change_pct = round((latest_close - prev_close) / prev_close * 100, 2) if prev_close else 0
         mom_5d  = round((latest_close / float(closes.iloc[-6])  - 1) * 100, 2) if len(closes) >= 6  else None
+        mom_10d = round((latest_close / float(closes.iloc[-11]) - 1) * 100, 2) if len(closes) >= 11 else None
         mom_20d = round((latest_close / float(closes.iloc[-21]) - 1) * 100, 2) if len(closes) >= 21 else None
+
+        # ── Volatility metrics ─────────────────────────────────────────────────
+        # ATR (14-day Average True Range) as % of current price.
+        # High ATR% = high daily swing = volatile stock → bad for our strategy.
+        atr_pct: float | None = None
+        try:
+            tr_list = []
+            for i in range(1, min(15, len(closes))):
+                h = float(highs.iloc[-i])
+                l = float(lows.iloc[-i])
+                c_prev = float(closes.iloc[-(i + 1)])
+                true_range = max(h - l, abs(h - c_prev), abs(l - c_prev))
+                tr_list.append(true_range)
+            if tr_list and latest_close > 0:
+                atr_pct = round(sum(tr_list) / len(tr_list) / latest_close * 100, 2)
+        except Exception:
+            pass
+
+        # Average daily high-low range as % of close (10-day window).
+        # Smaller = more stable price action.
+        daily_range_avg_pct: float | None = None
+        try:
+            n = min(10, len(closes))
+            ranges = [
+                (float(highs.iloc[-i]) - float(lows.iloc[-i])) / float(closes.iloc[-i]) * 100
+                for i in range(1, n + 1)
+                if float(closes.iloc[-i]) > 0
+            ]
+            if ranges:
+                daily_range_avg_pct = round(sum(ranges) / len(ranges), 2)
+        except Exception:
+            pass
+
+        # Number of consecutive days the stock closed UP (streak of green candles).
+        # A long positive streak signals a calm, steady uptrend.
+        consec_up_days = 0
+        try:
+            for i in range(1, min(15, len(closes))):
+                if float(closes.iloc[-i]) > float(closes.iloc[-(i + 1)]):
+                    consec_up_days += 1
+                else:
+                    break
+        except Exception:
+            pass
+
+        # Worst single-day percentage drop in the last 5 trading days.
+        # A large single-day drop flags a volatile / trend-breaking stock.
+        max_daily_drop_5d: float | None = None
+        try:
+            drops = [
+                (float(closes.iloc[-i]) - float(closes.iloc[-(i + 1)])) / float(closes.iloc[-(i + 1)]) * 100
+                for i in range(1, min(6, len(closes)))
+                if float(closes.iloc[-(i + 1)]) > 0
+            ]
+            if drops:
+                max_daily_drop_5d = round(min(drops), 2)  # most negative = worst day
+        except Exception:
+            pass
+
+        # Percentage of the last 20 trading days that closed positive.
+        # High % = consistent bullish behaviour (not whipsawing).
+        pct_days_positive_20d: float | None = None
+        try:
+            n = min(20, len(closes) - 1)
+            if n > 0:
+                up_days = sum(
+                    1 for i in range(1, n + 1)
+                    if float(closes.iloc[-i]) > float(closes.iloc[-(i + 1)])
+                )
+                pct_days_positive_20d = round(up_days / n * 100, 1)
+        except Exception:
+            pass
 
         # Check for earnings in the upcoming week via yfinance calendar
         earnings_this_week = False
@@ -443,6 +522,7 @@ def _fetch_technicals_for_ticker(ticker: str) -> dict | None:
             "prev_close": round(prev_close, 2),
             "day_change_pct": day_change_pct,
             "mom_5d": mom_5d,
+            "mom_10d": mom_10d,
             "mom_20d": mom_20d,
             "sma_5":  round(sma_5,  2) if sma_5  else None,
             "sma_10": round(sma_10, 2) if sma_10 else None,
@@ -454,9 +534,15 @@ def _fetch_technicals_for_ticker(ticker: str) -> dict | None:
             "macd": macd_val,
             "macd_signal": macd_signal,
             "volume": int(latest_vol),
-            "avg_daily_vol_20": avg_daily_vol_20,   # 20-day avg daily volume (liquidity check)
-            "vol_vs_avg_10": vol_ratio_10,           # Relative volume vs 10-day avg
-            "vol_vs_avg_20": vol_ratio_20,           # Relative volume vs 20-day avg (key signal)
+            "avg_daily_vol_20": avg_daily_vol_20,         # 20-day avg daily volume (liquidity check)
+            "vol_vs_avg_10": vol_ratio_10,                 # Relative volume vs 10-day avg
+            "vol_vs_avg_20": vol_ratio_20,                 # Relative volume vs 20-day avg
+            # ── Volatility & stability metrics ───────────────────────────────
+            "atr_pct": atr_pct,                            # ATR as % of price (14-day) — lower = more stable
+            "daily_range_avg_pct": daily_range_avg_pct,   # Avg daily H-L range % (10-day)
+            "consec_up_days": consec_up_days,              # Consecutive green close days
+            "max_daily_drop_5d": max_daily_drop_5d,        # Worst single-day % drop in last 5 days
+            "pct_days_positive_20d": pct_days_positive_20d,  # % of last 20 days that were positive closes
             "earnings_this_week": earnings_this_week,
         }
     except Exception as e:
@@ -542,33 +628,38 @@ def pre_filter_candidates(technicals: list[dict]) -> list[dict]:
     """
     Remove stocks that are obviously unsuitable before sending to AI.
 
+    Strategy focus: LOW-VOLATILITY, STEADY UPTREND stocks only.
+    We want stocks that go up gently or stay flat — NOT volatile movers.
+
     Rejection criteria (all hard stops):
     - Average daily volume < 50,000 shares → liquidity risk at sell time
-    - Earnings this week → too unpredictable
-    - 5-day momentum > +20% → likely exhausted, due for pullback
+    - Earnings this week → too unpredictable / binary event risk
+    - 5-day momentum > +20% → already ran, likely to pull back
     - Price well below both SMA-20 and SMA-50 (> 3%) → confirmed downtrend
     - Heavy negative momentum on both timeframes → falling knife
-    - RSI > 85 → extremely overbought
-
-    Note: Penny stocks (price < $1) are NOT filtered here — they are handled
-    by the volume check (very low-volume pennies won't pass the 50k threshold).
+    - RSI > 85 → extremely overbought with high mean-reversion risk
+    - ATR% > 5% → too volatile (stock swings ±5%+ per day, will hit stop-loss fast)
+    - Worst single-day drop in last 5 days < -4% → recent violent move (unstable)
+    - Stock currently below SMA-5 AND momentum negative → actively declining right now
     """
     filtered = []
     rejected = []
 
     for t in technicals:
-        ticker  = t["ticker"]
-        price   = t.get("price", 0)
-        sma_20  = t.get("sma_20")
-        sma_50  = t.get("sma_50")
-        rsi     = t.get("rsi_14")
-        mom_5d  = t.get("mom_5d")
-        mom_20d = t.get("mom_20d")
-        avg_vol = t.get("avg_daily_vol_20", 0) or 0
+        ticker   = t["ticker"]
+        price    = t.get("price", 0)
+        sma_5    = t.get("sma_5")
+        sma_20   = t.get("sma_20")
+        sma_50   = t.get("sma_50")
+        rsi      = t.get("rsi_14")
+        mom_5d   = t.get("mom_5d")
+        mom_20d  = t.get("mom_20d")
+        avg_vol  = t.get("avg_daily_vol_20", 0) or 0
         earnings = t.get("earnings_this_week", False)
+        atr_pct  = t.get("atr_pct")
+        max_drop = t.get("max_daily_drop_5d")
 
-        # Hard reject: no valid price data (NaN or zero) — cannot calculate
-        # share count and IBKR will have no price to work with either.
+        # Hard reject: no valid price data (NaN or zero)
         if not price or math.isnan(price) or price <= 0:
             rejected.append(f"{ticker}(price=NaN/0)")
             continue
@@ -588,20 +679,39 @@ def pre_filter_candidates(technicals: list[dict]) -> list[dict]:
             rejected.append(f"{ticker}(already+{mom_5d:.1f}%_in_5d)")
             continue
 
-        # Reject: price WELL below both SMA-20 and SMA-50 (strong downtrend)
+        # Hard reject: price WELL below both SMA-20 and SMA-50 (strong downtrend)
         if sma_20 and sma_50 and price < sma_20 * 0.97 and price < sma_50 * 0.97:
             rejected.append(f"{ticker}(well_below_SMA20&50)")
             continue
 
-        # Reject: heavy negative momentum on both timeframes
+        # Hard reject: heavy negative momentum on both timeframes (falling knife)
         if mom_5d is not None and mom_20d is not None:
             if mom_5d < -5.0 and mom_20d < -8.0:
                 rejected.append(f"{ticker}(downtrend:5d={mom_5d}%,20d={mom_20d}%)")
                 continue
 
-        # Reject: extremely overbought
+        # Hard reject: extremely overbought
         if rsi and rsi > 85:
             rejected.append(f"{ticker}(overbought_RSI={rsi})")
+            continue
+
+        # ── NEW: Volatility hard-rejects ─────────────────────────────────────
+        # Hard reject: ATR > 5% of price — stock swings too much per day.
+        # A 3% stop-loss has zero buffer against a stock that moves ±5%/day.
+        if atr_pct is not None and atr_pct > 5.0:
+            rejected.append(f"{ticker}(atr_pct={atr_pct}%>5%)")
+            continue
+
+        # Hard reject: stock had a violent single-day drop of more than -4%
+        # in the last 5 days — signals instability and potential downtrend.
+        if max_drop is not None and max_drop < -4.0:
+            rejected.append(f"{ticker}(max_drop_5d={max_drop:.1f}%<-4%)")
+            continue
+
+        # Hard reject: stock is below its 5-day SMA AND has negative 5-day momentum
+        # — it is actively declining right now, do not buy into a falling stock.
+        if sma_5 and price < sma_5 * 0.99 and mom_5d is not None and mom_5d < -2.0:
+            rejected.append(f"{ticker}(below_SMA5_and_declining:mom5d={mom_5d}%)")
             continue
 
         filtered.append(t)
@@ -613,25 +723,77 @@ def pre_filter_candidates(technicals: list[dict]) -> list[dict]:
 
 
 def verify_ticker_momentum(ticker: str) -> bool:
-    """Quick pre-buy check: reject stocks that are actively crashing."""
+    """Pre-buy volatility and momentum gate.
+
+    Rejects stocks that are:
+    - Actively falling (down > 3% over last 3 days)
+    - Too volatile for a 3% stop-loss (any single day > ±4% in last 5 days)
+    - Currently below their 5-day SMA (declining right now)
+    - Down on the most recent session (price action going the wrong way)
+    """
     try:
         tk = yf.Ticker(ticker)
         hist = tk.history(period="5d", interval="1d")
-        if hist.empty or len(hist) < 3:
+        if hist.empty or len(hist) < 2:
             return True
 
         closes = hist["Close"]
+        highs  = hist["High"]
+        lows   = hist["Low"]
         latest = float(closes.iloc[-1])
-        three_days_ago = float(closes.iloc[0]) if len(closes) >= 3 else latest
-        change = (latest / three_days_ago - 1) * 100
 
-        if change < -5.0:
-            logger.warning(f"Pre-buy check FAILED for {ticker}: down {change:.1f}% over recent sessions")
+        # ── Check 1: 3-day trend — reject if down > 3% ─────────────────────
+        three_days_ago = float(closes.iloc[-3]) if len(closes) >= 3 else float(closes.iloc[0])
+        change_3d = (latest / three_days_ago - 1) * 100
+        if change_3d < -3.0:
+            logger.warning(
+                f"Pre-buy check FAILED for {ticker}: down {change_3d:.1f}% over 3 sessions (threshold: -3%)"
+            )
             return False
+
+        # ── Check 2: Single-day volatility — reject high-swing stocks ──────
+        # If ANY day in the last 5 had a > ±4% intra-day swing, the stock is
+        # too volatile for a 3% stop-loss. We'll hit it within hours.
+        for i in range(len(closes)):
+            try:
+                c = float(closes.iloc[i])
+                h = float(highs.iloc[i])
+                l = float(lows.iloc[i])
+                if c > 0:
+                    intraday_range_pct = (h - l) / c * 100
+                    if intraday_range_pct > 6.0:  # High-low range > 6% = very volatile day
+                        logger.warning(
+                            f"Pre-buy check FAILED for {ticker}: high intra-day range {intraday_range_pct:.1f}% "
+                            f"on day {i} (H={h:.2f}, L={l:.2f}, C={c:.2f}). Too volatile."
+                        )
+                        return False
+            except Exception:
+                continue
+
+        # ── Check 3: Recent session was a down-day ──────────────────────────
+        if len(closes) >= 2:
+            prev = float(closes.iloc[-2])
+            day_change = (latest - prev) / prev * 100 if prev > 0 else 0
+            if day_change < -2.0:
+                logger.warning(
+                    f"Pre-buy check FAILED for {ticker}: most recent session closed down {day_change:.1f}%."
+                )
+                return False
+
+        # ── Check 4: Price below 5-day SMA (actively declining) ────────────
+        if len(closes) >= 5:
+            sma_5 = float(closes.rolling(5).mean().iloc[-1])
+            if latest < sma_5 * 0.98:  # More than 2% below SMA-5
+                logger.warning(
+                    f"Pre-buy check FAILED for {ticker}: price ${latest:.2f} is more than 2% "
+                    f"below 5-day SMA ${sma_5:.2f} — actively declining."
+                )
+                return False
+
         return True
     except Exception as e:
         logger.warning(f"Pre-buy momentum check error for {ticker}: {e}")
-        return True
+        return True  # Fail open — don't block if we can't fetch data
 
 
 def _quick_screen_universe(
@@ -641,18 +803,18 @@ def _quick_screen_universe(
     """
     Dynamically screen the full ticker universe to find today's best candidates.
 
-    Uses yfinance batch download to fetch 1-month daily data for every ticker,
-    compute quick technical metrics, and rank them by a composite score.
+    Strategy focus: LOW-VOLATILITY, STEADY UPTREND stocks.
+    We want stocks that are gradually drifting upward, NOT volatile short-term movers.
 
-    Changes from previous version:
-    - Accepts the full NASDAQ universe (~3,300+ tickers); processes in batches
-      to stay within yfinance limits.
-    - Removed the penny-stock price filter (price < $5 skip) — liquidity is now
-      checked via avg_daily_vol_20 instead.
-    - Added avg_vol_20 check: skip if < 50,000 shares/day (liquidity risk).
-    - Returns top_n=75 instead of 50 to give Gemini more candidates.
+    Scoring philosophy:
+    - HEAVILY PENALISE high ATR/volatility (stocks that swing ±4%+ per day hit stop-losses)
+    - REWARD consistent uptrend alignment (price above SMA-5, SMA-10, SMA-20 all together)
+    - REWARD sustained multi-week momentum (mom_20d) over explosive short-term spikes
+    - REWARD consecutive positive close days (steady drift up)
+    - PENALISE large single-day moves (even if positive — they signal volatility)
+    - Keep liquidity gate (avg vol >= 50k shares/day)
     """
-    logger.info(f"Dynamic screening {len(universe)} tickers to find top {top_n}...")
+    logger.info(f"Dynamic screening {len(universe)} tickers to find top {top_n} (low-vol uptrend focus)...")
 
     scores: list[tuple[str, float]] = []
     BATCH_SIZE = 500  # yfinance handles batches of ~500 well
@@ -666,7 +828,7 @@ def _quick_screen_universe(
         try:
             data = yf.download(
                 batch,
-                period="1mo",
+                period="2mo",  # Extended to 2 months for better MA and volatility calculations
                 interval="1d",
                 group_by="ticker",
                 threads=True,
@@ -682,34 +844,105 @@ def _quick_screen_universe(
                         continue
                     ticker_df = data[ticker]
                     closes  = ticker_df["Close"].dropna()
+                    highs   = ticker_df["High"].dropna()
+                    lows    = ticker_df["Low"].dropna()
                     volumes = ticker_df["Volume"].dropna()
 
                     if len(closes) < 10:
                         continue
 
-                    latest    = float(closes.iloc[-1])
+                    latest     = float(closes.iloc[-1])
                     prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else latest
 
-                    # ── Liquidity gate — skip low-volume stocks ──
+                    # ── Liquidity gate — skip low-volume stocks ──────────────────
                     avg_vol_20 = float(volumes.rolling(20).mean().iloc[-1]) if len(volumes) >= 20 else 0.0
                     if avg_vol_20 < 50_000:
                         continue
 
-                    # ── Quick metrics ──
+                    # ── ATR% volatility gate — skip too-volatile stocks ──────────
+                    # Stocks with ATR > 5% of price will regularly hit a 3% stop-loss
+                    # within hours of purchase. Hard-reject them at the screener level.
+                    atr_pct = None
+                    try:
+                        tr_list = []
+                        for i in range(1, min(15, len(closes))):
+                            h = float(highs.iloc[-i])
+                            l = float(lows.iloc[-i])
+                            c_prev = float(closes.iloc[-(i + 1)])
+                            true_range = max(h - l, abs(h - c_prev), abs(l - c_prev))
+                            tr_list.append(true_range)
+                        if tr_list and latest > 0:
+                            atr_pct = sum(tr_list) / len(tr_list) / latest * 100
+                    except Exception:
+                        pass
+
+                    if atr_pct is not None and atr_pct > 5.0:
+                        continue  # Too volatile — skip entirely
+
+                    # ── Momentum metrics ─────────────────────────────────────────
                     mom_1d  = ((latest / prev_close) - 1) * 100 if prev_close > 0 else 0.0
                     mom_5d  = ((latest / float(closes.iloc[-6]))  - 1) * 100 if len(closes) >= 6  else 0.0
                     mom_10d = ((latest / float(closes.iloc[-11])) - 1) * 100 if len(closes) >= 11 else 0.0
-                    ema_8   = float(closes.ewm(span=8,  adjust=False).mean().iloc[-1]) if len(closes) >= 8  else latest
-                    ema_21  = float(closes.ewm(span=21, adjust=False).mean().iloc[-1]) if len(closes) >= 21 else latest
+                    mom_20d = ((latest / float(closes.iloc[-21])) - 1) * 100 if len(closes) >= 21 else 0.0
+
+                    # Hard rejection: already up > 20% in 5 days → likely to reverse
+                    if mom_5d > 20.0:
+                        continue
+
+                    # Hard rejection: worst single-day drop > 4% in last 5 days → volatile/unstable
+                    try:
+                        worst_drop = min(
+                            (float(closes.iloc[-i]) - float(closes.iloc[-(i + 1)])) / float(closes.iloc[-(i + 1)]) * 100
+                            for i in range(1, min(6, len(closes)))
+                            if float(closes.iloc[-(i + 1)]) > 0
+                        )
+                        if worst_drop < -4.0:
+                            continue
+                    except Exception:
+                        pass
+
+                    # ── Trend alignment metrics ──────────────────────────────────
+                    sma_5   = float(closes.rolling(5).mean().iloc[-1])  if len(closes) >= 5  else latest
                     sma_10  = float(closes.rolling(10).mean().iloc[-1]) if len(closes) >= 10 else latest
                     sma_20  = float(closes.rolling(20).mean().iloc[-1]) if len(closes) >= 20 else latest
+                    ema_8   = float(closes.ewm(span=8,  adjust=False).mean().iloc[-1]) if len(closes) >= 8  else latest
+                    ema_21  = float(closes.ewm(span=21, adjust=False).mean().iloc[-1]) if len(closes) >= 21 else latest
+
+                    above_sma5  = latest > sma_5
                     above_sma10 = latest > sma_10
                     above_sma20 = latest > sma_20
-                    ema_bullish = ema_8 > ema_21
-                    rsi = _compute_rsi(closes) or 50.0
+                    # Full uptrend alignment: SMA-5 > SMA-10 > SMA-20 and price above all
+                    fully_aligned = above_sma5 and above_sma10 and above_sma20 and sma_5 > sma_10 > sma_20
+                    ema_bullish   = ema_8 > ema_21
+
+                    rsi       = _compute_rsi(closes) or 50.0
                     vol_ratio = float(volumes.iloc[-1]) / avg_vol_20 if avg_vol_20 > 0 else 1.0
 
-                    # ── MACD quick check ──
+                    # ── Consecutive up-days streak ───────────────────────────────
+                    consec_up = 0
+                    try:
+                        for i in range(1, min(15, len(closes))):
+                            if float(closes.iloc[-i]) > float(closes.iloc[-(i + 1)]):
+                                consec_up += 1
+                            else:
+                                break
+                    except Exception:
+                        pass
+
+                    # ── % positive days in last 20 ───────────────────────────────
+                    pct_positive_20d = 50.0
+                    try:
+                        n = min(20, len(closes) - 1)
+                        if n > 0:
+                            up_days = sum(
+                                1 for i in range(1, n + 1)
+                                if float(closes.iloc[-i]) > float(closes.iloc[-(i + 1)])
+                            )
+                            pct_positive_20d = up_days / n * 100
+                    except Exception:
+                        pass
+
+                    # ── MACD quick check ─────────────────────────────────────────
                     macd_bullish = False
                     if len(closes) >= 26:
                         ema12 = closes.ewm(span=12, adjust=False).mean()
@@ -718,45 +951,96 @@ def _quick_screen_universe(
                         signal_line = macd_line.ewm(span=9, adjust=False).mean()
                         macd_bullish = float(macd_line.iloc[-1]) > float(signal_line.iloc[-1])
 
-                    # ── Composite score ──
+                    # ══════════════════════════════════════════════════════════
+                    # COMPOSITE SCORE — LOW-VOL STEADY UPTREND STRATEGY
+                    # ══════════════════════════════════════════════════════════
                     score = 0.0
 
-                    # Momentum (biggest weight)
-                    score += mom_1d  * 3.0
-                    score += mom_5d  * 2.0
-                    score += mom_10d * 1.0
+                    # ── Sustained momentum (slow and steady wins the race) ────
+                    # Weight LONGER-TERM momentum more than short-term spikes.
+                    # mom_20d captures the underlying trend; mom_1d is de-emphasised.
+                    score += mom_20d * 2.0   # 20-day sustained drift (primary)
+                    score += mom_10d * 1.5   # 10-day trend continuation
+                    score += mom_5d  * 0.5   # 5-day (small weight — avoid spike chasers)
+                    # mom_1d gets a small contribution only if it's a gentle positive day
+                    if 0 < mom_1d < 2.0:
+                        score += mom_1d * 0.5  # Gentle green day — slight bonus
+                    elif mom_1d > 4.0:
+                        score -= mom_1d * 0.5  # Big single-day spike — slight penalty
 
-                    # Hard rejection: already up > 20% in 5 days → likely exhausted
-                    if mom_5d > 20.0:
-                        continue
+                    # ── Volatility penalty (critical for stop-loss survival) ──
+                    # High ATR = high chance of hitting a 3% stop-loss intra-day.
+                    if atr_pct is not None:
+                        if atr_pct < 1.5:    # Very stable (e.g. large-cap blue chips)
+                            score += 20
+                        elif atr_pct < 2.5:  # Stable
+                            score += 12
+                        elif atr_pct < 3.5:  # Moderate — OK
+                            score += 4
+                        elif atr_pct < 4.5:  # Somewhat volatile — penalty
+                            score -= 10
+                        else:                # Very volatile — large penalty
+                            score -= 25
 
-                    # RSI sweet-spot
-                    if 40 <= rsi <= 65:
-                        score += 15
-                    elif 30 <= rsi <= 75:
-                        score += 5
-                    elif rsi > 80:
-                        score -= 20
+                    # ── Steady uptrend alignment (key signal for our strategy) ─
+                    if fully_aligned:
+                        score += 25   # All MAs stacked correctly — strong signal
                     else:
-                        score -= 10
+                        if above_sma20:
+                            score += 10
+                        else:
+                            score -= 15  # Below SMA-20 = downtrend
+                        if above_sma10:
+                            score += 5
+                        if above_sma5:
+                            score += 3
 
-                    # Trend alignment
-                    score += 10 if above_sma20 else -10
-                    score += 5  if above_sma10 else -5
-                    score += 8  if ema_bullish  else -4
-                    score += 8  if macd_bullish else -5
+                    score += 8 if ema_bullish  else -4
+                    score += 6 if macd_bullish else -3
 
-                    # Relative volume (1.5x+ is a strong signal per requirements)
-                    if vol_ratio > 2.0:
-                        score += 20
-                    elif vol_ratio > 1.5:
-                        score += 14
-                    elif vol_ratio > 1.2:
-                        score += 7
-                    elif vol_ratio > 1.0:
-                        score += 3
+                    # ── Consecutive green days (consistency bonus) ────────────
+                    if consec_up >= 5:
+                        score += 18   # 5+ days in a row going up
+                    elif consec_up >= 3:
+                        score += 10   # 3-4 days in a row
+                    elif consec_up >= 1:
+                        score += 4    # At least today is green
+                    else:
+                        score -= 5    # Closed down today — caution
 
-                    # Core mega-cap bonus
+                    # ── Consistency of positive days (% of 20 days) ──────────
+                    if pct_positive_20d >= 70:
+                        score += 15   # Very consistent bullish behaviour
+                    elif pct_positive_20d >= 60:
+                        score += 8
+                    elif pct_positive_20d >= 50:
+                        score += 2
+                    else:
+                        score -= 8    # More down-days than up-days recently
+
+                    # ── RSI sweet-spot (uptrending but not overbought) ────────
+                    if 45 <= rsi <= 65:
+                        score += 15   # Ideal: trending up, room to run
+                    elif 35 <= rsi <= 72:
+                        score += 5    # Acceptable
+                    elif rsi > 75:
+                        score -= 15   # Overbought — likely to stall or reverse
+                    else:
+                        score -= 10   # Oversold — could be a falling knife
+
+                    # ── Volume: prefer normal-to-slightly-elevated (not a spike) ─
+                    # We DON'T want volume spikes here — those signal volatility.
+                    # Steady moderate volume = institutional accumulation.
+                    if 0.9 <= vol_ratio <= 1.5:
+                        score += 10   # Normal/modest volume — healthy steady move
+                    elif 1.5 < vol_ratio <= 2.5:
+                        score += 5    # Slightly elevated — acceptable
+                    elif vol_ratio > 2.5:
+                        score -= 5    # Volume spike — more likely a volatile day
+                    else:
+                        score += 2    # Below-average volume — still OK for our strategy
+
+                    # ── Core mega-cap bonus (blue chips tend to be more stable) ─
                     if ticker in CORE_TICKERS:
                         score += 8
 
@@ -775,7 +1059,7 @@ def _quick_screen_universe(
     core_in_list = [t for t, _ in hot_list if t in CORE_TICKERS]
     logger.info(
         f"Dynamic screening complete. Screened {len(scores)} tickers. "
-        f"Selected top {len(hot_list)}. "
+        f"Selected top {len(hot_list)} (low-vol uptrend strategy). "
         f"Top 10 by score: {top10} | "
         f"Core tickers in hot list: {len(core_in_list)}/{len(CORE_TICKERS)}"
     )
@@ -847,67 +1131,91 @@ TECHNICAL DATA (real-time indicators):
             )
 
     prompt = f"""You are an elite quantitative swing-trading AI analysing NASDAQ stocks for the week of {today}.
-Your job is to identify stocks that are highly likely to trend upward over the next 3–5 trading days.
 
-═══ TARGET ═══
-Aim to recommend 5 to 15 stocks. Prioritise quality, but ensure the portfolio is diversified
-and not over-concentrated. An empty list or fewer than 5 picks (when viable candidates exist)
-is a poor outcome. If the market offers strong setups, populate the full 5–15 range.
+═══ STRATEGY MANDATE ═══
+Your PRIMARY OBJECTIVE is capital preservation with steady, low-risk gains.
+The portfolio has been LOSING money daily because volatile, high-momentum stocks
+hit the 3% stop-loss within hours of purchase. You MUST avoid this.
+
+Target stocks that will:
+  ✅ STAY around the same price or drift GENTLY UPWARD (1–5% gain over 1–5 days)
+  ✅ Have LOW daily volatility — small intra-day swings (ATR < 3% of price ideally)
+  ✅ Be in a stable, confirmed uptrend (price above SMA-5, SMA-10, SMA-20 all aligned)
+  ✅ Have CONSISTENT recent performance (majority of days closing positive)
+
+  ❌ DO NOT pick explosive short-term movers, meme stocks, or volatile small-caps
+  ❌ DO NOT pick stocks with recent big single-day swings (even if upward)
+  ❌ DO NOT pick stocks based purely on news hype — price action must confirm the stability
+
+Think of this like picking a reliable car for a long trip — not the fastest sports car
+that might spin out, but a steady vehicle that gets you there safely.
+
+═══ TARGET PICKS ═══
+Aim for 5 to 12 stocks. Prioritise quality and stability over quantity.
+Fewer high-quality low-volatility picks are far better than many volatile ones.
 
 ═══ MARKET REGIME ═══
 {regime_section}
 
 ═══ HARD EXCLUSION CRITERIA (disqualify entirely — no exceptions) ═══
 1. ❌ Earnings announced this week (earnings_this_week = true) — binary risk, too unpredictable
-2. ❌ Stock has already risen > 20% in the last 5 days (mom_5d > 20%) — likely exhausted
+2. ❌ Stock has already risen > 20% in the last 5 days (mom_5d > 20%) — exhausted, likely to reverse
 3. ❌ Average daily volume < 50,000 shares (avg_daily_vol_20 < 50k) — cannot exit safely
-4. ❌ Major negative news: lawsuits, earnings misses, FDA rejections, downgrades
-5. ❌ RSI > 85 — extremely overbought with high mean-reversion risk
+4. ❌ Major negative news: lawsuits, earnings misses, FDA rejections, analyst downgrades
+5. ❌ RSI > 80 — severely overbought, high mean-reversion risk
 6. ❌ Price significantly (> 3%) below both SMA-20 AND SMA-50 — confirmed downtrend
+7. ❌ ATR% > 4% — stock swings too much per day, WILL hit a 3% stop-loss within hours
+8. ❌ Any single day in the last 5 had a drop of more than -4% — stock is unstable
+9. ❌ Stock is currently below its SMA-5 with negative short-term momentum — actively declining
 
-═══ PRIORITY BUY SIGNALS (aim for at least 2 of these) ═══
-1. ✅ Pre-market green on Monday morning (day_change_pct > 0 at open)
-2. ✅ Elevated relative volume (vol_vs_avg_20 >= 1.5x) — institutional interest
-3. ✅ Strong positive 5-day momentum (mom_5d > 3%) entering the week
-4. ✅ Positive news catalyst in the last 72 hours (earnings beat, analyst upgrade,
-      product launch, contract win, FDA approval, sector tailwind)
-5. ✅ EMA-8 crossing or holding ABOVE EMA-21 (swing momentum burst)
-6. ✅ MACD line above signal line (bullish crossover)
-7. ✅ RSI between 50–70 — sweet spot: trending but not overbought
-8. ✅ Price ABOVE SMA-20 — short-term uptrend confirmed
+═══ PRIORITY BUY SIGNALS (ideal: 3 or more of these) ═══
+1. ✅ LOW VOLATILITY — atr_pct < 2.5%, daily_range_avg_pct < 3% — stock barely wiggles
+2. ✅ STRONG UPTREND ALIGNMENT — price above SMA-5 > SMA-10 > SMA-20 all stacked correctly
+3. ✅ CONSISTENT POSITIVE DAYS — pct_days_positive_20d > 60% AND consec_up_days >= 2
+4. ✅ SUSTAINED SLOW MOMENTUM — mom_20d > 3% AND mom_10d > 1% (gradual, not a spike)
+5. ✅ RSI between 45–65 — trending up steadily, not overbought, not oversold
+6. ✅ EMA-8 ABOVE EMA-21 — short-term EMAs confirm the uptrend
+7. ✅ MACD line above signal line — trend continuation confirmed
+8. ✅ Positive fundamental catalyst (earnings beat, product launch, analyst upgrade)
+   that caused a STEADY, measured price rise (not a spike)
+9. ✅ Volume at or near average (0.9x–1.5x) — institutional accumulation, not speculation
 
-═══ DEPRIORITISE (may still include if other signals are very strong) ═══
-- No news catalyst — technicals alone can justify inclusion
-- RSI 70–85 — include only if news catalyst is very strong
-- Low-price stocks — fine to include if volume spike is significant (>= 1.5x 20-day avg)
+═══ WARNING SIGNS (reject or heavily discount these patterns) ═══
+- Recent volume spike > 3x average (signals speculative activity, high volatility risk)
+- Stock up > 5% on any single day in the last 5 days (too volatile)
+- RSI > 72 (likely to stall)
+- Below-average volume combined with falling price (distribution / weak demand)
+- Negative or flat 20-day momentum despite recent short-term bounce (dead-cat bounce risk)
 
 ═══ ANALYSIS WEIGHTS ═══
-1. Technical Momentum (35%): EMA-8/21 alignment, SMA-20 position, MACD, vol_vs_avg_20
-2. News Catalyst (30%): earnings beats, upgrades, launches, sector tailwinds
-3. Trend Confirmation (20%): price vs MAs, multi-timeframe momentum (mom_5d, mom_20d)
-4. Risk Management (15%): liquidity, avoid binary events, avoid overbought extremes
+1. Volatility & Stability (35%): atr_pct, daily_range_avg_pct, max_daily_drop_5d, consec_up_days
+2. Trend Quality (30%): price vs SMA-5/10/20 alignment, EMA-8/21, MACD, pct_days_positive_20d
+3. Sustained Momentum (20%): mom_20d, mom_10d (preferred), mom_5d (minor weight)
+4. Risk Management (15%): liquidity, avoid binary events, RSI range, news sentiment
 
 ═══ CONFIDENCE & POSITION SIZING ═══
-- 0.80–1.00: Multiple strong catalysts + excellent technicals → position_size_pct = 12–20%
-- 0.65–0.79: Good setup with 2+ buy signals → position_size_pct = 7–12%
-- 0.50–0.64: Decent setup, at least 1 strong signal → position_size_pct = 3–7%
-- Below 0.50: Do NOT recommend
+- 0.80–1.00: Low-vol, fully-aligned, consistent uptrend + positive catalyst → position_size_pct = 10–18%
+- 0.65–0.79: Good stable setup with 3+ buy signals → position_size_pct = 7–12%
+- 0.55–0.64: Decent stable setup, at least 2 signals, moderate volatility → position_size_pct = 3–7%
+- Below 0.55: Do NOT recommend — insufficient confidence for capital deployment
 {market_caution}
 Position sizes should sum to approximately 100% across all picks.
-Higher confidence picks get larger allocations. Adjust so the total is sensible.
+Stable, lower-volatility picks with higher consistency deserve larger allocations.
+Avoid giving large allocations to picks that only have 1 signal — spread the risk.
 
 ═══ NEWS DATA ═══
 {news_json}
 {tech_section}
 ═══ OUTPUT FORMAT ═══
 Respond ONLY with a valid JSON array. No markdown fences, no explanation outside the JSON.
-Each recommendation MUST reference specific data points from the data above.
+Each recommendation MUST reference specific volatility and stability data points (atr_pct,
+consec_up_days, pct_days_positive_20d) alongside any news catalyst.
 [
   {{
-    "ticker": "NVDA",
-    "reason": "Earnings beat by 22% last week, 3 analyst upgrades to $1,100 PT. Technicals: RSI 58, price $870 above SMA-20 ($840), EMA-8 ($855) > EMA-21 ($830), MACD bullish, vol_vs_avg_20 = 2.3x, mom_5d +4.1%. Strong momentum entering the week with institutional volume confirmation.",
-    "confidence": 0.87,
-    "position_size_pct": 18
+    "ticker": "MSFT",
+    "reason": "Classic low-volatility steady uptrend. atr_pct=1.8% (very stable), price $415 above SMA-5($410)>SMA-10($405)>SMA-20($398) all stacked. consec_up_days=4, pct_days_positive_20d=70%. RSI 58 (sweet spot). EMA-8 > EMA-21, MACD bullish. mom_20d +3.2% (slow steady drift). Volume near average (1.1x). Azure cloud growth news adds mild catalyst. Ideal low-vol hold.",
+    "confidence": 0.84,
+    "position_size_pct": 15
   }}
 ]"""
 

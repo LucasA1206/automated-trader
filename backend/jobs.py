@@ -988,8 +988,13 @@ def job_monitor_swing_trades():
     """
     Runs periodically during market hours.
     Checks all open positions:
-    - If price drops >= 5% from buy_price (stop-loss): sell ALL, record final P&L.
-    - If price rises >= 10% from buy_price (take-profit): sell ALL shares, record final P&L.
+    - If price drops >= 3% from buy_price (stop-loss): sell ALL, record final P&L.
+    - If price rises >= 5% from buy_price (take-profit): sell ALL shares, record final P&L.
+
+    Thresholds match the bracket orders placed by place_bracket_orders() in trader.py
+    (stop_pct=0.03, profit_pct=0.05). The software monitor is a belt-and-suspenders
+    fallback for cases where the IBKR OCA bracket orders do not fire (e.g., data gaps,
+    gateway restart, paper-trading quirks).
 
     After any full exit, the system logs how many slots are now open.
     Replacement stocks will be bought at the next morning scan (09:30 ET)
@@ -1124,8 +1129,8 @@ def job_monitor_swing_trades():
                 ticker, buy_price, current_price, pct_change,
             )
 
-            # ── Stop Loss (>= 5% drop from buy price) ──────────────────────────
-            if current_price <= buy_price * 0.95:
+            # ── Stop Loss (>= 3% drop from buy price) ──────────────────────────
+            if current_price <= buy_price * 0.97:
                 # Mark as "closing" BEFORE placing the order so concurrent runs
                 # see this and skip the trade (idempotent sell guard).
                 previous_status = trade.status
@@ -1170,8 +1175,8 @@ def job_monitor_swing_trades():
                               f"❌ Stop-loss sell failed for {ticker}: "
                               f"{result.get('error')}. Will retry next cycle.", "ERROR")
 
-            # ── Take Profit (>= 10% rise) — sell ALL shares and close ──────────
-            elif current_price >= buy_price * 1.10 and trade.status == "open":
+            # ── Take Profit (>= 5% rise) — sell ALL shares and close ────────────
+            elif current_price >= buy_price * 1.05 and trade.status == "open":
                 # Mark as "closing" BEFORE placing the order (idempotent guard).
                 trade.status = "closing"
                 db.commit()
