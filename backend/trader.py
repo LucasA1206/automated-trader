@@ -553,8 +553,8 @@ class IBKRClient:
         contract,
         shares: int,
         fill_price: float,
-        stop_pct: float = 0.05,
-        profit_pct: float = 0.10,
+        stop_pct: float = 0.03,
+        profit_pct: float = 0.05,
     ) -> dict:
         """
         Places a GTC stop-loss and take-profit OCA pair after a buy fills.
@@ -562,13 +562,21 @@ class IBKRClient:
         Both legs are linked via an OCA (One Cancels All) group so that
         whichever triggers first automatically cancels the other.
 
+        Strategy rationale (low-volatility uptrend approach):
+        - stop_pct = 3%: Low-vol stocks (ATR < 3%) shouldn't normally move 3%
+          against us in a single day, giving adequate protection without being
+          triggered by normal intra-day noise.
+        - profit_pct = 5%: Realistic target for slow, steady risers within
+          1–5 trading days. More aggressive targets (e.g., 10%) are too far
+          away for stable stocks to reach reliably.
+
         Args:
             ticker:      Stock symbol (for logging).
             contract:    Already-qualified IBKR contract object.
             shares:      Number of shares that were bought.
             fill_price:  Actual fill price of the buy order.
-            stop_pct:    Fraction below fill price for stop-loss  (default 0.05 = 5%).
-            profit_pct:  Fraction above fill price for take-profit (default 0.10 = 10%).
+            stop_pct:    Fraction below fill price for stop-loss  (default 0.03 = 3%).
+            profit_pct:  Fraction above fill price for take-profit (default 0.05 = 5%).
 
         Returns a dict with stop/TP prices and order IDs (best-effort).
         """
