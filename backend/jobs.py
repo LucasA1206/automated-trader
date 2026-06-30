@@ -296,7 +296,7 @@ def _run_scan_phase(db, log_prefix: str = "morning", num_picks: int | None = Non
                           f"Slots to fill: {effective_pick_limit}")
 
     # AI Scan — returns (ai_picks, screener_fallback_candidates)
-    recommendations, screened_candidates = run_daily_scan()
+    recommendations, screened_candidates = run_daily_scan(num_picks=effective_pick_limit)
 
     # Sort AI picks by confidence (highest first)
     recommendations.sort(key=lambda r: r.get("confidence", 0), reverse=True)

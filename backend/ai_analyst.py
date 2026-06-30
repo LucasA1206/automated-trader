@@ -1072,6 +1072,7 @@ def analyse_with_gemini(
     news_data: list[dict],
     technicals: list[dict] | None = None,
     market_regime: dict | None = None,
+    num_picks: int = 5,
 ) -> list[dict]:
     """
     Uses Gemini to analyse news + technical data and return ranked stock
@@ -1151,7 +1152,9 @@ Think of this like picking a reliable car for a long trip — not the fastest sp
 that might spin out, but a steady vehicle that gets you there safely.
 
 ═══ TARGET PICKS ═══
-Aim for 5 to 12 stocks. Prioritise quality and stability over quantity.
+Return exactly {num_picks} stock pick(s), ranked by confidence (highest first).
+Prioritise quality and stability over quantity — if you cannot find {num_picks} picks that meet the
+quality bar above, return fewer rather than forcing low-confidence or high-volatility stocks.
 Fewer high-quality low-volatility picks are far better than many volatile ones.
 
 ═══ MARKET REGIME ═══
@@ -1252,10 +1255,13 @@ consec_up_days, pct_days_positive_20d) alongside any news catalyst.
         return []
 
 
-def run_daily_scan() -> tuple[list[dict], list[dict]]:
+def run_daily_scan(num_picks: int = 5) -> tuple[list[dict], list[dict]]:
     """
     Main entry point: scans the full NASDAQ market and returns AI-ranked stock picks
     PLUS the pre-filtered screener candidates for use as a guaranteed fallback.
+
+    num_picks controls how many picks to ask the AI for (should match the number
+    of open portfolio slots so the AI targets exactly the right number).
 
     Returns a 2-tuple:
       (ai_recommendations, screened_candidates)
@@ -1376,7 +1382,7 @@ def run_daily_scan() -> tuple[list[dict], list[dict]]:
     )
 
     # Step 8: AI analysis with news + filtered technicals + market context
-    recommendations = analyse_with_gemini(all_news, filtered_technicals, market_regime)
+    recommendations = analyse_with_gemini(all_news, filtered_technicals, market_regime, num_picks=num_picks)
 
     picks = [f"{r['ticker']}({r['confidence']:.0%})" for r in recommendations]
     logger.info(f"═══ Scan complete. AI: {len(recommendations)} pick(s): {picks} | "
