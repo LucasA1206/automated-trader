@@ -11,10 +11,15 @@ interface AIPick {
   created_at: string | null;
 }
 
-interface AIPicksData {
+interface DayGroup {
   scan_date: string | null;
   total: number;
   picks: AIPick[];
+}
+
+interface AIPicksData {
+  days: DayGroup[];
+  total_days: number;
 }
 
 type AuthFetch = (url: string, init?: RequestInit) => Promise<Response>;
@@ -88,10 +93,22 @@ function formatScanDate(dateStr: string | null): string {
   });
 }
 
+function isToday(dateStr: string | null): boolean {
+  if (!dateStr) return false;
+  const today = new Date();
+  const d = new Date(dateStr + 'T00:00:00');
+  return (
+    d.getFullYear() === today.getFullYear() &&
+    d.getMonth() === today.getMonth() &&
+    d.getDate() === today.getDate()
+  );
+}
+
 export default function AIPicksTab({ authFetch }: { authFetch: AuthFetch }) {
   const [data, setData] = useState<AIPicksData | null>(null);
   const [loading, setLoading] = useState(true);
-  const [expandedRank, setExpandedRank] = useState<number | null>(null);
+  // Keyed by `${scan_date}-${rank}` to handle multiple days
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
   const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null);
 
   const fetchPicks = useCallback(async () => {
@@ -114,7 +131,9 @@ export default function AIPicksTab({ authFetch }: { authFetch: AuthFetch }) {
     return () => clearInterval(interval);
   }, [fetchPicks]);
 
-  const totalAlloc = data?.picks.reduce((s, p) => s + p.position_size_pct, 0) ?? 0;
+  const latestDay = data?.days?.[0] ?? null;
+  const totalAlloc = latestDay?.picks.reduce((s, p) => s + p.position_size_pct, 0) ?? 0;
+  const hasPicks = (data?.days?.length ?? 0) > 0;
 
   return (
     <div>
@@ -124,7 +143,7 @@ export default function AIPicksTab({ authFetch }: { authFetch: AuthFetch }) {
           <div>
             <h2>AI Picks</h2>
             <p>
-              This week&apos;s Gemini-ranked stock recommendations
+              Gemini-ranked stock recommendations by scan day
               {lastRefreshed && ` · Refreshed ${lastRefreshed.toLocaleTimeString()}`}
             </p>
           </div>
@@ -139,8 +158,8 @@ export default function AIPicksTab({ authFetch }: { authFetch: AuthFetch }) {
         </div>
       </div>
 
-      {/* ── Scan date banner ─────────────────────────────────────── */}
-      {data?.scan_date && (
+      {/* ── Latest scan summary banner ────────────────────────────── */}
+      {latestDay && (
         <div style={{
           display: 'flex', alignItems: 'center', gap: 12,
           padding: '12px 20px', borderRadius: 12, marginBottom: 24,
@@ -150,11 +169,20 @@ export default function AIPicksTab({ authFetch }: { authFetch: AuthFetch }) {
           <span style={{ fontSize: 18 }}>🤖</span>
           <div>
             <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--accent-blue)', marginBottom: 1 }}>
-              Latest Scan — {formatScanDate(data.scan_date)}
+              Latest Scan — {formatScanDate(latestDay.scan_date)}
+              {isToday(latestDay.scan_date) && (
+                <span style={{
+                  marginLeft: 8, fontSize: 10, fontWeight: 700,
+                  background: 'rgba(34,197,94,0.15)', color: '#22c55e',
+                  border: '1px solid rgba(34,197,94,0.3)',
+                  borderRadius: 6, padding: '1px 6px',
+                }}>TODAY</span>
+              )}
             </div>
             <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-              {data.total} stock{data.total !== 1 ? 's' : ''} selected ·{' '}
-              Total allocation: {totalAlloc.toFixed(0)}%
+              {latestDay.total} stock{latestDay.total !== 1 ? 's' : ''} selected ·{' '}
+              Total allocation: {totalAlloc.toFixed(0)}% ·{' '}
+              {data!.total_days} day{data!.total_days !== 1 ? 's' : ''} of history
             </div>
           </div>
         </div>
@@ -169,7 +197,7 @@ export default function AIPicksTab({ authFetch }: { authFetch: AuthFetch }) {
         </div>
       )}
 
-      {!loading && (!data || data.picks.length === 0) && (
+      {!loading && !hasPicks && (
         <div className="table-container">
           <div className="empty-state">
             <div className="icon">🔍</div>
@@ -181,109 +209,156 @@ export default function AIPicksTab({ authFetch }: { authFetch: AuthFetch }) {
         </div>
       )}
 
-      {/* ── Picks list ───────────────────────────────────────────── */}
-      {!loading && data && data.picks.length > 0 && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {data.picks.map((pick) => {
-            const isExpanded = expandedRank === pick.rank;
-            const confPct = Math.round(pick.confidence * 100);
-
-            // Bar width for the confidence visualiser
-            const barColor =
-              confPct >= 80 ? '#22c55e'
-              : confPct >= 65 ? '#86efac'
-              : confPct >= 55 ? '#3b82f6'
-              : '#eab308';
-
+      {/* ── Picks list grouped by day ─────────────────────────────── */}
+      {!loading && hasPicks && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 28 }}>
+          {data!.days.map((day) => {
+            const dayTotalAlloc = day.picks.reduce((s, p) => s + p.position_size_pct, 0);
             return (
-              <div
-                key={pick.rank}
-                style={{
-                  background: 'var(--bg-card)',
-                  border: '1px solid var(--border)',
-                  borderRadius: 14,
-                  overflow: 'hidden',
-                  transition: 'border-color 0.15s, box-shadow 0.15s',
-                  boxShadow: isExpanded ? '0 4px 24px rgba(0,0,0,0.2)' : 'none',
-                  borderColor: isExpanded ? 'var(--border-bright)' : 'var(--border)',
-                }}
-              >
-                {/* ── Pick header row ─────────────────────────── */}
-                <div
-                  onClick={() => setExpandedRank(isExpanded ? null : pick.rank)}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: 16,
-                    padding: '18px 20px',
-                    cursor: 'pointer',
-                    userSelect: 'none',
-                  }}
-                >
-                  <RankBadge rank={pick.rank} />
-
-                  <div style={{ fontWeight: 800, fontSize: 17, color: 'var(--text-primary)', letterSpacing: '0.5px', minWidth: 60 }}>
-                    {pick.ticker}
-                  </div>
-
-                  {/* Confidence bar */}
-                  <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    <div style={{ height: 5, background: 'rgba(255,255,255,0.06)', borderRadius: 3, overflow: 'hidden' }}>
-                      <div style={{
-                        height: '100%',
-                        width: `${confPct}%`,
-                        background: barColor,
-                        borderRadius: 3,
-                        transition: 'width 0.4s ease',
-                        boxShadow: `0 0 6px ${barColor}80`,
-                      }} />
-                    </div>
-                    <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
-                      {pick.reason.split('.')[0].slice(0, 80)}{pick.reason.length > 80 ? '…' : ''}
-                    </div>
-                  </div>
-
-                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6, flexShrink: 0 }}>
-                    <ConfidenceBadge confidence={pick.confidence} />
-                    <PositionSizePill pct={pick.position_size_pct} />
-                  </div>
-
+              <div key={day.scan_date}>
+                {/* ── Day header ────────────────────────────── */}
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12,
+                }}>
                   <div style={{
-                    color: 'var(--text-muted)', fontSize: 14,
-                    transition: 'transform 0.2s', transform: isExpanded ? 'rotate(180deg)' : 'rotate(0deg)',
-                    flexShrink: 0, marginLeft: 4,
+                    height: 1, flex: 1,
+                    background: 'var(--border)',
+                  }} />
+                  <div style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    padding: '4px 14px', borderRadius: 20,
+                    background: 'var(--bg-card)',
+                    border: '1px solid var(--border)',
+                    fontSize: 11, fontWeight: 700,
+                    color: 'var(--text-secondary)',
+                    whiteSpace: 'nowrap',
                   }}>
-                    ▾
+                    📅 {formatScanDate(day.scan_date)}
+                    {isToday(day.scan_date) && (
+                      <span style={{
+                        fontSize: 10, fontWeight: 700,
+                        background: 'rgba(34,197,94,0.15)', color: '#22c55e',
+                        border: '1px solid rgba(34,197,94,0.3)',
+                        borderRadius: 4, padding: '1px 5px',
+                      }}>TODAY</span>
+                    )}
+                    <span style={{ color: 'var(--text-muted)', fontWeight: 400 }}>
+                      · {day.total} pick{day.total !== 1 ? 's' : ''} · {dayTotalAlloc.toFixed(0)}% alloc
+                    </span>
                   </div>
+                  <div style={{
+                    height: 1, flex: 1,
+                    background: 'var(--border)',
+                  }} />
                 </div>
 
-                {/* ── Expanded rationale ──────────────────────── */}
-                {isExpanded && (
-                  <div style={{
-                    borderTop: '1px solid var(--border)',
-                    padding: '18px 20px',
-                    background: 'rgba(59,130,246,0.03)',
-                  }}>
-                    <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--accent-blue)', marginBottom: 10, letterSpacing: '0.5px', textTransform: 'uppercase' }}>
-                      AI Rationale
-                    </div>
-                    <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.7 }}>
-                      {pick.reason}
-                    </div>
-                    <div style={{ display: 'flex', gap: 16, marginTop: 14, flexWrap: 'wrap' }}>
-                      <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                        <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>Confidence: </span>
-                        <span style={{ fontFamily: "'JetBrains Mono', monospace", color: barColor, fontWeight: 700 }}>
-                          {confPct}%
-                        </span>
+                {/* ── Pick cards for this day ────────────────── */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                  {day.picks.map((pick) => {
+                    const pickKey = `${day.scan_date}-${pick.rank}`;
+                    const isExpanded = expandedKey === pickKey;
+                    const confPct = Math.round(pick.confidence * 100);
+
+                    // Bar width for the confidence visualiser
+                    const barColor =
+                      confPct >= 80 ? '#22c55e'
+                      : confPct >= 65 ? '#86efac'
+                      : confPct >= 55 ? '#3b82f6'
+                      : '#eab308';
+
+                    return (
+                      <div
+                        key={pickKey}
+                        style={{
+                          background: 'var(--bg-card)',
+                          border: '1px solid var(--border)',
+                          borderRadius: 14,
+                          overflow: 'hidden',
+                          transition: 'border-color 0.15s, box-shadow 0.15s',
+                          boxShadow: isExpanded ? '0 4px 24px rgba(0,0,0,0.2)' : 'none',
+                          borderColor: isExpanded ? 'var(--border-bright)' : 'var(--border)',
+                        }}
+                      >
+                        {/* ── Pick header row ─────────────────────────── */}
+                        <div
+                          onClick={() => setExpandedKey(isExpanded ? null : pickKey)}
+                          style={{
+                            display: 'flex', alignItems: 'center', gap: 16,
+                            padding: '18px 20px',
+                            cursor: 'pointer',
+                            userSelect: 'none',
+                          }}
+                        >
+                          <RankBadge rank={pick.rank} />
+
+                          <div style={{ fontWeight: 800, fontSize: 17, color: 'var(--text-primary)', letterSpacing: '0.5px', minWidth: 60 }}>
+                            {pick.ticker}
+                          </div>
+
+                          {/* Confidence bar */}
+                          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                            <div style={{ height: 5, background: 'rgba(255,255,255,0.06)', borderRadius: 3, overflow: 'hidden' }}>
+                              <div style={{
+                                height: '100%',
+                                width: `${confPct}%`,
+                                background: barColor,
+                                borderRadius: 3,
+                                transition: 'width 0.4s ease',
+                                boxShadow: `0 0 6px ${barColor}80`,
+                              }} />
+                            </div>
+                            <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+                              {pick.reason.split('.')[0].slice(0, 80)}{pick.reason.length > 80 ? '…' : ''}
+                            </div>
+                          </div>
+
+                          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6, flexShrink: 0 }}>
+                            <ConfidenceBadge confidence={pick.confidence} />
+                            <PositionSizePill pct={pick.position_size_pct} />
+                          </div>
+
+                          <div style={{
+                            color: 'var(--text-muted)', fontSize: 14,
+                            transition: 'transform 0.2s', transform: isExpanded ? 'rotate(180deg)' : 'rotate(0deg)',
+                            flexShrink: 0, marginLeft: 4,
+                          }}>
+                            ▾
+                          </div>
+                        </div>
+
+                        {/* ── Expanded rationale ──────────────────────── */}
+                        {isExpanded && (
+                          <div style={{
+                            borderTop: '1px solid var(--border)',
+                            padding: '18px 20px',
+                            background: 'rgba(59,130,246,0.03)',
+                          }}>
+                            <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--accent-blue)', marginBottom: 10, letterSpacing: '0.5px', textTransform: 'uppercase' }}>
+                              AI Rationale
+                            </div>
+                            <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.7 }}>
+                              {pick.reason}
+                            </div>
+                            <div style={{ display: 'flex', gap: 16, marginTop: 14, flexWrap: 'wrap' }}>
+                              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                                <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>Confidence: </span>
+                                <span style={{ fontFamily: "'JetBrains Mono', monospace", color: barColor, fontWeight: 700 }}>
+                                  {confPct}%
+                                </span>
+                              </div>
+                              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                                <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>Suggested Allocation: </span>
+                                <span style={{ fontFamily: "'JetBrains Mono', monospace", color: '#a855f7', fontWeight: 700 }}>
+                                  {pick.position_size_pct.toFixed(0)}% of capital
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        )}
                       </div>
-                      <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                        <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>Suggested Allocation: </span>
-                        <span style={{ fontFamily: "'JetBrains Mono', monospace", color: '#a855f7', fontWeight: 700 }}>
-                          {pick.position_size_pct.toFixed(0)}% of capital
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-                )}
+                    );
+                  })}
+                </div>
               </div>
             );
           })}
@@ -291,11 +366,12 @@ export default function AIPicksTab({ authFetch }: { authFetch: AuthFetch }) {
       )}
 
       {/* ── Info footer ─────────────────────────────────────────── */}
-      {!loading && data && data.picks.length > 0 && (
+      {!loading && hasPicks && (
         <div style={{ marginTop: 20, padding: '12px 16px', borderRadius: 10, background: 'rgba(255,255,255,0.02)', border: '1px solid var(--border)', fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6 }}>
           <strong style={{ color: 'var(--text-secondary)' }}>How picks are generated: </strong>
-          The AI scans the full NASDAQ universe every Monday morning, screens the top 75 momentum candidates,
-          and uses Gemini to rank them by expected weekly performance. Stocks with earnings this week,
+          Each morning Gemini scans the full NASDAQ universe, screens the top 75 momentum candidates,
+          and ranks them by expected weekly performance. The AI is asked for exactly as many stocks
+          as there are open portfolio slots. Stocks with earnings this week,
           average volume under 50k, or a 5-day gain over 20% are automatically excluded.
           Confidence scores reflect multi-factor analysis of technicals, news catalysts, and sector trends.
         </div>

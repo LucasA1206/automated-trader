@@ -342,37 +342,48 @@ def get_trades(
 @app.get("/api/ai-picks", dependencies=[Depends(require_auth)])
 def get_ai_picks(db: Session = Depends(get_db)):
     """
-    Returns AI stock picks from the most recent scan.
-    Includes confidence score, rationale, and suggested position size.
+    Returns AI stock picks grouped by scan date, most recent first (up to 30 days).
+    Each day entry contains the scan_date, total picks for that day, and the picks list.
     """
-    # Get the most recent scan date
-    latest = db.query(AIPick).order_by(AIPick.scan_date.desc()).first()
-    if not latest:
-        return {"scan_date": None, "picks": [], "total": 0}
+    from sqlalchemy import func
 
-    scan_date = latest.scan_date
-    picks = (
-        db.query(AIPick)
-        .filter(AIPick.scan_date == scan_date)
-        .order_by(AIPick.rank.asc())
+    # Get up to 30 distinct scan dates, most recent first
+    scan_dates = (
+        db.query(AIPick.scan_date)
+        .distinct()
+        .order_by(AIPick.scan_date.desc())
+        .limit(30)
         .all()
     )
 
-    return {
-        "scan_date": scan_date.isoformat() if scan_date else None,
-        "total": len(picks),
-        "picks": [
-            {
-                "rank": p.rank,
-                "ticker": p.ticker,
-                "reason": p.reason,
-                "confidence": p.confidence,
-                "position_size_pct": p.position_size_pct,
-                "created_at": p.created_at.isoformat() if p.created_at else None,
-            }
-            for p in picks
-        ],
-    }
+    if not scan_dates:
+        return {"days": [], "total_days": 0}
+
+    days = []
+    for (scan_date,) in scan_dates:
+        picks = (
+            db.query(AIPick)
+            .filter(AIPick.scan_date == scan_date)
+            .order_by(AIPick.rank.asc())
+            .all()
+        )
+        days.append({
+            "scan_date": scan_date.isoformat() if scan_date else None,
+            "total": len(picks),
+            "picks": [
+                {
+                    "rank": p.rank,
+                    "ticker": p.ticker,
+                    "reason": p.reason,
+                    "confidence": p.confidence,
+                    "position_size_pct": p.position_size_pct,
+                    "created_at": p.created_at.isoformat() if p.created_at else None,
+                }
+                for p in picks
+            ],
+        })
+
+    return {"days": days, "total_days": len(days)}
 
 
 # ─── System Logs ───────────────────────────────────────────────────────────
