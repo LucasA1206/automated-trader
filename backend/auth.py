@@ -88,4 +88,8 @@ def validate_credentials(username: str, password: str) -> bool:
     if not IBKR_USERNAME or not IBKR_PASSWORD:
         logger.error("IBKR_USERNAME / IBKR_PASSWORD env vars are not set — login is disabled.")
         return False
-    return username == IBKR_USERNAME and password == IBKR_PASSWORD
+    # Use secrets.compare_digest() for timing-safe comparison to prevent
+    # timing-oracle attacks that could reveal the correct credentials character-by-character.
+    username_ok = secrets.compare_digest(username, IBKR_USERNAME)
+    password_ok = secrets.compare_digest(password, IBKR_PASSWORD)
+    return username_ok and password_ok
