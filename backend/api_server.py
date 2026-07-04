@@ -138,9 +138,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ── CORS ── Read ALLOWED_ORIGINS from env var for production security.
+# Set ALLOWED_ORIGINS=https://your-frontend.vercel.app in Railway env vars.
+# Falls back to wildcard "*" in dev/local when the env var is not set.
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS: list[str] = (
+    [o.strip() for o in _raw_origins.split(",") if o.strip()]
+    if _raw_origins else ["*"]
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -911,9 +920,11 @@ def trigger_snapshot(background_tasks: BackgroundTasks):
 
 
 @app.post("/api/reset-pnl-history", dependencies=[Depends(require_auth)])
-def reset_pnl_history(db: Session = Depends(get_db)):
+def reset_pnl_history(db: Session = Depends(get_db), confirm: bool = False):
     """
     Deletes ALL AccountSnapshot records so the P&L chart can start fresh.
+
+    Requires ?confirm=true as a query parameter to prevent accidental deletions.
 
     Use this when the existing snapshot history is incorrect or stale.
     After calling this endpoint, trigger a new snapshot via /api/trigger-snapshot
@@ -921,6 +932,11 @@ def reset_pnl_history(db: Session = Depends(get_db)):
 
     WARNING: This is irreversible. Old chart data will be lost.
     """
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Pass ?confirm=true to confirm deletion of all P&L history. This is irreversible."
+        )
     try:
         deleted_count = db.query(AccountSnapshot).delete()
         db.commit()

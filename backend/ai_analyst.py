@@ -1,5 +1,6 @@
 import os
 import io
+import csv
 import json
 import math
 import time
@@ -232,8 +233,7 @@ def fetch_full_nasdaq_tickers() -> list[str]:
                 if line.startswith("File Creation Time"):
                     continue
                 # Handle quoted CSV fields
-                import csv as _csv
-                row = next(_csv.reader([line]))
+                row = next(csv.reader([line]))
                 if len(row) < 2:
                     continue
                 symbol = row[sym_idx].strip().upper()
@@ -500,19 +500,50 @@ def _fetch_technicals_for_ticker(ticker: str) -> dict | None:
         except Exception:
             pass
 
-        # Check for earnings in the upcoming week via yfinance calendar
+        # Check for earnings in the upcoming week via yfinance calendar.
+        # yfinance 0.2.x+ returns a dict; older versions return a DataFrame.
+        # Handle both to avoid AttributeError on .empty / .loc.
         earnings_this_week = False
         try:
             cal = tk.calendar
-            if cal is not None and not cal.empty:
-                # calendar index may include 'Earnings Date'
-                if "Earnings Date" in cal.index:
-                    earn_date = cal.loc["Earnings Date"].iloc[0]
+            if cal is not None:
+                earn_date = None
+                if isinstance(cal, dict):
+                    # Dict format: {"Earnings Date": [datetime, ...], ...}
+                    dates = cal.get("Earnings Date")
+                    if dates:
+                        earn_date = dates[0] if hasattr(dates[0], "date") else None
+                elif hasattr(cal, "empty") and not cal.empty:
+                    # Legacy DataFrame format
+                    if "Earnings Date" in cal.index:
+                        earn_date = cal.loc["Earnings Date"].iloc[0]
+                        if hasattr(earn_date, "date"):
+                            earn_date = earn_date.date()
+                if earn_date is not None:
                     if hasattr(earn_date, "date"):
                         earn_date = earn_date.date()
                     today = datetime.now(timezone.utc).date()
                     delta_days = (earn_date - today).days
                     earnings_this_week = 0 <= delta_days <= 7
+        except Exception:
+            pass
+
+        # ── Worst intra-day dip vs prior close (last 5 sessions) ───────────────
+        # Measures how far below the *previous day's close* the day's LOW went.
+        # A negative value means the intra-day price was below the prior close.
+        # This is the most direct predictor of stop-loss hits: even if a stock
+        # closes UP, its intra-day low may have crossed our -3% stop threshold.
+        worst_intraday_dip_5d: float | None = None
+        try:
+            dips = []
+            for i in range(1, min(6, len(closes))):
+                prev_c = float(closes.iloc[-(i + 1)])
+                day_low = float(lows.iloc[-i])
+                if prev_c > 0:
+                    dip_pct = (day_low - prev_c) / prev_c * 100
+                    dips.append(dip_pct)
+            if dips:
+                worst_intraday_dip_5d = round(min(dips), 2)  # most negative = worst
         except Exception:
             pass
 
@@ -541,7 +572,8 @@ def _fetch_technicals_for_ticker(ticker: str) -> dict | None:
             "atr_pct": atr_pct,                            # ATR as % of price (14-day) — lower = more stable
             "daily_range_avg_pct": daily_range_avg_pct,   # Avg daily H-L range % (10-day)
             "consec_up_days": consec_up_days,              # Consecutive green close days
-            "max_daily_drop_5d": max_daily_drop_5d,        # Worst single-day % drop in last 5 days
+            "max_daily_drop_5d": max_daily_drop_5d,        # Worst single-day % drop (close-to-close) in last 5d
+            "worst_intraday_dip_5d": worst_intraday_dip_5d,  # Worst intra-day low vs prior close in last 5d
             "pct_days_positive_20d": pct_days_positive_20d,  # % of last 20 days that were positive closes
             "earnings_this_week": earnings_this_week,
         }
@@ -638,8 +670,10 @@ def pre_filter_candidates(technicals: list[dict]) -> list[dict]:
     - Price well below both SMA-20 and SMA-50 (> 3%) → confirmed downtrend
     - Heavy negative momentum on both timeframes → falling knife
     - RSI > 85 → extremely overbought with high mean-reversion risk
-    - ATR% > 5% → too volatile (stock swings ±5%+ per day, will hit stop-loss fast)
-    - Worst single-day drop in last 5 days < -4% → recent violent move (unstable)
+    - ATR% > 2.5% → too volatile (stock's normal daily swing can clip 3% stop-loss)
+    - Worst close-to-close drop in last 5 days < -2.8% → near stop-loss territory
+    - Worst intra-day dip vs prior close in last 5 days < -2.8% → would have hit stop intra-day
+    - Less than 55% of last 20 days positive → not a genuine uptrend
     - Stock currently below SMA-5 AND momentum negative → actively declining right now
     """
     filtered = []
@@ -658,6 +692,8 @@ def pre_filter_candidates(technicals: list[dict]) -> list[dict]:
         earnings = t.get("earnings_this_week", False)
         atr_pct  = t.get("atr_pct")
         max_drop = t.get("max_daily_drop_5d")
+        intraday_dip = t.get("worst_intraday_dip_5d")
+        pct_positive = t.get("pct_days_positive_20d")
 
         # Hard reject: no valid price data (NaN or zero)
         if not price or math.isnan(price) or price <= 0:
@@ -695,17 +731,32 @@ def pre_filter_candidates(technicals: list[dict]) -> list[dict]:
             rejected.append(f"{ticker}(overbought_RSI={rsi})")
             continue
 
-        # ── NEW: Volatility hard-rejects ─────────────────────────────────────
-        # Hard reject: ATR > 5% of price — stock swings too much per day.
-        # A 3% stop-loss has zero buffer against a stock that moves ±5%/day.
-        if atr_pct is not None and atr_pct > 5.0:
-            rejected.append(f"{ticker}(atr_pct={atr_pct}%>5%)")
+        # ── Volatility hard-rejects (CRITICAL for stop-loss survival) ─────────
+        # Hard reject: ATR > 2.5% of price — stock's normal daily swing can clip
+        # a 3% stop-loss within hours of purchase.
+        # Previously 5% — lowered to 2.5% to ensure adequate stop-loss buffer.
+        if atr_pct is not None and atr_pct > 2.5:
+            rejected.append(f"{ticker}(atr_pct={atr_pct}%>2.5%)")
             continue
 
-        # Hard reject: stock had a violent single-day drop of more than -4%
-        # in the last 5 days — signals instability and potential downtrend.
-        if max_drop is not None and max_drop < -4.0:
-            rejected.append(f"{ticker}(max_drop_5d={max_drop:.1f}%<-4%)")
+        # Hard reject: worst close-to-close drop > -2.8% in last 5 days.
+        # Previously -4% — tightened: a -2.8% daily drop is already near the
+        # stop trigger and signals unstable price action.
+        if max_drop is not None and max_drop < -2.8:
+            rejected.append(f"{ticker}(max_drop_5d={max_drop:.1f}%<-2.8%)")
+            continue
+
+        # Hard reject: intra-day low went > -2.8% below prior close in any of
+        # the last 5 sessions. This catches the stop-loss trap pattern: a stock
+        # that closes flat or even UP but dipped through our -3% stop intra-day.
+        if intraday_dip is not None and intraday_dip < -2.8:
+            rejected.append(f"{ticker}(intraday_dip={intraday_dip:.1f}%<-2.8%)")
+            continue
+
+        # Hard reject: fewer than 55% of last 20 days closed positive.
+        # A genuine uptrend shows consistent positive closes — not whipsawing.
+        if pct_positive is not None and pct_positive < 55.0:
+            rejected.append(f"{ticker}(pct_positive_20d={pct_positive:.0f}%<55%)")
             continue
 
         # Hard reject: stock is below its 5-day SMA AND has negative 5-day momentum
@@ -751,9 +802,9 @@ def verify_ticker_momentum(ticker: str) -> bool:
             )
             return False
 
-        # ── Check 2: Single-day volatility — reject high-swing stocks ──────
-        # If ANY day in the last 5 had a > ±4% intra-day swing, the stock is
-        # too volatile for a 3% stop-loss. We'll hit it within hours.
+        # ── Check 2a: Intra-day H-L range — reject high-swing stocks ─────────
+        # If ANY day in the last 5 had a > ±5% intra-day range (H-L), the stock
+        # swings too much for a 3% stop-loss. Tightened from 6% to 5%.
         for i in range(len(closes)):
             try:
                 c = float(closes.iloc[i])
@@ -761,7 +812,7 @@ def verify_ticker_momentum(ticker: str) -> bool:
                 l = float(lows.iloc[i])
                 if c > 0:
                     intraday_range_pct = (h - l) / c * 100
-                    if intraday_range_pct > 6.0:  # High-low range > 6% = very volatile day
+                    if intraday_range_pct > 5.0:  # Tightened: 6% → 5%
                         logger.warning(
                             f"Pre-buy check FAILED for {ticker}: high intra-day range {intraday_range_pct:.1f}% "
                             f"on day {i} (H={h:.2f}, L={l:.2f}, C={c:.2f}). Too volatile."
@@ -769,6 +820,27 @@ def verify_ticker_momentum(ticker: str) -> bool:
                         return False
             except Exception:
                 continue
+
+        # ── Check 2b: Intra-day dip below prior close ──────────────────────────
+        # Even if the stock CLOSED up or flat, if its intra-day LOW crossed
+        # -2.8% below the PRIOR DAY'S CLOSE it would have hit our stop-loss
+        # and been sold before recovering. Reject these stocks.
+        if len(closes) >= 2:
+            for i in range(1, len(closes)):
+                try:
+                    prev_close = float(closes.iloc[i - 1])
+                    day_low    = float(lows.iloc[i])
+                    if prev_close > 0:
+                        dip_pct = (day_low - prev_close) / prev_close * 100
+                        if dip_pct < -2.8:
+                            logger.warning(
+                                f"Pre-buy check FAILED for {ticker}: intra-day low ${day_low:.2f} was "
+                                f"{dip_pct:.1f}% below prior close ${prev_close:.2f} on session {i} "
+                                f"— would have hit stop-loss intra-day."
+                            )
+                            return False
+                except Exception:
+                    continue
 
         # ── Check 3: Recent session was a down-day ──────────────────────────
         if len(closes) >= 2:
@@ -876,8 +948,8 @@ def _quick_screen_universe(
                     except Exception:
                         pass
 
-                    if atr_pct is not None and atr_pct > 5.0:
-                        continue  # Too volatile — skip entirely
+                    if atr_pct is not None and atr_pct > 2.5:
+                        continue  # Too volatile — skip entirely (matches pre_filter threshold)
 
                     # ── Momentum metrics ─────────────────────────────────────────
                     mom_1d  = ((latest / prev_close) - 1) * 100 if prev_close > 0 else 0.0
@@ -889,15 +961,29 @@ def _quick_screen_universe(
                     if mom_5d > 20.0:
                         continue
 
-                    # Hard rejection: worst single-day drop > 4% in last 5 days → volatile/unstable
+                    # Hard rejection: worst single-day drop > -2.8% in last 5 days
+                    # Tightened from -4% to -2.8% to match pre_filter_candidates().
                     try:
                         worst_drop = min(
                             (float(closes.iloc[-i]) - float(closes.iloc[-(i + 1)])) / float(closes.iloc[-(i + 1)]) * 100
                             for i in range(1, min(6, len(closes)))
                             if float(closes.iloc[-(i + 1)]) > 0
                         )
-                        if worst_drop < -4.0:
+                        if worst_drop < -2.8:
                             continue
+                    except Exception:
+                        pass
+
+                    # Hard rejection: intra-day low > -2.8% below prior close in last 5 days.
+                    # This is the most direct predictor of stop-loss hits in this strategy.
+                    try:
+                        for i in range(1, min(6, len(closes))):
+                            prev_c = float(closes.iloc[-(i + 1)])
+                            day_l = float(lows.iloc[-i])
+                            if prev_c > 0 and (day_l - prev_c) / prev_c * 100 < -2.8:
+                                raise StopIteration  # use exception to break out of loop
+                    except StopIteration:
+                        continue  # reject this ticker
                     except Exception:
                         pass
 
@@ -942,6 +1028,10 @@ def _quick_screen_universe(
                     except Exception:
                         pass
 
+                    # Hard rejection: fewer than 55% positive days → not a genuine uptrend.
+                    if pct_positive_20d < 55.0:
+                        continue
+
                     # ── MACD quick check ─────────────────────────────────────────
                     macd_bullish = False
                     if len(closes) >= 26:
@@ -970,17 +1060,18 @@ def _quick_screen_universe(
 
                     # ── Volatility penalty (critical for stop-loss survival) ──
                     # High ATR = high chance of hitting a 3% stop-loss intra-day.
+                    # ATR > 2.5% is already hard-rejected above, so scores here
+                    # only apply to ATR <= 2.5% stocks.
                     if atr_pct is not None:
-                        if atr_pct < 1.5:    # Very stable (e.g. large-cap blue chips)
-                            score += 20
-                        elif atr_pct < 2.5:  # Stable
-                            score += 12
-                        elif atr_pct < 3.5:  # Moderate — OK
-                            score += 4
-                        elif atr_pct < 4.5:  # Somewhat volatile — penalty
-                            score -= 10
-                        else:                # Very volatile — large penalty
-                            score -= 25
+                        if atr_pct < 1.0:    # Extremely stable (e.g. large-cap blue chips)
+                            score += 30
+                        elif atr_pct < 1.5:  # Very stable
+                            score += 25
+                        elif atr_pct < 2.0:  # Stable
+                            score += 18
+                        elif atr_pct < 2.5:  # Acceptable — still safe enough for 3% stop
+                            score += 8
+                        # ATR >= 2.5%: hard-rejected above, never scored
 
                     # ── Steady uptrend alignment (key signal for our strategy) ─
                     if fully_aligned:
@@ -1140,9 +1231,10 @@ hit the 3% stop-loss within hours of purchase. You MUST avoid this.
 
 Target stocks that will:
   ✅ STAY around the same price or drift GENTLY UPWARD (1–5% gain over 1–5 days)
-  ✅ Have LOW daily volatility — small intra-day swings (ATR < 3% of price ideally)
+  ✅ Have VERY LOW daily volatility — tiny intra-day swings (ATR < 2.0% of price ideally, hard limit 2.5%)
+  ✅ Have intra-day lows that NEVER dip close to our -3% stop-loss (worst_intraday_dip_5d > -2.0%)
   ✅ Be in a stable, confirmed uptrend (price above SMA-5, SMA-10, SMA-20 all aligned)
-  ✅ Have CONSISTENT recent performance (majority of days closing positive)
+  ✅ Have CONSISTENT recent performance (majority of days closing positive, >= 55% of last 20 days)
 
   ❌ DO NOT pick explosive short-term movers, meme stocks, or volatile small-caps
   ❌ DO NOT pick stocks with recent big single-day swings (even if upward)
@@ -1167,14 +1259,19 @@ Fewer high-quality low-volatility picks are far better than many volatile ones.
 4. ❌ Major negative news: lawsuits, earnings misses, FDA rejections, analyst downgrades
 5. ❌ RSI > 80 — severely overbought, high mean-reversion risk
 6. ❌ Price significantly (> 3%) below both SMA-20 AND SMA-50 — confirmed downtrend
-7. ❌ ATR% > 4% — stock swings too much per day, WILL hit a 3% stop-loss within hours
-8. ❌ Any single day in the last 5 had a drop of more than -4% — stock is unstable
+7. ❌ ATR% > 2.5% — stock swings too much per day; WILL hit a 3% stop-loss as normal noise
+   (Previously 4% — tightened because a 3% stop needs > 0.5% buffer from normal daily swing)
+8. ❌ Any single day in the last 5 had a close-to-close drop of more than -2.8% — stock is unstable
 9. ❌ Stock is currently below its SMA-5 with negative short-term momentum — actively declining
+10. ❌ worst_intraday_dip_5d < -2.8% — the stock's intra-day LOW dipped more than 2.8% below the
+    prior day's close in at least one session this week. Even if it recovered and closed higher,
+    it would have triggered our stop-loss during the session. Do not buy these stocks.
 
 ═══ PRIORITY BUY SIGNALS (ideal: 3 or more of these) ═══
-1. ✅ LOW VOLATILITY — atr_pct < 2.5%, daily_range_avg_pct < 3% — stock barely wiggles
+1. ✅ VERY LOW VOLATILITY — atr_pct < 2.0% (ideal), < 2.5% (acceptable), daily_range_avg_pct < 2.5%
+   AND worst_intraday_dip_5d > -2.0% — stock barely wiggles intra-day
 2. ✅ STRONG UPTREND ALIGNMENT — price above SMA-5 > SMA-10 > SMA-20 all stacked correctly
-3. ✅ CONSISTENT POSITIVE DAYS — pct_days_positive_20d > 60% AND consec_up_days >= 2
+3. ✅ CONSISTENT POSITIVE DAYS — pct_days_positive_20d >= 60% AND consec_up_days >= 2
 4. ✅ SUSTAINED SLOW MOMENTUM — mom_20d > 3% AND mom_10d > 1% (gradual, not a spike)
 5. ✅ RSI between 45–65 — trending up steadily, not overbought, not oversold
 6. ✅ EMA-8 ABOVE EMA-21 — short-term EMAs confirm the uptrend
@@ -1212,11 +1309,11 @@ Avoid giving large allocations to picks that only have 1 signal — spread the r
 ═══ OUTPUT FORMAT ═══
 Respond ONLY with a valid JSON array. No markdown fences, no explanation outside the JSON.
 Each recommendation MUST reference specific volatility and stability data points (atr_pct,
-consec_up_days, pct_days_positive_20d) alongside any news catalyst.
+worst_intraday_dip_5d, consec_up_days, pct_days_positive_20d) alongside any news catalyst.
 [
   {{
     "ticker": "MSFT",
-    "reason": "Classic low-volatility steady uptrend. atr_pct=1.8% (very stable), price $415 above SMA-5($410)>SMA-10($405)>SMA-20($398) all stacked. consec_up_days=4, pct_days_positive_20d=70%. RSI 58 (sweet spot). EMA-8 > EMA-21, MACD bullish. mom_20d +3.2% (slow steady drift). Volume near average (1.1x). Azure cloud growth news adds mild catalyst. Ideal low-vol hold.",
+    "reason": "Classic low-volatility steady uptrend. atr_pct=1.4% (very stable), worst_intraday_dip_5d=-0.8% (never close to stop). Price $415 above SMA-5($410)>SMA-10($405)>SMA-20($398) all stacked. consec_up_days=4, pct_days_positive_20d=70%. RSI 58 (sweet spot). EMA-8 > EMA-21, MACD bullish. mom_20d +3.2% (slow steady drift). Volume near average (1.1x). Azure cloud growth news adds mild catalyst. Ideal low-vol hold.",
     "confidence": 0.84,
     "position_size_pct": 15
   }}

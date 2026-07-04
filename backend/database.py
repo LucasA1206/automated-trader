@@ -50,7 +50,7 @@ def init_db():
             "trading_mode": "paper",           # paper | live
             "account_type": "trading_cash",    # trading_cash | investment_cash
             "paper_strategy": "cash",          # cash | margin comparison preset
-            "daily_budget_pct": "50",          # % of available cash per daily cycle
+            "daily_budget_pct": "100",         # % of available cash per daily cycle
             "max_positions": "3",              # max picks per scan
             "scan_enabled": "true",            # pause/resume auto scanning
             "trader_enabled": "true",          # Master switch

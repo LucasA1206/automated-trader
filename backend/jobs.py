@@ -439,9 +439,10 @@ def _place_buy_orders(db, client: IBKRClient, picks: list[dict], budgets: list[f
             remaining_picks_count = len(picks) - i  # this pick + future picks
             extra_per_pick = remaining_budget / remaining_picks_count
             budget_for_trade += extra_per_pick
-            # Also adjust future budgets so the redistribution cascades correctly
-            for j in range(i + 1, len(picks)):
-                budgets[j] += extra_per_pick
+            # Don't pre-adjust future budgets here — each future pick's iteration
+            # will pick up the remainder naturally via the remaining_budget path.
+            # Pre-adjusting caused double-counting (the future pick received
+            # extra_per_pick twice: once here and once in its own iteration).
             remaining_budget = 0.0
 
         # Enforce per-trade cap (50% of available cash)
@@ -1011,6 +1012,11 @@ def job_monitor_swing_trades():
         if trader_enabled.lower() != "true":
             return
 
+        # Skip entirely when the market is closed — saves an IBKR connection
+        # at the 9:00–9:25 ET scheduler ticks before market open.
+        if not is_market_open():
+            return
+
         trading_mode = get_setting(db, "trading_mode", "paper")
         client = IBKRClient(trading_mode=trading_mode)
         if not client.connect():
@@ -1150,7 +1156,9 @@ def job_monitor_swing_trades():
                     remaining_pnl = (sell_price - buy_price) * live_shares
                     total_pnl = remaining_pnl + partial_already_realised
 
-                    pnl_pct = ((sell_price - buy_price) / buy_price * 100)
+                    # pnl_pct on original full position cost (consistent with afternoon sell)
+                    original_cost = buy_price * trade.shares if trade.shares else 1
+                    pnl_pct = (total_pnl / original_cost * 100) if original_cost else 0.0
 
                     trade.sell_price = sell_price
                     trade.sell_time = datetime.now(timezone.utc)
