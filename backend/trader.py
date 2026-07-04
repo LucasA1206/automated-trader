@@ -495,9 +495,9 @@ class IBKRClient:
                 else:
                     return {"success": False, "ticker": ticker, "error": error_msg}
 
-    # Safety net: all retries exhausted without an explicit return (shouldn't happen,
-    # but prevents a silent None return that would cause TypeError in the caller).
-    return {"success": False, "ticker": ticker, "error": last_error or "All retry attempts exhausted"}
+        # Safety net: all retries exhausted without an explicit return (shouldn't happen,
+        # but prevents a silent None return that would cause TypeError in the caller).
+        return {"success": False, "ticker": ticker, "error": last_error or "All retry attempts exhausted"}
 
     def cancel_all_open_orders(self) -> int:
         """
