@@ -2,7 +2,8 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text
-from models import Base, Setting, AccountSnapshot  # noqa: F401 – AccountSnapshot triggers table creation
+# noqa: F401 – all model imports trigger table creation
+from models import Base, Setting, AccountSnapshot, ScanResult, TradeJournalEntry  # noqa: F401
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./blitz_trader.db")
@@ -43,6 +44,63 @@ def init_db():
     except Exception:
         pass  # Column already exists
 
+    # ── Blueprint strategy columns ─────────────────────────────────────────────
+    # ATR-based stop price placed at IBKR at entry
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE trades ADD COLUMN stop_price FLOAT"))
+    except Exception:
+        pass
+
+    # IBKR order ID for the native stop order
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE trades ADD COLUMN stop_order_id VARCHAR(50)"))
+    except Exception:
+        pass
+
+    # 1.5R partial exit target price
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE trades ADD COLUMN partial_target_price FLOAT"))
+    except Exception:
+        pass
+
+    # Whether the 1.5R partial has been executed
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE trades ADD COLUMN partial_sold BOOLEAN DEFAULT FALSE"))
+    except Exception:
+        pass
+
+    # Current Chandelier trailing stop price
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE trades ADD COLUMN trailing_stop_price FLOAT"))
+    except Exception:
+        pass
+
+    # Entry composite score (for journaling / post-trade analysis)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE trades ADD COLUMN entry_composite_score FLOAT"))
+    except Exception:
+        pass
+
+    # ATR value at time of entry (used for exit engine calculations)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE trades ADD COLUMN atr_at_entry FLOAT"))
+    except Exception:
+        pass
+
+    # Sector at entry (for risk engine sector-cap gate)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE trades ADD COLUMN sector VARCHAR(50)"))
+    except Exception:
+        pass
+
     # ── Default settings seed ──────────────────────────────────────────────────
     db = SessionLocal()
     try:
@@ -51,7 +109,7 @@ def init_db():
             "account_type": "trading_cash",    # trading_cash | investment_cash
             "paper_strategy": "cash",          # cash | margin comparison preset
             "daily_budget_pct": "100",         # % of available cash per daily cycle
-            "max_positions": "3",              # max picks per scan
+            "max_positions": "4",              # max concurrent positions (blueprint: 4)
             "scan_enabled": "true",            # pause/resume auto scanning
             "trader_enabled": "true",          # Master switch
             "margin_upgrade_alerted": "false",
@@ -63,6 +121,7 @@ def init_db():
         db.commit()
     finally:
         db.close()
+
 
 
 def get_db():

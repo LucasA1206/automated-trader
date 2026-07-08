@@ -499,10 +499,128 @@ class IBKRClient:
         # but prevents a silent None return that would cause TypeError in the caller).
         return {"success": False, "ticker": ticker, "error": last_error or "All retry attempts exhausted"}
 
+    def place_limit_buy_order(self, ticker: str, shares: int, limit_price: float) -> dict:
+        """
+        Places a DAY limit buy order at the specified price.
+        Used by the entry monitor (blueprint Section 8).
+        Waits up to 5 minutes for fill; cancels if not filled.
+        """
+        try:
+            if not self.ib.isConnected():
+                self.connect()
+
+            contract = Stock(ticker, "SMART", "USD")
+            self.ib.qualifyContracts(contract)
+
+            order = LimitOrder("BUY", shares, limit_price)
+            order.tif = "DAY"
+            logger.info("Placing LIMIT BUY for %s: %d shares @ $%.4f", ticker, shares, limit_price)
+            trade = self.ib.placeOrder(contract, order)
+
+            filled = False
+            terminal_statuses = {"Cancelled", "Inactive"}
+            for _ in range(600):  # 600 x 0.5 s = 5 min max
+                self.ib.sleep(0.5)
+                status = trade.orderStatus.status
+                if status == "Filled":
+                    filled = True
+                    break
+                if status in terminal_statuses:
+                    break
+
+            if not filled:
+                if trade.fills:
+                    filled = True
+                else:
+                    try:
+                        self.ib.cancelOrder(order)
+                        self.ib.sleep(1.0)
+                    except Exception:
+                        pass
+                    status = trade.orderStatus.status
+                    return {
+                        "success": False, "ticker": ticker,
+                        "error": f"Limit order did not fill (status: {status}). Cancelled."
+                    }
+
+            fill_price = limit_price
+            fees = 0.0
+            if trade.fills:
+                fill_price = safe_float(trade.fills[-1].execution.price)
+                fees = sum(
+                    safe_float(f.commissionReport.commission)
+                    for f in trade.fills
+                    if getattr(f, "commissionReport", None) and getattr(f.commissionReport, "commission", None) is not None
+                )
+
+            logger.info("LIMIT BUY filled: %s x %d @ $%.4f", ticker, shares, fill_price)
+            return {
+                "success": True,
+                "ticker": ticker,
+                "shares": shares,
+                "price": round(fill_price, 4),
+                "fees": round(fees, 4),
+                "total_cost": round(fill_price * shares, 2),
+                "order_id": str(trade.order.orderId),
+            }
+
+        except Exception as exc:
+            logger.error("place_limit_buy_order failed for %s: %s", ticker, exc)
+            return {"success": False, "ticker": ticker, "error": str(exc)}
+
+    def place_stop_order(self, ticker: str, shares: int, stop_price: float) -> dict:
+        """
+        Places a GTC native stop order at IBKR for position protection.
+        Blueprint Section 9: stop orders must be placed with IBKR at time of entry.
+        Returns the order_id for DB storage (used to cancel if needed).
+        """
+        try:
+            if not self.ib.isConnected():
+                self.connect()
+
+            contract = Stock(ticker, "SMART", "USD")
+            self.ib.qualifyContracts(contract)
+
+            order = StopOrder("SELL", shares, stop_price)
+            order.tif = "GTC"  # Good-Till-Cancelled
+            logger.info("Placing native STOP order for %s: %d shares @ $%.4f (GTC)",
+                        ticker, shares, stop_price)
+            trade = self.ib.placeOrder(contract, order)
+            self.ib.sleep(0.5)
+
+            return {
+                "success": True,
+                "ticker": ticker,
+                "shares": shares,
+                "stop_price": round(stop_price, 4),
+                "order_id": str(trade.order.orderId),
+            }
+
+        except Exception as exc:
+            logger.error("place_stop_order failed for %s: %s", ticker, exc)
+            return {"success": False, "ticker": ticker, "error": str(exc)}
+
+    def cancel_stop_order(self, order_id: str, ticker: str) -> bool:
+        """Cancel a native stop order by IBKR order ID (e.g., after a sell)."""
+        try:
+            if not self.ib.isConnected():
+                self.connect()
+            open_orders = self.ib.reqAllOpenOrders()
+            self.ib.sleep(0.5)
+            for trade in open_orders:
+                if str(trade.order.orderId) == str(order_id):
+                    self.ib.cancelOrder(trade.order)
+                    logger.info("Cancelled native stop order %s for %s.", order_id, ticker)
+                    return True
+            logger.info("Stop order %s for %s not found (may already be gone).", order_id, ticker)
+            return True
+        except Exception as exc:
+            logger.warning("cancel_stop_order failed for %s (order_id=%s): %s", ticker, order_id, exc)
+            return False
+
     def cancel_all_open_orders(self) -> int:
         """
-        Cancels every open/pending order on the account, including OCA legs
-        (stop-loss and take-profit bracket orders).
+        Cancels every open/pending order on the account, including OCA legs.
 
         Called before the afternoon sell-all job so that no residual OCA
         orders can interfere with — or re-trigger after — the EOD liquidation.

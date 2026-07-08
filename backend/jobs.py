@@ -1,95 +1,57 @@
+"""
+jobs.py — Systematic Swing Trading Strategy Jobs
+=================================================
+Implements the three scheduled jobs per blueprint Section 2/18:
+
+  job_pre_market_scan  : 07:30 ET Mon-Fri
+    Full pipeline: universe fetch → filter → score → AI → candidate list persisted.
+    No orders placed here — candidates are staged for intraday entry confirmation.
+
+  job_entry_monitor    : 09:45–15:30 ET, every 5 min, Mon-Fri
+    Checks pending candidates for intraday entry confirmation (Section 8).
+    Places limit orders via IBKR when all entry conditions are met.
+    Respects all risk engine gates before any order placement.
+
+  job_exit_monitor     : 09:30–16:00 ET, every 5 min, Mon-Fri
+    Checks all open positions against all exit rules (Section 9):
+    stop-loss, 1.5R partial, Chandelier trail, MA break, time exits, ATR expansion.
+
+  job_eod_snapshot     : 15:45 ET Mon-Fri
+    Captures daily NetLiquidation snapshot (unchanged from previous system).
+
+DESIGN PRINCIPLES:
+  - "Fail-safe, not fail-guess": every data failure is logged and halts that job step
+  - "No forced trades": system correctly outputs "no trade today" when appropriate
+  - Paper trading is the default — live trading requires explicit DB setting
+  - Stop-loss orders are placed with IBKR at time of entry as native stop orders
+  - The software monitor is a belt-and-suspenders fallback
+"""
+
 import logging
 import threading
 import time
-from datetime import datetime, timezone, timedelta
+import json
+from datetime import datetime, timezone, timedelta, date
+
 from database import SessionLocal, get_setting
-from models import Trade, SystemLog, AIPick, AccountSnapshot
-from ai_analyst import run_daily_scan, verify_ticker_momentum
+from models import Trade, SystemLog, AIPick, AccountSnapshot, ScanResult
 from trader import IBKRClient, safe_float
 
 import pytz
 
-# Minimum number of stocks to buy each week.
-# If AI returns fewer picks, we fill the gap with the top screener candidates.
-MIN_WEEKLY_BUYS = 3
-
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Cross-job state guards
-# ---------------------------------------------------------------------------
-
-# Set when a deferred-buy thread is waiting for market open.
-# Cleared when the thread starts placing orders (or is superseded by the morning scan).
-# Prevents the morning scan and a pending deferred buy from both firing at 09:30 ET,
-# which would double the budget and trigger IBKR Error 201 (insufficient funds).
-_deferred_buy_pending = threading.Event()
-
-# Tickers that were rejected this session with a "No Trading Permission" or
-# "closing-only" error. We never retry these in the same process lifetime.
-# Cleared only on process restart (acceptable — permissions don't change mid-day).
-_session_rejected_tickers: set[str] = set()
-
-
-# ---------------------------------------------------------------------------
-# Market-hours helpers (NYSE / ET)
-# ---------------------------------------------------------------------------
 _ET = pytz.timezone("America/New_York")
 _MARKET_OPEN_HOUR = 9
 _MARKET_OPEN_MINUTE = 30
-_MARKET_CLOSE_HOUR = 16  # 4 PM ET
+_MARKET_CLOSE_HOUR = 16
 
+# Module-level storage for today's scan candidates
+# (shared between pre_market_scan and entry_monitor jobs)
+_pending_candidates: list[dict] = []
+_pending_candidates_lock = threading.Lock()
+_scan_date_today: date | None = None
 
-def is_market_open() -> bool:
-    """Return True if NYSE is currently open (Mon–Fri, 09:30–16:00 ET)."""
-    now_et = datetime.now(_ET)
-    if now_et.weekday() >= 5:  # Saturday=5, Sunday=6
-        return False
-    open_time = now_et.replace(hour=_MARKET_OPEN_HOUR, minute=_MARKET_OPEN_MINUTE, second=0, microsecond=0)
-    close_time = now_et.replace(hour=_MARKET_CLOSE_HOUR, minute=0, second=0, microsecond=0)
-    return open_time <= now_et < close_time
-
-
-def seconds_until_market_open() -> float:
-    """
-    Return the number of seconds until the next NYSE open (09:30 ET Mon–Fri).
-    Returns 0 if the market is currently open.
-    """
-    if is_market_open():
-        return 0
-    now_et = datetime.now(_ET)
-    # Find the next market-open datetime
-    candidate = now_et.replace(hour=_MARKET_OPEN_HOUR, minute=_MARKET_OPEN_MINUTE, second=0, microsecond=0)
-    if candidate <= now_et:
-        # Already past today's open — move to the next calendar day
-        candidate += timedelta(days=1)
-    # Skip weekends
-    while candidate.weekday() >= 5:
-        candidate += timedelta(days=1)
-    delta = (candidate - now_et).total_seconds()
-    return max(delta, 0)
-
-
-def _build_strategy_plan(
-    trading_mode: str,
-    paper_strategy: str,
-    available_cash: float,
-    net_liq: float,
-    db_budget_pct: float,
-    db_max_positions: int
-) -> tuple[float, int, str]:
-    """Return the daily budget, position cap, and a human-readable strategy label."""
-    fraction = db_budget_pct / 100.0
-    if trading_mode == "live":
-        return available_cash * fraction, db_max_positions, f"live cash account / {db_max_positions} stocks / {db_budget_pct}% budget"
-    if paper_strategy == "margin":
-        return available_cash * fraction, db_max_positions, f"paper margin simulation / {db_max_positions} stocks / {db_budget_pct}% budget"
-    return available_cash * fraction, db_max_positions, f"paper cash simulation / {db_max_positions} stocks / {db_budget_pct}% budget"
-
-
-def _count_open_positions(db) -> int:
-    """Return the number of currently open/sold_half/closing trades in the DB."""
-    return db.query(Trade).filter(Trade.status.in_(["open", "sold_half", "closing"])).count()
 
 # ---------------------------------------------------------------------------
 # Persistent keepalive — a single IBKRClient that stays connected between jobs
@@ -125,11 +87,37 @@ def stop_persistent_keepalive() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Market-hours helpers (NYSE / ET)
+# ---------------------------------------------------------------------------
+
+def is_market_open() -> bool:
+    """Return True if NYSE is currently open (Mon–Fri, 09:30–16:00 ET)."""
+    now_et = datetime.now(_ET)
+    if now_et.weekday() >= 5:
+        return False
+    open_time  = now_et.replace(hour=_MARKET_OPEN_HOUR, minute=_MARKET_OPEN_MINUTE, second=0, microsecond=0)
+    close_time = now_et.replace(hour=_MARKET_CLOSE_HOUR, minute=0, second=0, microsecond=0)
+    return open_time <= now_et < close_time
+
+
+def seconds_until_market_open() -> float:
+    if is_market_open():
+        return 0
+    now_et = datetime.now(_ET)
+    candidate = now_et.replace(hour=_MARKET_OPEN_HOUR, minute=_MARKET_OPEN_MINUTE, second=0, microsecond=0)
+    if candidate <= now_et:
+        candidate += timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return max((candidate - now_et).total_seconds(), 0)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def log_event(db, category: str, message: str, level: str = "INFO"):
-    """Helper to write a system log entry."""
+    """Write a system log entry."""
     entry = SystemLog(
         timestamp=datetime.now(timezone.utc),
         level=level,
@@ -138,35 +126,44 @@ def log_event(db, category: str, message: str, level: str = "INFO"):
     )
     db.add(entry)
     db.commit()
-    logger.info(f"[{category.upper()}] {message}")
+    logger.info("[%s] %s", category.upper(), message)
 
 
-def _reconcile_stale_db_trades(db, live_tickers: set[str], log_fn) -> None:
-    """Close any DB trades marked 'open'/'sold_half' for tickers no longer held in IBKR.
+def _count_open_positions(db) -> int:
+    return db.query(Trade).filter(Trade.status.in_(["open", "sold_half", "closing"])).count()
 
-    Trades with status 'closing' are excluded — they have a sell order in-flight
-    and will be finalised by the monitor that initiated the sell.
-    """
+
+def _get_open_positions_with_sectors(db) -> list[dict]:
+    """Return open trades as list of dicts including sector for risk engine."""
+    trades = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
+    result = []
+    for t in trades:
+        result.append({
+            "ticker": t.ticker,
+            "shares": t.shares,
+            "buy_price": t.buy_price,
+            "stop_price": t.stop_price,
+            "sector": getattr(t, "sector", "Unknown") or "Unknown",
+            "status": t.status,
+        })
+    return result
+
+
+def _reconcile_stale_db_trades(db, live_tickers: set[str]) -> None:
+    """Close any DB trades for tickers no longer held in IBKR."""
     open_trades = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
     for trade in open_trades:
         if trade.ticker not in live_tickers:
             trade.status = "closed"
             trade.sell_time = datetime.now(timezone.utc)
-            # sell_price/pnl left as None — we don't know the actual exit price
             db.commit()
-            log_fn(db, "sell",
-                   f"⚠️ Reconciled stale DB record for {trade.ticker} "
-                   f"(marked closed — not found in live IBKR positions).")
+            log_event(db, "sell",
+                      f"⚠️ Reconciled stale DB record for {trade.ticker} "
+                      f"(marked closed — not found in live IBKR positions).")
 
 
-def _sync_untracked_ibkr_positions(db, live_positions: list[dict], trading_mode: str, log_fn) -> None:
-    """Ensure every live IBKR position has a matching open Trade in the DB.
-
-    If a position exists in IBKR but not the DB (e.g. the buy order was marked
-    'cancelled' due to a timeout but actually filled — a known IBKR paper bug),
-    a synthetic Trade record is inserted so that the monitor and sell jobs can
-    apply take-profit / stop-loss and properly record P&L.
-    """
+def _sync_untracked_ibkr_positions(db, live_positions: list[dict], trading_mode: str) -> None:
+    """Ensure every live IBKR position has a matching DB trade record."""
     open_tickers = set(
         t.ticker for t in db.query(Trade).filter(
             Trade.status.in_(["open", "sold_half", "closing"]),
@@ -177,7 +174,6 @@ def _sync_untracked_ibkr_positions(db, live_positions: list[dict], trading_mode:
         ticker = pos["ticker"]
         if ticker in open_tickers:
             continue
-        # This position is live in IBKR but has no DB record — create one.
         avg_cost = pos.get("avg_cost") or pos.get("current_price", 0)
         shares = pos.get("shares", 0)
         if shares == 0:
@@ -192,819 +188,521 @@ def _sync_untracked_ibkr_positions(db, live_positions: list[dict], trading_mode:
             fees=0.0,
             realised_partial_pnl=0.0,
             ai_reason="[Auto-registered: position found in IBKR but missing from DB]",
+            # Conservative safety stop at 5% below avg cost
+            stop_price=round(avg_cost * 0.95, 4) if avg_cost else None,
         )
         db.add(ghost_trade)
         db.commit()
-        log_fn(db, "system",
-               f"⚠️ Untracked IBKR position detected: {ticker} "
-               f"({shares} shares @ avg ${avg_cost:.2f}). "
-               f"Created synthetic DB record so monitoring/take-profit can track it.",
-               "WARNING")
+        log_event(db, "system",
+                  f"⚠️ Untracked IBKR position detected: {ticker} "
+                  f"({shares} shares @ avg ${avg_cost:.2f}). DB record created.")
 
 
-def _persist_ai_picks(db, recommendations: list[dict], scan_date) -> None:
-    """Save this week's AI picks to the ai_picks table, replacing any same-day records."""
-    # Remove old picks for today (in case of a re-scan)
-    db.query(AIPick).filter(AIPick.scan_date == scan_date).delete()
-    db.commit()
-
-    for rank, rec in enumerate(recommendations, start=1):
-        pick = AIPick(
-            scan_date=scan_date,
-            ticker=rec.get("ticker", "").upper().strip(),
-            reason=rec.get("reason", ""),
-            confidence=float(rec.get("confidence", 0.0)),
-            position_size_pct=float(rec.get("position_size_pct", 0.0)),
-            rank=rank,
-        )
-        db.add(pick)
-    db.commit()
-    logger.info(f"Persisted {len(recommendations)} AI pick(s) to database for {scan_date}.")
+def _get_peak_equity(db) -> float:
+    """Return peak NetLiquidation from account_snapshots for drawdown tracking."""
+    snapshots = db.query(AccountSnapshot).order_by(AccountSnapshot.date.desc()).limit(90).all()
+    if not snapshots:
+        return 0.0
+    return max((s.net_liq_usd for s in snapshots), default=0.0)
 
 
-# ---------------------------------------------------------------------------
-# Jobs
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Internal helper — reusable scan phase
-# ---------------------------------------------------------------------------
-
-def _run_scan_phase(db, log_prefix: str = "morning", num_picks: int | None = None) -> tuple[list[dict], list[float], dict] | None:
-    """
-    Runs the AI scan + screener fallback and computes per-pick budgets.
-    Returns (picks, budgets, meta) where meta contains mode/strategy info,
-    or None if the scan should be aborted (disabled, no funds, no picks).
-
-    If num_picks is provided, limits the number of stocks to buy to that value
-    (used for daily replacement scans where only some slots need filling).
-
-    Does NOT connect to IBKR itself — the caller is responsible for the
-    client lifecycle when they are ready to place orders.
-    """
-    trader_enabled = get_setting(db, "trader_enabled", "true")
-    if trader_enabled.lower() != "true":
-        log_event(db, "system", "Trader is globally disabled. Skipping scan.")
-        return None
-
-    scan_enabled = get_setting(db, "scan_enabled", "true")
-    if scan_enabled.lower() != "true":
-        log_event(db, "system", "Auto-scan is disabled. Skipping scan.")
-        return None
-
-    trading_mode = get_setting(db, "trading_mode", "paper")
-    account_type = get_setting(db, "account_type", "trading_cash")
-    paper_strategy = get_setting(db, "paper_strategy", "cash")
-
-    try:
-        budget_pct = float(get_setting(db, "daily_budget_pct", "100"))
-    except ValueError:
-        budget_pct = 100.0
-
-    try:
-        max_positions_setting = int(get_setting(db, "max_positions", "5"))
-    except ValueError:
-        max_positions_setting = 5
-
-    # Connect briefly to IBKR only to check available funds
-    client = IBKRClient(trading_mode=trading_mode)
-    connected = client.connect()
-    if not connected:
-        log_event(db, "ibkr", "Failed to connect to IB Gateway. Aborting scan.", "ERROR")
-        return None
-
-    client.start_keepalive(interval=30)
-    account = client.get_account_summary()
-    available_cash = account.get("AvailableFunds", 0)
-    net_liq = account.get("NetLiquidation", 0)
-    client.disconnect()
-
-    if available_cash <= 0:
-        log_event(db, "ibkr", f"No available funds (${available_cash:.2f}). Aborting.", "ERROR")
-        return None
-
-    daily_budget, max_positions, strategy_label = _build_strategy_plan(
-        trading_mode, paper_strategy, available_cash, net_liq, budget_pct, max_positions_setting
+def _compute_weekly_pnl_pct(db, account_equity: float) -> float:
+    """Estimate weekly P&L % from account snapshots."""
+    from sqlalchemy import func
+    now_et = datetime.now(_ET)
+    # Monday of this week
+    days_since_monday = now_et.weekday()
+    week_start = (now_et - timedelta(days=days_since_monday)).date()
+    snap = (
+        db.query(AccountSnapshot)
+        .filter(AccountSnapshot.date >= week_start)
+        .order_by(AccountSnapshot.date.asc())
+        .first()
     )
-
-    # If caller specifies how many picks to buy, use that as the cap
-    effective_pick_limit = num_picks if num_picks is not None else max_positions
-
-    log_event(db, "scan", f"Starting {log_prefix} scan. Mode: {trading_mode}, "
-                          f"Account: {account_type}, Strategy: {strategy_label}, "
-                          f"Budget: ${daily_budget:,.2f}, "
-                          f"Slots to fill: {effective_pick_limit}")
-
-    # AI Scan — returns (ai_picks, screener_fallback_candidates)
-    recommendations, screened_candidates = run_daily_scan(num_picks=effective_pick_limit)
-
-    # Sort AI picks by confidence (highest first)
-    recommendations.sort(key=lambda r: r.get("confidence", 0), reverse=True)
-
-    if recommendations:
-        tickers_str = ", ".join(
-            f"{r['ticker']}({r.get('confidence', 0):.0%})" for r in recommendations
-        )
-        log_event(db, "scan", f"AI recommended {len(recommendations)} stock(s): {tickers_str}")
-    else:
-        log_event(db, "scan",
-                  "⚠️ AI returned no recommendations. Will use top screener candidates "
-                  f"to guarantee {MIN_WEEKLY_BUYS} buy(s).")
-
-    # Persist all AI picks to DB for the UI to display
-    # NOTE: We persist AFTER the fallback merge so the tab shows exactly
-    # what will be bought (AI picks + any screener fallback additions).
-    today_date = datetime.now(timezone.utc).date()
-
-    # ── Select picks up to the effective limit ────────────────────────────
-    pick_limit = min(effective_pick_limit, len(recommendations))
-    picks = list(recommendations[:pick_limit])
-
-    # Exclude tickers we already hold open positions for
-    open_tickers = set(
-        t.ticker for t in db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
-    )
-    picks = [p for p in picks if p["ticker"] not in open_tickers]
-
-    # Exclude tickers that were permanently rejected this session
-    # (e.g. "No Trading Permission" / closing-only — IBKR won't accept these today)
-    if _session_rejected_tickers:
-        before = len(picks)
-        picks = [p for p in picks if p["ticker"] not in _session_rejected_tickers]
-        dropped = before - len(picks)
-        if dropped:
-            log_event(db, "scan",
-                      f"🚫 Excluded {dropped} session-rejected ticker(s) from picks: "
-                      f"{', '.join(sorted(_session_rejected_tickers))}")
-
-    ai_ticker_set = {r["ticker"] for r in picks} | open_tickers | _session_rejected_tickers
-    fallback_used: list[dict] = []
-    min_buys = min(MIN_WEEKLY_BUYS, effective_pick_limit)
-    if len(picks) < min_buys and screened_candidates:
-        needed = min_buys - len(picks)
-        for candidate in screened_candidates:
-            if len(fallback_used) >= needed:
-                break
-            if candidate["ticker"] not in ai_ticker_set:
-                fallback_used.append(candidate)
-                ai_ticker_set.add(candidate["ticker"])
-
-
-        if fallback_used:
-            fallback_str = ", ".join(c["ticker"] for c in fallback_used)
-            log_event(db, "scan",
-                      f"📊 Screener fallback: adding {len(fallback_used)} top-scored "
-                      f"candidate(s) to reach minimum {min_buys} buys: {fallback_str}")
-            picks.extend(fallback_used)
-
-    # Final trim to effective limit (fallback may have added extras)
-    picks = picks[:effective_pick_limit]
-
-    if not picks:
-        log_event(db, "scan",
-                  "❌ No picks from AI or screener. Market data may be unavailable. "
-                  "No trades will be placed.")
-        return None
-
-    # Persist the final buy list (AI + fallback) to ai_picks so the UI tab
-    # always reflects the stocks that were actually selected this scan.
-    # Mark screener fallback picks with a synthetic reason if they lack one.
-    picks_to_persist = []
-    for p in picks:
-        entry = dict(p)
-        if not entry.get("reason"):
-            entry["reason"] = "Selected via screener momentum fallback (AI returned insufficient picks)."
-        if not entry.get("confidence"):
-            entry["confidence"] = 0.5
-        if not entry.get("position_size_pct"):
-            # Assign an equal-split placeholder so the UI shows a sensible allocation
-            entry["position_size_pct"] = round(100.0 / len(picks), 1)
-        picks_to_persist.append(entry)
-    _persist_ai_picks(db, picks_to_persist, today_date)
-
-    # Distribute budget according to position_size_pct if available, otherwise split evenly
-    total_pct = sum(r.get("position_size_pct", 0) for r in picks)
-    budgets: list[float] = []
-    if total_pct > 0:
-        for r in picks:
-            weight = r.get("position_size_pct", 0) / total_pct
-            budgets.append(daily_budget * weight)
-    else:
-        budgets = [daily_budget / len(picks)] * len(picks)
-
-    meta = {
-        "trading_mode": trading_mode,
-        "net_liq": net_liq,
-        "available_cash": available_cash,
-        "daily_budget": daily_budget,
-    }
-
-    log_event(db, "system",
-              f"Net Liq: ${net_liq:,.2f} | Available cash: ${available_cash:,.2f} | "
-              f"Today's budget: ${daily_budget:,.2f} | "
-              f"Buying {len(picks)} stock(s)")
-
-    return picks, budgets, meta
-
-
-def _place_buy_orders(db, client: IBKRClient, picks: list[dict], budgets: list[float], trading_mode: str, available_cash: float = 0.0) -> None:
-    """Place buy orders for all picks. Expects an already-connected IBKRClient.
-
-    Budget redistribution: when a stock is rejected (momentum check failure or
-    order error), its budget is redistributed equally across the remaining
-    un-attempted picks so the full daily budget is always deployed.
-
-    Cap: no single order will exceed 50% of available_cash to prevent
-    IBKR from rejecting orders due to insufficient funds when redistribution
-    pushes an order budget higher than the account can support.
-    """
-    # Work with a mutable copy so we can adjust future budgets in-place
-    budgets = list(budgets)
-    remaining_budget = 0.0  # Accumulates budget from rejected/failed stocks
-
-    # Cap per trade: no single order may exceed 50% of available cash.
-    # Falls back to the total daily budget if available_cash wasn't provided.
-    per_trade_cap = (available_cash * 0.50) if available_cash > 0 else float("inf")
-
-    for i, rec in enumerate(picks):
-        ticker = rec["ticker"]
-        reason = rec.get("reason", "")
-        confidence = rec.get("confidence", 0)
-        pos_size = rec.get("position_size_pct", 0)
-
-        budget_for_trade = budgets[i]
-
-        # Redistribute any leftover budget from previously rejected stocks
-        if remaining_budget > 0:
-            remaining_picks_count = len(picks) - i  # this pick + future picks
-            extra_per_pick = remaining_budget / remaining_picks_count
-            budget_for_trade += extra_per_pick
-            # Don't pre-adjust future budgets here — each future pick's iteration
-            # will pick up the remainder naturally via the remaining_budget path.
-            # Pre-adjusting caused double-counting (the future pick received
-            # extra_per_pick twice: once here and once in its own iteration).
-            remaining_budget = 0.0
-
-        # Enforce per-trade cap (50% of available cash)
-        if budget_for_trade > per_trade_cap:
-            excess = budget_for_trade - per_trade_cap
-            budget_for_trade = per_trade_cap
-            remaining_budget += excess
-            log_event(db, "buy",
-                      f"⚠️ {ticker}: budget capped at 50% of available cash "
-                      f"(${per_trade_cap:,.2f}). Excess ${excess:,.2f} carried forward.")
-
-        log_event(db, "buy",
-                  f"Placing BUY order for {ticker} "
-                  f"(confidence={confidence:.0%}, size={pos_size:.0f}%, "
-                  f"budget=${budget_for_trade:,.2f}): {reason}")
-
-        # Pre-buy momentum gate
-        if not verify_ticker_momentum(ticker):
-            log_event(db, "buy",
-                      f"⚠️ Skipped {ticker} — failed pre-buy momentum check "
-                      f"(down >3% over recent sessions despite AI recommendation). "
-                      f"Redistributing ${budget_for_trade:,.2f} to remaining picks.")
-            remaining_budget += budget_for_trade
-            continue
-
-        result = client.place_buy_order(ticker, budget_for_trade)
-
-        if result["success"]:
-            trade = Trade(
-                ticker=ticker,
-                shares=result["shares"],
-                buy_price=result["price"],
-                buy_time=datetime.now(timezone.utc),
-                status="open",
-                order_id=result.get("order_id"),
-                ai_reason=reason,
-                mode=trading_mode,
-                fees=result.get("fees", 0.0),
-                realised_partial_pnl=0.0,
-            )
-            db.add(trade)
-            db.commit()
-            log_event(db, "buy",
-                      f"✅ Bought {result['shares']} shares of {ticker} "
-                      f"@ ${result['price']:.2f} "
-                      f"(Total: ${result['total_cost']:,.2f})")
-        else:
-            error_msg = result.get('error', '')
-            log_event(db, "buy",
-                      f"❌ Buy failed for {ticker}: {error_msg}. "
-                      f"Redistributing ${budget_for_trade:,.2f} to remaining picks.", "ERROR")
-
-            # Detect permanent permission errors — these tickers cannot be traded
-            # today at all (IBKR "closing-only" / "No Trading Permission").
-            # Add to session reject set so we never attempt them again this session.
-            _PERM_REJECT_PHRASES = (
-                "no trading permission",
-                "customer ineligible",
-                "closing-only status",
-                "closing only",
-            )
-            if any(phrase in error_msg.lower() for phrase in _PERM_REJECT_PHRASES):
-                _session_rejected_tickers.add(ticker)
-                log_event(db, "buy",
-                          f"🚫 {ticker} added to session reject list — IBKR will not accept "
-                          f"new orders for this ticker (permission/closing-only). "
-                          f"It will be skipped in all future scans this session.")
-
-            # Immediately sync IBKR positions in case the order secretly filled
-            # (common IBKR paper bug where Cancelled orders actually went through).
-            # Use the already-connected client — no reconnect needed.
-            try:
-                _live_positions = client.get_positions()
-                _sync_untracked_ibkr_positions(db, _live_positions, trading_mode, log_event)
-            except Exception as _sync_exc:
-                logger.warning("Post-failure position sync failed: %s", _sync_exc)
-            remaining_budget += budget_for_trade
-
-    if remaining_budget > 0:
-        log_event(db, "buy",
-                  f"⚠️ ${remaining_budget:,.2f} of budget could not be deployed "
-                  f"(all remaining picks were rejected or failed).")
+    if snap and snap.net_liq_usd and account_equity:
+        return round((account_equity - snap.net_liq_usd) / snap.net_liq_usd * 100, 3)
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
-# Deferred buy — waits for market open, then places queued orders
+# Fetch the universe of tickers from the existing NASDAQ source
 # ---------------------------------------------------------------------------
 
-def job_deferred_sell_single(ticker: str, trading_mode: str) -> None:
+def _fetch_ticker_universe() -> list[str]:
     """
-    Called in a background thread when a manual sell is triggered outside market hours.
-    Sleeps until NYSE opens (09:30 ET, next weekday), then sells all shares of the
-    given ticker. A fresh DB session and IBKR connection are opened at that point.
+    Fetch the full universe of tradeable tickers using the NASDAQ FTP source.
+    Reuses the parsing logic from the old ai_analyst.py via direct HTTP fetch.
+    Falls back to a compact curated list if fetch fails.
     """
-    wait_secs = seconds_until_market_open()
-    if wait_secs > 0:
-        open_et = datetime.now(_ET) + timedelta(seconds=wait_secs)
-        logger.info(
-            "Deferred sell (%s): market is closed. Sleeping %.0f s until %s ET.",
-            ticker, wait_secs, open_et.strftime("%Y-%m-%d %H:%M"),
-        )
-        db_notify = SessionLocal()
+    import csv
+    import requests
+
+    FALLBACK = [
+        "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO",
+        "AMD", "PLTR", "CRM", "NFLX", "CRWD", "PANW", "ADBE", "NOW", "WDAY",
+        "DDOG", "NET", "SNOW", "SHOP", "COIN", "MELI", "UBER", "ABNB",
+        "DKNG", "RBLX", "PYPL", "SQ", "SOFI", "HOOD", "MU", "INTC", "QCOM",
+        "SMCI", "ARM", "AMAT", "LRCX", "KLAC", "ANET", "CSCO", "FTNT",
+        "ISRG", "IDXX", "DXCM", "REGN", "VRTX", "MRNA", "CRSP", "RXRX",
+        "COST", "LULU", "ORLY", "ROST", "ULTA", "DECK", "ONON",
+        "AXON", "KTOS", "RKLB", "TMUS",
+    ]
+
+    _SPECIAL_SUFFIX = set("WRUPQZ")
+
+    def _parse(text: str) -> list[str]:
+        lines = text.strip().splitlines()
+        tickers = []
+        for line in lines[1:]:
+            if line.startswith("File Creation Time"):
+                continue
+            parts = line.split("|")
+            if len(parts) < 2:
+                continue
+            symbol = parts[0].strip().upper()
+            if not symbol:
+                continue
+            etf_flag = parts[6].strip().upper() if len(parts) > 6 else ""
+            if etf_flag == "Y":
+                continue
+            if any(c in symbol for c in (".", "+", "-", "^", "=", "/")):
+                continue
+            if symbol.startswith("$") or " " in symbol:
+                continue
+            if len(symbol) > 4 and symbol[-1] in _SPECIAL_SUFFIX and len(symbol[:-1]) >= 4:
+                continue
+            if symbol.lower().endswith("test"):
+                continue
+            tickers.append(symbol)
+        return tickers
+
+    merged = []
+    for url in [
+        "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+        "https://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+    ]:
         try:
-            log_event(
-                db_notify, "sell",
-                f"⏳ Sell order for {ticker} deferred — market is closed. "
-                f"Will execute at {open_et.strftime('%Y-%m-%d %H:%M ET')}."
-            )
-        finally:
-            db_notify.close()
+            resp = requests.get(url, timeout=20)
+            resp.raise_for_status()
+            merged += _parse(resp.text)
+        except Exception as exc:
+            logger.warning("[Jobs] Ticker universe fetch failed for %s: %s", url, exc)
 
-        time.sleep(wait_secs)
+    seen: set[str] = set()
+    deduped = [t for t in merged if not (t in seen or seen.add(t))]
 
-    db = SessionLocal()
-    try:
-        # Re-check settings haven't been changed while we waited
-        trader_enabled = get_setting(db, "trader_enabled", "true")
-        if trader_enabled.lower() != "true":
-            log_event(db, "system", f"Trader disabled — cancelling deferred sell for {ticker}.")
-            return
+    if len(deduped) < 100:
+        logger.warning("[Jobs] Universe too small (%d) — using fallback.", len(deduped))
+        return FALLBACK
 
-        log_event(db, "sell",
-                  f"🔔 Market opened — placing deferred sell order for {ticker}.")
-
-        client = IBKRClient(trading_mode=trading_mode)
-        if not client.connect():
-            log_event(db, "ibkr",
-                      f"Deferred sell ({ticker}): failed to connect to IB Gateway at market open.", "ERROR")
-            return
-
-        client.start_keepalive(interval=30)
-
-        # Find the live position for this ticker
-        live_positions = client.get_positions()
-        target_pos = None
-        for pos in live_positions:
-            if pos["ticker"] == ticker:
-                target_pos = pos
-                break
-
-        if not target_pos or target_pos["shares"] == 0:
-            log_event(db, "sell",
-                      f"⚠️ Deferred sell ({ticker}): no live position found in IBKR. "
-                      f"The position may have already been sold.", "WARNING")
-            client.disconnect()
-            return
-
-        live_shares = target_pos["shares"]
-        # place_sell_order auto-routes to buy-to-cover if live_shares < 0 (short position)
-        result = client.place_sell_order(ticker, live_shares)
-
-        if result.get("success"):
-            sell_price = result["price"]
-            sell_fees = result.get("fees", 0.0)
-
-            trade = (
-                db.query(Trade)
-                .filter(
-                    Trade.ticker == ticker,
-                    Trade.status.in_(["open", "sold_half"]),
-                    Trade.mode == trading_mode,
-                )
-                .order_by(Trade.buy_time.desc())
-                .first()
-            )
-            if trade:
-                buy_price = trade.buy_price or 0.0
-                partial_already_realised = trade.realised_partial_pnl or 0.0
-                remaining_pnl = (sell_price - buy_price) * live_shares
-                total_pnl = remaining_pnl + partial_already_realised
-                original_cost = buy_price * trade.shares if trade.shares else 1
-                pnl_pct = (total_pnl / original_cost * 100) if original_cost else 0.0
-
-                trade.sell_price = sell_price
-                trade.sell_time = datetime.now(timezone.utc)
-                trade.status = "closed"
-                trade.pnl = round(total_pnl, 2)
-                trade.pnl_pct = round(pnl_pct, 2)
-                trade.fees = round((trade.fees or 0.0) + sell_fees, 4)
-                db.commit()
-
-            emoji = "🟢" if (trade and (trade.pnl or 0) >= 0) else "🔴"
-            log_event(db, "sell",
-                      f"{emoji} Deferred sell filled: sold {live_shares} shares of {ticker} "
-                      f"@ ${sell_price:.2f} | Fees: ${sell_fees:.2f}")
-        else:
-            log_event(db, "sell",
-                      f"❌ Deferred sell failed for {ticker}: {result.get('error')}", "ERROR")
-
-        client.disconnect()
-    except Exception as e:
-        logger.exception("Deferred sell job crashed (%s): %s", ticker, e)
-        try:
-            log_event(db, "system", f"Deferred sell crashed ({ticker}): {e}", "ERROR")
-        except Exception:
-            pass
-    finally:
-        db.close()
-
-
-def job_deferred_buy(picks: list[dict], budgets: list[float], trading_mode: str, available_cash: float = 0.0) -> None:
-    """
-    Called in a background thread when a manual scan is triggered outside market hours.
-    Sleeps until NYSE opens (09:30 ET, next weekday), then places the pre-computed
-    buy orders. A fresh DB session and IBKR connection are opened at that point.
-
-    The caller (job_manual_scan_with_deferred_buy) sets _deferred_buy_pending BEFORE
-    starting this thread. This function must NOT re-set the flag — doing so would race
-    with the morning scan that may have already cleared it to signal a supersession.
-    """
-    wait_secs = seconds_until_market_open()
-    if wait_secs > 0:
-
-        open_et = datetime.now(_ET) + timedelta(seconds=wait_secs)
-        logger.info(
-            "Deferred buy: market is closed. Sleeping %.0f s until %s ET.",
-            wait_secs,
-            open_et.strftime("%Y-%m-%d %H:%M"),
-        )
-        db_notify = SessionLocal()
-        try:
-            log_event(
-                db_notify, "scan",
-                f"⏳ Buy orders deferred — market is closed. "
-                f"Will execute at {open_et.strftime('%Y-%m-%d %H:%M ET')} "
-                f"for {len(picks)} stock(s): "
-                + ", ".join(r['ticker'] for r in picks)
-            )
-        finally:
-            db_notify.close()
-
-        time.sleep(wait_secs)
-
-    # Abort if the morning scan has already superseded this deferred buy.
-    # (The morning scan clears _deferred_buy_pending before it runs its own scan.)
-    if not _deferred_buy_pending.is_set():
-        db_abort = SessionLocal()
-        try:
-            log_event(db_abort, "scan",
-                      "⏭️ Deferred buy cancelled — superseded by the morning scan. "
-                      "Morning scan orders will be placed instead.")
-        finally:
-            db_abort.close()
-        return
-
-    db = SessionLocal()
-    try:
-
-        # Re-check settings haven't been changed while we waited
-        trader_enabled = get_setting(db, "trader_enabled", "true")
-        if trader_enabled.lower() != "true":
-            log_event(db, "system", "Trader disabled — cancelling deferred buy orders.")
-            return
-
-        log_event(db, "scan",
-                  f"🔔 Market opened — placing {len(picks)} deferred buy order(s): "
-                  + ", ".join(r['ticker'] for r in picks))
-
-        client = IBKRClient(trading_mode=trading_mode)
-        if not client.connect():
-            log_event(db, "ibkr",
-                      "Deferred buy: failed to connect to IB Gateway at market open.", "ERROR")
-            return
-
-        client.start_keepalive(interval=30)
-        _place_buy_orders(db, client, picks, budgets, trading_mode, available_cash=available_cash)
-        client.disconnect()
-    except Exception as e:
-        logger.exception("Deferred buy job crashed: %s", e)
-        try:
-            log_event(db, "system", f"Deferred buy crashed: {e}", "ERROR")
-        except Exception:
-            pass
-    finally:
-        db.close()
-        _deferred_buy_pending.clear()  # Always clear on exit (success, error, or abort)
+    logger.info("[Jobs] Ticker universe loaded: %d symbols.", len(deduped))
+    return deduped
 
 
 # ---------------------------------------------------------------------------
+# Job 1: Pre-market scan (07:30 ET Mon-Fri)
+# ---------------------------------------------------------------------------
 
-def job_morning_scan_and_buy():
+def job_pre_market_scan():
     """
-    Runs at 09:15 ET every weekday (Mon–Fri).
+    Full systematic pipeline:
+      1. Fetch market regime (SPY + VIX)
+      2. Fetch ticker universe
+      3. Apply mandatory filters (price, vol, market cap, 200SMA, ATR, earnings)
+      4. Score surviving candidates (0–100 composite)
+      5. Run AI analysis (Gemini + DeepSeek cross-check)
+      6. Persist candidates to DB for entry monitor
+      7. Log scan result
 
-    Checks how many position slots are available (max_positions minus current
-    open/sold_half trades) and scans for that many replacement stocks.
-    Sleeps until 09:30 ET before connecting to IBKR and placing orders.
+    NO orders are placed here. This job only STAGES candidates.
+    The entry monitor job places orders after intraday confirmation.
     """
-    db = SessionLocal()
-    try:
-        try:
-            max_positions = int(get_setting(db, "max_positions", "5"))
-        except ValueError:
-            max_positions = 5
+    global _pending_candidates, _scan_date_today
 
-        current_open = _count_open_positions(db)
-        slots_to_fill = max_positions - current_open
-
-        if slots_to_fill <= 0:
-            log_event(db, "scan",
-                      f"Portfolio is full ({current_open}/{max_positions} positions open). "
-                      f"Skipping morning scan.")
-            return
-
-        log_event(db, "scan",
-                  f"📊 {current_open}/{max_positions} positions open — "
-                  f"scanning for {slots_to_fill} replacement stock(s).")
-
-        # Supersede any pending deferred buy from a manual scan — the morning scan
-        # is authoritative because it rechecks live position counts before buying.
-        if _deferred_buy_pending.is_set():
-            _deferred_buy_pending.clear()
-            log_event(db, "scan",
-                      "⏭️ Cleared pending deferred-buy thread — morning scan will "
-                      "place today's orders with fresh position data instead.")
-
-        result = _run_scan_phase(db, log_prefix="morning", num_picks=slots_to_fill)
-        if result is None:
-            return
-        picks, budgets, meta = result
-        trading_mode = meta["trading_mode"]
-
-        # Sleep until market opens (09:30 ET)
-        wait_secs = seconds_until_market_open()
-        if wait_secs > 0:
-            open_et = datetime.now(_ET) + timedelta(seconds=wait_secs)
-            log_event(db, "scan",
-                      f"⏳ Scan complete. Sleeping {wait_secs:.0f} seconds until market opens "
-                      f"at {open_et.strftime('%H:%M:%S ET')} to place buy orders.")
-            time.sleep(wait_secs)
-
-        log_event(db, "scan",
-                  f"🔔 Market opened — placing {len(picks)} morning buy order(s): "
-                  + ", ".join(r['ticker'] for r in picks))
-
-        client = IBKRClient(trading_mode=trading_mode)
-        if not client.connect():
-            log_event(db, "ibkr", "Failed to connect to IB Gateway. Aborting trades.", "ERROR")
-            return
-
-        client.start_keepalive(interval=30)
-        _place_buy_orders(db, client, picks, budgets, trading_mode, available_cash=meta.get("available_cash", 0.0))
-        client.disconnect()
-
-    except Exception as e:
-        logger.exception(f"Morning scan job crashed: {e}")
-        log_event(db, "system", f"Morning scan crashed: {e}", "ERROR")
-    finally:
-        db.close()
-
-
-def job_manual_scan_with_deferred_buy():
-    """
-    Entry point for manual scans triggered via the API.
-    - Runs the AI scan immediately (any time of day).
-    - If the market is currently open: places buy orders immediately.
-    - If the market is closed: persists the AI picks and queues a background
-      thread that will place orders when NYSE opens next.
-    """
-    db = SessionLocal()
-    try:
-        result = _run_scan_phase(db, log_prefix="manual")
-        if result is None:
-            return
-        picks, budgets, meta = result
-        trading_mode = meta["trading_mode"]
-
-        if is_market_open():
-            # Market is open — place orders right now
-            log_event(db, "scan", "Market is open — placing buy orders immediately.")
-            client = IBKRClient(trading_mode=trading_mode)
-            if not client.connect():
-                log_event(db, "ibkr", "Failed to connect to IB Gateway. Aborting trades.", "ERROR")
-                return
-            client.start_keepalive(interval=30)
-            _place_buy_orders(db, client, picks, budgets, trading_mode, available_cash=meta.get("available_cash", 0.0))
-            client.disconnect()
-        else:
-            # Market is closed — hand off to the deferred-buy thread.
-            # Set the pending flag BEFORE starting the thread so the morning
-            # scan can detect and supersede it if needed.
-            _deferred_buy_pending.set()
-            t = threading.Thread(
-                target=job_deferred_buy,
-                args=(picks, budgets, trading_mode, meta.get("available_cash", 0.0)),
-                daemon=True,
-                name="deferred-buy",
-            )
-            t.start()
-
-    except Exception as e:
-        logger.exception(f"Manual scan job crashed: {e}")
-        log_event(db, "system", f"Manual scan crashed: {e}", "ERROR")
-    finally:
-        db.close()
-
-
-def job_afternoon_sell():
-    """
-    Runs at 15:30 ET weekdays (30 min before NYSE close):
-    Sells ALL open positions held in the IBKR account.
-
-    P&L calculation for closed trades:
-    - For 'open' trades: pnl = (sell_price - buy_price) * shares
-    - For 'sold_half' trades: pnl = (sell_price - buy_price) * remaining_shares
-                                    + trade.realised_partial_pnl
-
-    The realised_partial_pnl column banks the +10% partial gain so it is NEVER
-    overwritten here, regardless of how many shares remain.
-    """
     db = SessionLocal()
     try:
         trader_enabled = get_setting(db, "trader_enabled", "true")
         if trader_enabled.lower() != "true":
-            log_event(db, "system", "Trader is globally disabled. Skipping afternoon sell job.")
+            log_event(db, "scan", "Trader globally disabled — skipping pre-market scan.")
             return
 
         trading_mode = get_setting(db, "trading_mode", "paper")
-        log_event(db, "sell", "Starting afternoon sell-all job (30 min before close).")
+        scan_date = datetime.now(timezone.utc).date()
 
-        client = IBKRClient(trading_mode=trading_mode)
-        connected = client.connect()
-        if not connected:
-            log_event(db, "ibkr",
-                      "Failed to connect to IB Gateway for sell job.", "ERROR")
+        log_event(db, "scan", "🔍 Pre-market scan starting…")
+
+        # ── Step 1: Market regime ────────────────────────────────────────────
+        from strategy.data_layer import compute_regime_status, clear_all_caches
+        clear_all_caches()
+        regime_data = compute_regime_status()
+
+        if regime_data is None:
+            log_event(db, "scan",
+                      "❌ Regime data unavailable — cannot proceed safely. No trade today. "
+                      "(fail-safe: never proceed on stale/missing regime data)", "WARNING")
+            from strategy.journal import log_no_trade_day, log_scan_result
+            log_no_trade_day(db, "regime_data_unavailable",
+                             "SPY or VIX fetch failed — fail-safe halt.")
+            log_scan_result(db, scan_date, "unknown", "Data unavailable", 0, 0, 0,
+                            "no_trade", [], {})
             return
 
-        client.start_keepalive(interval=30)
+        regime = regime_data["regime"]
+        log_event(db, "scan",
+                  f"📊 Regime: {regime.upper()} | {regime_data['details']}")
 
-        # Cancel ALL open orders first (stop-loss, take-profit, OCA brackets, etc.)
-        # so they cannot fire while — or after — we liquidate positions.
-        n_cancelled = client.cancel_all_open_orders()
-        log_event(db, "sell",
-                  f"Cancelled {n_cancelled} open order(s) (stop-loss/take-profit brackets) "
-                  f"before starting sell-all.")
-
-        live_positions = client.get_positions()
-        live_tickers = {p["ticker"] for p in live_positions}
-
-        if not live_positions:
-            log_event(db, "sell",
-                      "No live positions found in IBKR account. "
-                      "Reconciling any stale DB records.")
-            _reconcile_stale_db_trades(db, live_tickers, log_event)
-            client.disconnect()
+        if regime == "risk_off":
+            log_event(db, "scan",
+                      f"🛑 Market is RISK_OFF — no new entries today. "
+                      f"({regime_data['details']})")
+            from strategy.journal import log_no_trade_day, log_scan_result
+            log_no_trade_day(db, "risk_off", regime_data["details"])
+            log_scan_result(db, scan_date, regime, regime_data["details"], 0, 0, 0,
+                            "regime_off", [], {})
             return
 
-        log_event(db, "sell",
-                  f"Found {len(live_positions)} live position(s) in IBKR: "
-                  f"{', '.join(p['ticker'] for p in live_positions)}")
+        # ── Step 2: Universe ─────────────────────────────────────────────────
+        log_event(db, "scan", "📋 Fetching ticker universe…")
+        tickers = _fetch_ticker_universe()
+        log_event(db, "scan", f"Universe: {len(tickers)} tickers loaded.")
 
-        # Sync any positions held in IBKR that have no DB record before selling.
-        _sync_untracked_ibkr_positions(db, live_positions, trading_mode, log_event)
+        # ── Step 3: Mandatory filters ─────────────────────────────────────────
+        from strategy.universe_filter import run_universe_filter
+        log_event(db, "scan", f"🔬 Applying mandatory filters…")
+        shortlist, rejections = run_universe_filter(tickers)
 
-        # Build lookup of DB open trades by ticker
-        open_trades = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
-        db_trades_by_ticker = {t.ticker: t for t in open_trades}
+        log_event(db, "scan",
+                  f"Filters complete: {len(shortlist)} candidates survived / "
+                  f"{len(rejections)} rejected from {len(tickers)} universe.")
 
-        sold_tickers: set[str] = set()
+        if not shortlist:
+            log_event(db, "scan",
+                      "✅ No candidates passed all mandatory filters — no trade today. "
+                      "This is a valid system output.")
+            from strategy.journal import log_no_trade_day, log_scan_result
+            log_no_trade_day(db, "no_filter_survivors",
+                             "All tickers failed mandatory filter gates.")
+            log_scan_result(db, scan_date, regime, regime_data["details"], 0, 0, 0,
+                            "no_trade", [], dict(list(rejections.items())[:50]))
+            return
 
-        for position in live_positions:
-            ticker = position["ticker"]
-            live_shares = position["shares"]  # may be negative for short positions
+        # ── Step 4: Score ─────────────────────────────────────────────────────
+        from strategy.data_layer import fetch_sector_etf_returns
+        from strategy.scoring_engine import score_all_candidates, compute_confidence_score
+        sector_returns = fetch_sector_etf_returns()
+        open_positions = _get_open_positions_with_sectors(db)
 
-            is_short = live_shares < 0
-            order_desc = f"BUY-TO-COVER {abs(live_shares)}" if is_short else f"SELL {live_shares}"
+        log_event(db, "scan", f"📈 Scoring {len(shortlist)} candidates…")
+        high_conviction, marginal, no_trade_list = score_all_candidates(
+            shortlist, sector_returns, regime, open_positions
+        )
 
-            if live_shares == 0:
-                log_event(db, "sell",
-                          f"⚠️ Skipping {ticker} in afternoon sell — zero share count.")
-                continue
+        all_scored = high_conviction + marginal + no_trade_list
+        log_event(db, "scan",
+                  f"Scoring done: {len(high_conviction)} high-conviction (≥70), "
+                  f"{len(marginal)} marginal (55-69), {len(no_trade_list)} no-trade (<55).")
 
-            log_event(db, "sell",
-                      f"Placing {order_desc} order for {ticker}...")
-            # place_sell_order transparently handles short positions (negative shares)
-            result = client.place_sell_order(ticker, live_shares)
+        if not high_conviction and not marginal:
+            log_event(db, "scan",
+                      "✅ No candidates scored above 55 — no trade today. "
+                      "This is a valid system output.")
+            from strategy.journal import log_no_trade_day, log_scan_result
+            log_no_trade_day(db, "no_scoring_threshold", "All candidates scored below 55.")
+            log_scan_result(db, scan_date, regime, regime_data["details"],
+                            len(shortlist), 0, 0, "no_trade",
+                            [_strip_df(c) for c in all_scored[:20]], {})
+            return
 
-            if result["success"]:
-                sell_price = result["price"]
-                sold_tickers.add(ticker)
+        # ── Step 5: AI analysis ───────────────────────────────────────────────
+        candidates_for_ai = high_conviction[:10] + marginal[:5]  # Top 15 max
+        log_event(db, "scan", f"🤖 Running AI analysis on {len(candidates_for_ai)} top candidates…")
 
-                trade = db_trades_by_ticker.get(ticker)
-                if trade:
-                    buy_price = trade.buy_price or 0.0
-                    partial_already_realised = trade.realised_partial_pnl or 0.0
+        from strategy.ai_layer import analyze_candidates_batch
+        verdicts = analyze_candidates_batch(
+            candidates_for_ai, regime_data["details"], max_candidates=10
+        )
 
-                    # Correct P&L: use LIVE shares (actual remaining) not trade.shares
-                    # (which still reflects the original full buy quantity).
-                    remaining_pnl = (sell_price - buy_price) * live_shares
-                    total_pnl = remaining_pnl + partial_already_realised
+        approved_verdicts = [v for v in verdicts if v.get("proceed")]
+        log_event(db, "scan",
+                  f"AI result: {len(approved_verdicts)}/{len(verdicts)} candidates approved.")
 
-                    # pnl_pct based on the original full position cost
-                    original_cost = buy_price * trade.shares if trade.shares else 1
-                    pnl_pct = (total_pnl / original_cost * 100) if original_cost else 0.0
+        if not approved_verdicts:
+            log_event(db, "scan",
+                      "✅ AI rejected all candidates — no trade today. "
+                      "This is a valid system output.")
+            from strategy.journal import log_no_trade_day, log_scan_result
+            log_no_trade_day(db, "ai_rejected_all",
+                             f"AI analyzed {len(verdicts)} candidates, approved 0.")
+            log_scan_result(db, scan_date, regime, regime_data["details"],
+                            len(shortlist), len(high_conviction), len(marginal),
+                            "ai_rejected", [_strip_df(c) for c in all_scored[:20]], {})
+            return
 
-                    trade.sell_price = sell_price
-                    trade.sell_time = datetime.now(timezone.utc)
-                    trade.status = "closed"
-                    trade.pnl = round(total_pnl, 2)
-                    trade.pnl_pct = round(pnl_pct, 2)
+        # ── Step 6: Merge AI verdicts with scored metrics ─────────────────────
+        # Build lookup for score data
+        score_by_ticker = {c["ticker"]: c for c in all_scored}
+        staged_candidates = []
+        for verdict in approved_verdicts:
+            ticker = verdict["ticker"]
+            scored = score_by_ticker.get(ticker, {})
+            staged = {**scored, **verdict}  # scored metrics + AI verdict
+            # Compute final confidence score
+            staged["confidence_score"] = compute_confidence_score(
+                composite_score=scored.get("composite_score", 0),
+                ai_gemini_score=verdict.get("gemini_raw", {}).get("conviction") if verdict.get("gemini_raw") else None,
+                ai_deepseek_score=verdict.get("crosscheck_raw", {}).get("conviction") if verdict.get("crosscheck_raw") else None,
+                regime=regime,
+                filter_margin=0.5,
+            )
+            staged_candidates.append(staged)
 
-                    sell_fees = result.get("fees", 0.0)
-                    trade.fees = round((trade.fees or 0.0) + sell_fees, 4)
-                    db.commit()
+        # ── Step 7: Persist AIPick records for UI ─────────────────────────────
+        for rank, candidate in enumerate(staged_candidates, 1):
+            pick = AIPick(
+                scan_date=scan_date,
+                ticker=candidate["ticker"],
+                reason=candidate.get("entry_notes", ""),
+                confidence=round(candidate.get("confidence_score", 0) / 100, 2),
+                position_size_pct=None,
+                rank=rank,
+            )
+            db.add(pick)
+        db.commit()
 
-                    emoji = "🟢" if total_pnl >= 0 else "🔴"
-                    partial_note = (f" (incl. +${partial_already_realised:.2f} partial)"
-                                    if partial_already_realised else "")
-                    log_event(db, "sell",
-                              f"{emoji} Sold {live_shares} shares of {ticker} "
-                              f"@ ${sell_price:.2f} | P&L: ${total_pnl:+.2f} "
-                              f"({pnl_pct:+.2f}%){partial_note} | Fees: ${sell_fees:.2f}")
-                else:
-                    log_event(db, "sell",
-                              f"✅ Sold {live_shares} shares of {ticker} @ ${sell_price:.2f} "
-                              f"(untracked position — no matching DB record)")
-            else:
-                trade = db_trades_by_ticker.get(ticker)
-                if trade:
-                    trade.status = "error"
-                    db.commit()
-                log_event(db, "sell",
-                          f"❌ Sell failed for {ticker}: {result.get('error')}", "ERROR")
+        # ── Step 8: Store staged candidates for entry monitor ─────────────────
+        with _pending_candidates_lock:
+            _pending_candidates = staged_candidates
+            _scan_date_today = scan_date
 
-        _reconcile_stale_db_trades(db, live_tickers, log_event)
+        log_event(db, "scan",
+                  f"✅ Pre-market scan complete: {len(staged_candidates)} candidate(s) staged for entry. "
+                  f"Intraday entry monitor will place orders when conditions are met.")
 
-        client.disconnect()
-        log_event(db, "sell", "Afternoon sell job complete.")
+        # ── Persist scan result ───────────────────────────────────────────────
+        from strategy.journal import log_scan_result
+        log_scan_result(
+            db, scan_date, regime, regime_data["details"],
+            len(shortlist), len(high_conviction), len(marginal),
+            "trade",
+            [_strip_df(c) for c in staged_candidates],
+            dict(list(rejections.items())[:50]),
+        )
 
-    except Exception as e:
-        logger.exception(f"Afternoon sell job crashed: {e}")
-        log_event(db, "system", f"Afternoon sell job crashed: {e}", "ERROR")
+    except Exception as exc:
+        logger.exception("Pre-market scan crashed: %s", exc)
+        try:
+            log_event(db, "system", f"Pre-market scan crashed: {exc}", "ERROR")
+        except Exception:
+            pass
     finally:
         db.close()
 
 
-# _trigger_rescan_if_all_closed() has been removed.
-# Instead of triggering an immediate rescan when positions close, the system
-# now waits until the next morning scan (09:30 ET) which checks how many
-# position slots need filling and scans for that many replacement stocks.
+def _strip_df(candidate: dict) -> dict:
+    """Remove non-serialisable DataFrame objects from a candidate dict."""
+    return {k: v for k, v in candidate.items() if k != "ohlcv_df"}
 
 
-def job_monitor_swing_trades():
+# ---------------------------------------------------------------------------
+# Job 2: Entry Monitor (09:45–15:30 ET, every 5 min)
+# ---------------------------------------------------------------------------
+
+def job_entry_monitor():
     """
-    Runs periodically during market hours.
-    Checks all open positions:
-    - If price drops >= 3% from buy_price (stop-loss): sell ALL, record final P&L.
-    - If price rises >= 5% from buy_price (take-profit): sell ALL shares, record final P&L.
+    Checks pending candidates for intraday entry confirmation.
+    Places limit orders + ATR-based native stop orders when all Section 8
+    conditions are met and all risk engine gates pass.
 
-    Thresholds match the bracket orders placed by place_bracket_orders() in trader.py
-    (stop_pct=0.03, profit_pct=0.05). The software monitor is a belt-and-suspenders
-    fallback for cases where the IBKR OCA bracket orders do not fire (e.g., data gaps,
-    gateway restart, paper-trading quirks).
+    Only runs if there are pending candidates from today's pre-market scan.
+    """
+    global _pending_candidates, _scan_date_today
 
-    After any full exit, the system logs how many slots are now open.
-    Replacement stocks will be bought at the next morning scan (09:30 ET)
-    rather than triggering an immediate rescan.
+    db = SessionLocal()
+    try:
+        trader_enabled = get_setting(db, "trader_enabled", "true")
+        if trader_enabled.lower() != "true":
+            return
 
-    P&L rules:
-    - Take-profit full sell → final pnl = (sell_price - buy_price) * all_live_shares
-    - Stop-loss full sell   → final pnl = (sell_price - buy_price) * all_live_shares
-                                         + trade.realised_partial_pnl (if any banked)
+        if not is_market_open():
+            return
+
+        with _pending_candidates_lock:
+            candidates = list(_pending_candidates)
+            scan_date = _scan_date_today
+
+        if not candidates:
+            return
+
+        # Only act on today's candidates
+        if scan_date != datetime.now(timezone.utc).date():
+            logger.info("[EntryMonitor] Candidates are from a previous day — clearing.")
+            with _pending_candidates_lock:
+                _pending_candidates.clear()
+                _scan_date_today = None
+            return
+
+        trading_mode = get_setting(db, "trading_mode", "paper")
+        client = IBKRClient(trading_mode=trading_mode)
+        if not client.connect():
+            log_event(db, "ibkr",
+                      "Entry monitor: could not connect to IBKR — skipping this cycle.",
+                      "WARNING")
+            return
+        client.start_keepalive(interval=30)
+
+        account = client.get_account_summary()
+        account_equity = account.get("NetLiquidation", 0)
+
+        if account_equity <= 0:
+            log_event(db, "ibkr",
+                      "Entry monitor: account equity is 0 or unavailable — skipping.", "WARNING")
+            client.disconnect()
+            return
+
+        open_positions = _get_open_positions_with_sectors(db)
+        peak_equity = _get_peak_equity(db)
+        weekly_pnl_pct = _compute_weekly_pnl_pct(db, account_equity)
+
+        from strategy.risk_engine import get_risk_engine
+        from strategy.entry_engine import prepare_entry_order
+        risk_engine = get_risk_engine()
+
+        placed_this_cycle = 0
+
+        for candidate in candidates[:]:  # iterate over a copy
+            ticker = candidate["ticker"]
+
+            # Skip if already have a trade for this ticker today
+            existing = db.query(Trade).filter(
+                Trade.ticker == ticker,
+                Trade.status.in_(["open", "sold_half", "closing"]),
+            ).first()
+            if existing:
+                continue
+
+            order_info = prepare_entry_order(
+                candidate=candidate,
+                account_equity=account_equity,
+                open_positions=open_positions,
+                risk_engine=risk_engine,
+            )
+
+            if order_info is None:
+                continue
+
+            shares = order_info["shares"]
+            limit_price = order_info["limit_price"]
+            stop_price  = order_info["stop_price"]
+            partial_target = order_info["partial_target_price"]
+            atr_abs     = order_info["atr_abs"]
+            sector      = order_info["sector"]
+
+            log_event(db, "buy",
+                      f"🟢 {ticker}: placing limit order — "
+                      f"{shares} shares @ ${limit_price:.4f} (limit) | "
+                      f"stop=${stop_price:.4f} | 1.5R=${partial_target:.4f} | "
+                      f"score={candidate.get('composite_score', 0):.1f} | "
+                      f"confidence={order_info.get('confidence_score', 0)}")
+
+            # Place limit buy order
+            result = client.place_limit_buy_order(ticker, shares, limit_price)
+
+            if not result.get("success"):
+                log_event(db, "buy",
+                          f"❌ {ticker}: limit order failed — {result.get('error')}", "ERROR")
+                continue
+
+            fill_price = result.get("price", limit_price)
+            order_id   = result.get("order_id", "")
+
+            # Place native stop order at IBKR
+            stop_result = client.place_stop_order(ticker, shares, stop_price)
+            stop_order_id = stop_result.get("order_id") if stop_result.get("success") else None
+            if not stop_result.get("success"):
+                log_event(db, "buy",
+                          f"⚠️ {ticker}: stop order placement failed — {stop_result.get('error')}. "
+                          f"Software monitor will act as fallback.", "WARNING")
+
+            # Record trade in DB
+            trade = Trade(
+                ticker=ticker,
+                shares=shares,
+                buy_price=fill_price,
+                buy_time=datetime.now(timezone.utc),
+                status="open",
+                mode=trading_mode,
+                order_id=str(order_id),
+                ai_reason=candidate.get("entry_notes", ""),
+                stop_price=stop_price,
+                stop_order_id=str(stop_order_id) if stop_order_id else None,
+                partial_target_price=partial_target,
+                partial_sold=False,
+                atr_at_entry=atr_abs,
+                entry_composite_score=candidate.get("composite_score"),
+                sector=sector,
+            )
+            db.add(trade)
+            db.commit()
+
+            # Journal the entry event
+            from strategy.journal import log_trade_event
+            log_trade_event(
+                db, trade.id, "entry",
+                details=order_info.get("entry_reason", ""),
+                composite_score=candidate.get("composite_score"),
+                confidence_score=order_info.get("confidence_score"),
+                stop_price=stop_price,
+                ai_gemini_json=candidate.get("gemini_raw"),
+                ai_crosscheck_json=candidate.get("crosscheck_raw"),
+                regime_at_event=order_info.get("regime"),
+            )
+
+            log_event(db, "buy",
+                      f"✅ {ticker}: {shares} shares bought @ ${fill_price:.4f} | "
+                      f"stop=${stop_price:.4f} | "
+                      f"1.5R target=${partial_target:.4f} | "
+                      f"risk=${order_info.get('risk_dollar', 0):.2f}")
+
+            placed_this_cycle += 1
+            # Remove candidate from pending list
+            with _pending_candidates_lock:
+                _pending_candidates = [c for c in _pending_candidates
+                                       if c.get("ticker") != ticker]
+
+        client.disconnect()
+
+        if placed_this_cycle:
+            log_event(db, "buy",
+                      f"Entry monitor cycle complete: {placed_this_cycle} order(s) placed.")
+
+    except Exception as exc:
+        logger.exception("Entry monitor crashed: %s", exc)
+        try:
+            log_event(db, "system", f"Entry monitor crashed: {exc}", "ERROR")
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Job 3: Exit Monitor (09:30–16:00 ET, every 5 min)
+# ---------------------------------------------------------------------------
+
+def job_exit_monitor():
+    """
+    Checks all open positions against all Section 9 exit rules:
+      - Hard stop-loss (software safety net for native IBKR stop)
+      - 1.5R partial exit (sell 50% and move stop to breakeven)
+      - Chandelier trailing stop
+      - MA trend break (20-day SMA)
+      - Time exits (10d soft warning, 20d hard exit)
+      - ATR expansion exit (volatility regime change)
+      - Pre-event exit (earnings within 2 trading days)
+
+    IMPORTANT: Exit checks run regardless of circuit breaker state.
+    The risk engine only gates NEW entries — existing positions always
+    have their exits monitored.
     """
     db = SessionLocal()
     try:
@@ -1012,259 +710,186 @@ def job_monitor_swing_trades():
         if trader_enabled.lower() != "true":
             return
 
-        # Skip entirely when the market is closed — saves an IBKR connection
-        # at the 9:00–9:25 ET scheduler ticks before market open.
         if not is_market_open():
             return
 
         trading_mode = get_setting(db, "trading_mode", "paper")
-        client = IBKRClient(trading_mode=trading_mode)
-        if not client.connect():
-            return
-
-        client.start_keepalive(interval=30)
-        live_positions = client.get_positions()
-        live_tickers = {p["ticker"]: p for p in live_positions}
-
-        # Sync any positions held in IBKR that have no DB record (e.g. buy order
-        # was reported as cancelled but actually filled — common IBKR paper bug).
-        _sync_untracked_ibkr_positions(db, live_positions, trading_mode, log_event)
-
         open_trades = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
 
-        any_fully_closed = False
+        if not open_trades:
+            return
 
-        # ── Fetch fresh delayed tick prices for all live tickers ───────────────
-        # get_positions() uses IBKR's portfolio snapshot, where marketPrice is
-        # frequently NaN/0 (especially at market open or after a stale cache
-        # flush). safe_float() silently converts NaN → avg_cost, so
-        # current_price ends up equal to buy_price and SL/TP never triggers.
-        # We batch-request delayed tick data (type 3) for every ticker now so
-        # all threshold comparisons use a real, current market price.
-        from ib_insync import Stock as _Stock
-        fresh_prices: dict[str, float] = {}
-        tick_reqs: dict[str, object] = {}
-        try:
-            client.ib.reqMarketDataType(3)  # delayed — no live subscription needed
-            for _ticker in live_tickers:
-                try:
-                    _contract = _Stock(_ticker, "SMART", "USD")
-                    client.ib.qualifyContracts(_contract)
-                    tick_reqs[_ticker] = client.ib.reqMktData(_contract, "", False, False)
-                except Exception as _exc:
-                    logger.warning("Monitor: could not subscribe to tick data for %s: %s", _ticker, _exc)
+        client = IBKRClient(trading_mode=trading_mode)
+        if not client.connect():
+            logger.warning("[ExitMonitor] Could not connect to IBKR — skipping this cycle.")
+            return
+        client.start_keepalive(interval=30)
 
-            # Wait up to 8 s for all prices to arrive
-            for _ in range(16):   # 16 × 0.5 s = 8 s
-                client.ib.sleep(0.5)
-                if all(
-                    safe_float(t.last) > 0 or safe_float(t.close) > 0
-                    for t in tick_reqs.values()
-                ):
-                    break
+        # Fetch fresh prices for all open tickers
+        live_positions = client.get_positions()
+        live_by_ticker = {p["ticker"]: p for p in live_positions}
 
-            for _ticker, _mkt in tick_reqs.items():
-                _tick_price = safe_float(_mkt.last) or safe_float(_mkt.close)
-                _portfolio_price = live_tickers[_ticker]["current_price"]
-                if _tick_price > 0:
-                    fresh_prices[_ticker] = _tick_price
-                    if _portfolio_price > 0 and abs(_tick_price - _portfolio_price) / _portfolio_price > 0.01:
-                        logger.info(
-                            "Monitor: %s tick price $%.4f differs from portfolio snapshot $%.4f — "
-                            "using fresh tick price for SL/TP evaluation.",
-                            _ticker, _tick_price, _portfolio_price,
-                        )
-                else:
-                    # Tick unavailable — fall back to portfolio snapshot
-                    fresh_prices[_ticker] = _portfolio_price
-                    logger.warning(
-                        "Monitor: no fresh tick price for %s (last=%.4f, close=%.4f). "
-                        "Falling back to portfolio snapshot $%.4f.",
-                        _ticker, safe_float(_mkt.last), safe_float(_mkt.close), _portfolio_price,
-                    )
+        # Sync untracked IBKR positions
+        _sync_untracked_ibkr_positions(db, live_positions, trading_mode)
 
-            # Cancel all subscriptions
-            for _ticker in list(tick_reqs.keys()):
-                try:
-                    _contract = _Stock(_ticker, "SMART", "USD")
-                    client.ib.cancelMktData(_contract)
-                except Exception:
-                    pass
-        except Exception as _exc:
-            logger.warning(
-                "Monitor: fresh tick-price batch failed (%s). "
-                "Falling back to portfolio snapshot prices for all tickers.", _exc,
-            )
-            fresh_prices = {_t: _p["current_price"] for _t, _p in live_tickers.items()}
+        account = client.get_account_summary()
+        account_equity = account.get("NetLiquidation", 0)
+
+        from strategy.exit_engine import check_exit_conditions
+        from strategy.journal import log_trade_event
 
         for trade in open_trades:
             ticker = trade.ticker
-            if ticker not in live_tickers:
+            pos = live_by_ticker.get(ticker)
+            if pos is None:
                 continue
 
-            pos = live_tickers[ticker]
-            # Use fresh tick price; fall back to portfolio snapshot if unavailable
-            current_price = fresh_prices.get(ticker, pos["current_price"])
-            live_shares = pos["shares"]
-            buy_price = trade.buy_price
+            live_shares = int(pos.get("shares", 0))
+            current_price = pos.get("current_price", 0)
 
-            if not buy_price:
+            if live_shares == 0 or current_price <= 0:
                 continue
 
-            # Guard: skip zero positions — selling zero is a no-op.
-            if live_shares == 0:
-                log_event(db, "sell",
-                          f"⚠️ Skipping {ticker} — live shares is 0 (nothing to close).")
-                continue
-
-            # Guard: re-read the trade from the DB in case a concurrent
-            # monitor run already closed it (stale portfolio data can linger
-            # for several minutes after a sell fills).
+            # Re-read trade in case a concurrent run just changed its status
             db.refresh(trade)
             if trade.status not in ("open", "sold_half"):
-                logger.info(
-                    "Monitor: skipping %s — status changed to '%s' "
-                    "(likely closed by a concurrent run).",
-                    ticker, trade.status,
-                )
                 continue
 
-            pct_change = (current_price - buy_price) / buy_price * 100
-            logger.info(
-                "Monitor: %s — buy=$%.4f  current=$%.4f  change=%.2f%%",
-                ticker, buy_price, current_price, pct_change,
+            signal = check_exit_conditions(
+                trade=trade,
+                current_price=current_price,
+                live_shares=live_shares,
+                account_equity=account_equity,
             )
 
-            # ── Stop Loss (>= 3% drop from buy price) ──────────────────────────
-            if current_price <= buy_price * 0.97:
-                # Mark as "closing" BEFORE placing the order so concurrent runs
-                # see this and skip the trade (idempotent sell guard).
-                previous_status = trade.status
+            # ── Trail update (no sell, just update stop price) ────────────────
+            if signal.action == "hold" and signal.reason == "trail_update" and signal.new_stop_price:
+                trade.trailing_stop_price = signal.new_stop_price
+                db.commit()
+                logger.info("[ExitMonitor] %s: trailing stop updated to $%.4f",
+                            ticker, signal.new_stop_price)
+                log_trade_event(db, trade.id, "trail_update", signal.details,
+                                trailing_stop_price=signal.new_stop_price)
+                continue
+
+            # ── Soft warning (log only, no action) ───────────────────────────
+            if signal.action == "hold":
+                if signal.reason == "time_exit_soft_warning":
+                    log_event(db, "sell",
+                              f"⏳ {ticker}: {signal.details}", "WARNING")
+                continue
+
+            # ── Partial exit (1.5R) ───────────────────────────────────────────
+            if signal.action == "partial_exit":
+                shares_to_sell = signal.shares_to_sell or max(1, live_shares // 2)
+                log_event(db, "sell",
+                          f"💰 {ticker}: 1.5R partial exit — selling {shares_to_sell}/{live_shares} shares. "
+                          f"{signal.details}")
+
+                # Mark as closing to prevent concurrent races
                 trade.status = "closing"
                 db.commit()
 
+                result = client.place_sell_order(ticker, shares_to_sell)
+                if result["success"]:
+                    sell_price = result["price"]
+                    partial_pnl = (sell_price - (trade.buy_price or 0)) * shares_to_sell
+                    trade.realised_partial_pnl = round(partial_pnl, 2)
+                    trade.partial_sold = True
+                    trade.status = "sold_half"
+                    # Move stop to breakeven
+                    if signal.new_stop_price:
+                        trade.stop_price = signal.new_stop_price
+                    db.commit()
+
+                    log_event(db, "sell",
+                              f"💰 {ticker}: partial exit filled @ ${sell_price:.4f} | "
+                              f"realised +${partial_pnl:.2f} | stop moved to breakeven")
+                    log_trade_event(db, trade.id, "partial_exit",
+                                    f"1.5R partial: sold {shares_to_sell} @ ${sell_price:.4f}. P&L=${partial_pnl:.2f}",
+                                    stop_price=signal.new_stop_price)
+                else:
+                    trade.status = "open"  # Revert
+                    db.commit()
+                    log_event(db, "sell",
+                              f"❌ {ticker}: partial exit failed — {result.get('error')}. Retrying next cycle.",
+                              "ERROR")
+                continue
+
+            # ── Full exit (stop, trail, MA, time, ATR expansion, pre-event) ──
+            if signal.action == "full_exit":
                 log_event(db, "sell",
-                          f"📉 Stop Loss triggered for {ticker} "
-                          f"(buy=${buy_price:.4f}, now=${current_price:.4f}, "
-                          f"change={pct_change:.2f}%). Selling all {live_shares} shares.")
+                          f"🔴 {ticker}: {signal.reason} — {signal.details}")
+
+                prev_status = trade.status
+                trade.status = "closing"
+                db.commit()
+
                 result = client.place_sell_order(ticker, live_shares)
                 if result["success"]:
                     sell_price = result["price"]
-                    partial_already_realised = trade.realised_partial_pnl or 0.0
-
-                    # Include any already-realised partial gain
+                    buy_price  = trade.buy_price or 0
+                    partial_already = trade.realised_partial_pnl or 0.0
                     remaining_pnl = (sell_price - buy_price) * live_shares
-                    total_pnl = remaining_pnl + partial_already_realised
+                    total_pnl = remaining_pnl + partial_already
 
-                    # pnl_pct on original full position cost (consistent with afternoon sell)
                     original_cost = buy_price * trade.shares if trade.shares else 1
                     pnl_pct = (total_pnl / original_cost * 100) if original_cost else 0.0
 
                     trade.sell_price = sell_price
-                    trade.sell_time = datetime.now(timezone.utc)
-                    trade.status = "closed"
-                    trade.pnl = round(total_pnl, 2)
-                    trade.pnl_pct = round(pnl_pct, 2)
-                    sell_fees = result.get("fees", 0.0)
-                    trade.fees = round((trade.fees or 0.0) + sell_fees, 4)
+                    trade.sell_time  = datetime.now(timezone.utc)
+                    trade.status     = "closed"
+                    trade.pnl        = round(total_pnl, 2)
+                    trade.pnl_pct    = round(pnl_pct, 2)
+                    trade.fees       = round((trade.fees or 0.0) + result.get("fees", 0.0), 4)
                     db.commit()
 
-                    partial_note = (f" (incl. +${partial_already_realised:.2f} partial)"
-                                    if partial_already_realised else "")
+                    emoji = "🟢" if total_pnl >= 0 else "🔴"
                     log_event(db, "sell",
-                              f"📉 Stop-loss closed {ticker}: "
-                              f"P&L ${total_pnl:+.2f}{partial_note}")
-                    any_fully_closed = True
+                              f"{emoji} {ticker} closed ({signal.reason}): "
+                              f"sold {live_shares} @ ${sell_price:.4f} | "
+                              f"P&L: ${total_pnl:+.2f} ({pnl_pct:+.2f}%)")
+                    log_trade_event(db, trade.id, signal.reason,
+                                    signal.details, stop_price=trade.stop_price)
                 else:
-                    # Sell failed — revert to previous status so the next run retries
-                    trade.status = previous_status
+                    trade.status = prev_status  # Revert
                     db.commit()
                     log_event(db, "sell",
-                              f"❌ Stop-loss sell failed for {ticker}: "
-                              f"{result.get('error')}. Will retry next cycle.", "ERROR")
+                              f"❌ {ticker}: exit order failed ({signal.reason}): "
+                              f"{result.get('error')}. Retrying next cycle.", "ERROR")
 
-            # ── Take Profit (>= 5% rise) — sell ALL shares and close ────────────
-            elif current_price >= buy_price * 1.05 and trade.status == "open":
-                # Mark as "closing" BEFORE placing the order (idempotent guard).
-                trade.status = "closing"
-                db.commit()
-
-                log_event(db, "sell",
-                          f"🚀 Take Profit triggered for {ticker} "
-                          f"(buy=${buy_price:.4f}, now=${current_price:.4f}, "
-                          f"change={pct_change:.2f}%). Selling ALL {live_shares} shares.")
-                result = client.place_sell_order(ticker, live_shares)
-                if result["success"]:
-                    sell_price = result["price"]
-                    sell_fees = result.get("fees", 0.0)
-
-                    total_pnl = (sell_price - buy_price) * live_shares
-                    pnl_pct = ((sell_price - buy_price) / buy_price * 100)
-
-                    trade.sell_price = sell_price
-                    trade.sell_time = datetime.now(timezone.utc)
-                    trade.status = "closed"
-                    trade.pnl = round(total_pnl, 2)
-                    trade.pnl_pct = round(pnl_pct, 2)
-                    trade.fees = round((trade.fees or 0.0) + sell_fees, 4)
-                    db.commit()
-
-                    log_event(db, "sell",
-                              f"🚀 Take-profit: sold ALL {live_shares} shares of {ticker} "
-                              f"@ ${sell_price:.2f} | P&L: +${total_pnl:.2f} "
-                              f"({pnl_pct:+.2f}%) | Fees: ${sell_fees:.2f}")
-                    any_fully_closed = True
-                else:
-                    # Sell failed — revert to "open" so the next run retries
-                    trade.status = "open"
-                    db.commit()
-                    log_event(db, "sell",
-                              f"❌ Take-profit sell failed for {ticker}: "
-                              f"{result.get('error')}. Will retry next cycle.", "ERROR")
+        # Reconcile any stale DB records
+        live_tickers = {p["ticker"] for p in live_positions}
+        _reconcile_stale_db_trades(db, live_tickers)
 
         client.disconnect()
 
-        # Positions sold via take-profit or stop-loss will be replaced at the
-        # next morning scan (09:30 ET). The morning job checks how many slots
-        # are available and scans for that many replacement stocks.
-        if any_fully_closed:
-            remaining_open = _count_open_positions(db)
-            try:
-                max_pos = int(get_setting(db, "max_positions", "5"))
-            except ValueError:
-                max_pos = 5
-            slots_available = max_pos - remaining_open
-            log_event(db, "scan",
-                      f"📋 {slots_available} position slot(s) now open "
-                      f"({remaining_open}/{max_pos} held). "
-                      f"Replacement stocks will be bought at next morning scan (09:30 ET).")
-
-    except Exception as e:
-        logger.exception(f"Swing trade monitor crashed: {e}")
+    except Exception as exc:
+        logger.exception("Exit monitor crashed: %s", exc)
+        try:
+            log_event(db, "system", f"Exit monitor crashed: {exc}", "ERROR")
+        except Exception:
+            pass
     finally:
         db.close()
 
 
-def job_snapshot_net_liq() -> None:
+# ---------------------------------------------------------------------------
+# Job 4: EOD Snapshot (15:45 ET Mon-Fri) — unchanged from previous system
+# ---------------------------------------------------------------------------
+
+def job_eod_snapshot() -> None:
     """
-    Runs at 15:45 ET Mon–Fri (15 minutes after the afternoon sell).
-
-    Captures a daily end-of-day NetLiquidation snapshot in the account_snapshots
-    table.  This data is used by /api/pnl-history to compute the P&L Over Time
-    chart from actual account-value movements rather than DB trade P&L fields.
-
-    If a snapshot for today already exists it is UPDATED (upsert) so re-runs
-    (e.g. manual triggers) always reflect the latest value.
+    Captures a daily end-of-day NetLiquidation snapshot.
+    Also used by the risk engine to track peak equity for drawdown circuit breakers.
     """
     db = SessionLocal()
     try:
         trading_mode = get_setting(db, "trading_mode", "paper")
-
         client = IBKRClient(trading_mode=trading_mode)
         if not client.connect():
             log_event(db, "ibkr",
-                      "Snapshot job: could not connect to IB Gateway — skipping today's snapshot.",
-                      "WARNING")
+                      "Snapshot job: could not connect to IB Gateway — skipping.", "WARNING")
             return
 
         client.start_keepalive(interval=30)
@@ -1273,18 +898,14 @@ def job_snapshot_net_liq() -> None:
 
         net_liq_usd = account.get("NetLiquidation", 0)
         net_liq_aud = account.get("NetLiquidation_AUD", None)
-        # fx_rate: USD→AUD (from IBKR account data)
-        fx_rate = account.get("ExchangeRate_USD", None)
+        fx_rate     = account.get("ExchangeRate_USD", None)
 
         if not net_liq_usd:
             log_event(db, "system",
-                      "Snapshot job: NetLiquidation is 0 or missing — skipping snapshot.",
-                      "WARNING")
+                      "Snapshot job: NetLiquidation is 0 or missing — skipping.", "WARNING")
             return
 
         today = datetime.now(timezone.utc).date()
-
-        # Upsert: update today's record if it already exists
         existing = db.query(AccountSnapshot).filter(AccountSnapshot.date == today).first()
         if existing:
             existing.net_liq_usd = net_liq_usd
@@ -1303,11 +924,23 @@ def job_snapshot_net_liq() -> None:
                   f"📸 Daily snapshot saved: Net Liq = ${net_liq_usd:,.2f} USD"
                   + (f" / A${net_liq_aud:,.2f} AUD" if net_liq_aud else ""))
 
-    except Exception as e:
-        logger.exception("Snapshot job crashed: %s", e)
+    except Exception as exc:
+        logger.exception("EOD snapshot crashed: %s", exc)
         try:
-            log_event(db, "system", f"Snapshot job crashed: {e}", "ERROR")
+            log_event(db, "system", f"EOD snapshot crashed: {exc}", "ERROR")
         except Exception:
             pass
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Manual trigger (called by POST /api/scan)
+# ---------------------------------------------------------------------------
+
+def job_manual_scan():
+    """
+    Trigger a full pre-market scan manually (from the API or dashboard).
+    Runs the same pipeline as job_pre_market_scan.
+    """
+    job_pre_market_scan()
