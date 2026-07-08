@@ -278,8 +278,8 @@ def _fetch_ticker_universe() -> list[str]:
 
     merged = []
     for url in [
-        "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
-        "https://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+        "https://nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+        "https://nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
     ]:
         try:
             resp = requests.get(url, timeout=20)

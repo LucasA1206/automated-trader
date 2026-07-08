@@ -211,7 +211,7 @@ def fetch_full_nasdaq_tickers() -> list[str]:
     # ── Source 1: NASDAQ-listed securities ───────────────────────────────────
     nasdaq_tickers: list[str] = []
     try:
-        url1 = "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+        url1 = "https://nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
         logger.info(f"Fetching NASDAQ universe from {url1} ...")
         resp1 = requests.get(url1, timeout=20)
         resp1.raise_for_status()
@@ -258,7 +258,7 @@ def fetch_full_nasdaq_tickers() -> list[str]:
     # ── Source 2: Other-listed securities (NYSE, ARCA, BATS, etc.) ────────────
     other_tickers: list[str] = []
     try:
-        url2 = "https://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+        url2 = "https://nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
         logger.info(f"Fetching other-listed securities from {url2} ...")
         resp2 = requests.get(url2, timeout=20)
         resp2.raise_for_status()
