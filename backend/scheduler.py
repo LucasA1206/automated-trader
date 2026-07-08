@@ -1,3 +1,16 @@
+"""
+scheduler.py — APScheduler configuration for the systematic trading strategy.
+
+Schedule (all times Eastern, Mon-Fri only):
+  07:30  pre_market_scan  — full pipeline: universe → filter → score → AI → candidates staged
+  09:30  exit_monitor     — check all open positions against exit rules (runs until 16:00)
+  09:45  entry_monitor    — place orders for confirmed candidates (runs until 15:30)
+  15:45  eod_snapshot     — capture daily NetLiquidation snapshot
+
+Exit monitor starts at 09:30 (market open) to catch any gaps or overnight events.
+Entry monitor starts at 09:45 (15-min after open) — never in the first 15 minutes.
+"""
+
 import logging
 import os
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -12,77 +25,83 @@ ET = pytz.timezone("America/New_York")
 def create_scheduler() -> BackgroundScheduler:
     """
     Creates and configures the APScheduler instance.
-    Jobs run in Eastern Time (NYSE market hours).
+    All jobs run in Eastern Time (NYSE market hours).
     """
-    from jobs import job_morning_scan_and_buy, job_afternoon_sell, job_snapshot_net_liq
+    from jobs import (
+        job_pre_market_scan,
+        job_entry_monitor,
+        job_exit_monitor,
+        job_eod_snapshot,
+    )
 
     scheduler = BackgroundScheduler(timezone=ET)
 
-    # 09:15 ET Mon-Fri — morning scan + buy orders (runs scan early, sleeps until 09:30 ET)
-    # Runs daily: checks how many position slots need filling (e.g. after
-    # take-profit or stop-loss exits the previous day) and buys replacements.
+    # 07:30 ET Mon-Fri — full pre-market scan
+    # Runs BEFORE market open to identify candidates. No orders placed here.
     scheduler.add_job(
-        func=job_morning_scan_and_buy,
+        func=job_pre_market_scan,
         trigger=CronTrigger(
             day_of_week="mon-fri",
-            hour=9,
-            minute=15,
-            timezone=ET,
-        ),
-        id="morning_scan_buy",
-        name="Morning Scan & Buy",
-        replace_existing=True,
-        misfire_grace_time=300,  # 5min grace window
-    )
-
-    # 15:30 ET Friday only — sell all positions (30min before close)
-    # Strategy: buy Monday morning, hold through the week, sell on Friday.
-    # Intra-week exits are handled by job_monitor_swing_trades (stop-loss / take-profit).
-    scheduler.add_job(
-        func=job_afternoon_sell,
-        trigger=CronTrigger(
-            day_of_week="fri",
-            hour=15,
+            hour=7,
             minute=30,
             timezone=ET,
         ),
-        id="afternoon_sell",
-        name="Friday Sell-All",
+        id="pre_market_scan",
+        name="Pre-Market Scan (07:30 ET)",
         replace_existing=True,
-        misfire_grace_time=300,
+        misfire_grace_time=600,   # 10 min grace — scan is long-running
+        max_instances=1,
     )
 
-    # 15:45 ET Mon-Fri — capture end-of-day NetLiquidation snapshot
-    # Runs 15 minutes after the sell-all so positions are settled.
+    # 09:30–16:00 ET, every 5 min, Mon-Fri — exit monitor
+    # Starts at market open to catch any immediate exits (gaps, overnight events).
     scheduler.add_job(
-        func=job_snapshot_net_liq,
-        trigger=CronTrigger(
-            day_of_week="mon-fri",
-            hour=15,
-            minute=45,
-            timezone=ET,
-        ),
-        id="snapshot_net_liq",
-        name="Daily NetLiq Snapshot",
-        replace_existing=True,
-        misfire_grace_time=300,
-    )
-
-    # Monitor Swing Trades (every 5 mins during market hours)
-    from jobs import job_monitor_swing_trades
-    scheduler.add_job(
-        func=job_monitor_swing_trades,
+        func=job_exit_monitor,
         trigger=CronTrigger(
             day_of_week="mon-fri",
             hour="9-15",
             minute="*/5",
             timezone=ET,
         ),
-        id="monitor_swing_trades",
-        name="Monitor Swing Trades",
+        id="exit_monitor",
+        name="Exit Monitor (every 5 min)",
         replace_existing=True,
         misfire_grace_time=60,
-        max_instances=1,       # Prevent concurrent runs that can duplicate sells
+        max_instances=1,          # Prevent concurrent runs (idempotent sell guards)
+    )
+
+    # 09:45–15:30 ET, every 5 min, Mon-Fri — entry monitor
+    # Avoids first 15 min of trading (blueprint Section 8 time gate).
+    # Stops at 15:30 to avoid entries 30 min before close.
+    scheduler.add_job(
+        func=job_entry_monitor,
+        trigger=CronTrigger(
+            day_of_week="mon-fri",
+            hour="9-15",
+            minute="*/5",
+            timezone=ET,
+        ),
+        id="entry_monitor",
+        name="Entry Monitor (every 5 min)",
+        replace_existing=True,
+        misfire_grace_time=60,
+        max_instances=1,
+    )
+
+    # 15:45 ET Mon-Fri — EOD NetLiquidation snapshot
+    # Runs after market close — 15 min after the last exit monitor tick.
+    scheduler.add_job(
+        func=job_eod_snapshot,
+        trigger=CronTrigger(
+            day_of_week="mon-fri",
+            hour=15,
+            minute=45,
+            timezone=ET,
+        ),
+        id="eod_snapshot",
+        name="EOD NetLiq Snapshot (15:45 ET)",
+        replace_existing=True,
+        misfire_grace_time=300,
     )
 
     return scheduler

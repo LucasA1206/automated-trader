@@ -13,11 +13,11 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from database import get_db, init_db, get_setting, set_setting, SessionLocal
-from models import Trade, SystemLog, Setting, AIPick, AccountSnapshot
+from models import Trade, SystemLog, Setting, AIPick, AccountSnapshot, ScanResult, TradeJournalEntry
 from scheduler import create_scheduler, get_next_job_times
 from trader import IBKRClient
 from auth import require_auth, validate_credentials, create_access_token
-from jobs import start_persistent_keepalive, stop_persistent_keepalive
+from jobs import start_persistent_keepalive, stop_persistent_keepalive, job_manual_scan
 
 # ─── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -395,6 +395,98 @@ def get_ai_picks(db: Session = Depends(get_db)):
     return {"days": days, "total_days": len(days)}
 
 
+# ─── Strategy: Scan History ────────────────────────────────────────────────
+@app.get("/api/scan-history", dependencies=[Depends(require_auth)])
+def get_scan_history(limit: int = 10, db: Session = Depends(get_db)):
+    """
+    Returns the most recent daily scan results including regime, candidate counts,
+    and the action taken. Used by the frontend to display scan outcomes.
+    """
+    import json as _json
+    results = (
+        db.query(ScanResult)
+        .order_by(ScanResult.scan_date.desc())
+        .limit(limit)
+        .all()
+    )
+    return {
+        "scans": [
+            {
+                "scan_date": r.scan_date.isoformat() if r.scan_date else None,
+                "regime_status": r.regime_status,
+                "regime_details": r.regime_details,
+                "candidates_count": r.candidates_count,
+                "high_conviction_count": r.high_conviction_count,
+                "marginal_count": r.marginal_count,
+                "action_taken": r.action_taken,
+                "candidates": _json.loads(r.candidates_json) if r.candidates_json else [],
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in results
+        ]
+    }
+
+
+# ─── Strategy: Risk State ──────────────────────────────────────────────────
+@app.get("/api/risk-state", dependencies=[Depends(require_auth)])
+def get_risk_state(db: Session = Depends(get_db)):
+    """
+    Returns the current portfolio risk state: heat, drawdown, circuit breaker status.
+    """
+    trading_mode = get_setting(db, "trading_mode", "paper")
+    try:
+        client = IBKRClient(trading_mode=trading_mode)
+        connected = client.connect(retries=2, delay=3)
+        if not connected:
+            return {"error": "Cannot connect to IB Gateway", "available": False}
+        account = client.get_account_summary()
+        client.disconnect()
+        equity = account.get("NetLiquidation", 0)
+    except Exception as exc:
+        return {"error": str(exc), "available": False}
+
+    from strategy.risk_engine import get_risk_engine
+    open_trades = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
+    open_positions = [
+        {"buy_price": t.buy_price, "stop_price": t.stop_price, "shares": t.shares,
+         "status": t.status, "sector": getattr(t, "sector", "Unknown") or "Unknown"}
+        for t in open_trades
+    ]
+    from jobs import _get_peak_equity, _compute_weekly_pnl_pct
+    peak_equity = _get_peak_equity(db)
+    weekly_pnl = _compute_weekly_pnl_pct(db, equity)
+
+    from strategy.data_layer import compute_regime_status
+    regime_data = compute_regime_status()
+    regime = regime_data["regime"] if regime_data else "unknown"
+
+    risk_engine = get_risk_engine()
+    state = risk_engine.get_state_summary(
+        account_equity=equity,
+        peak_equity=peak_equity,
+        open_positions=open_positions,
+        daily_pnl_pct=0.0,
+        weekly_pnl_pct=weekly_pnl,
+        regime=regime,
+    )
+    return {"available": True, **state}
+
+
+# ─── Strategy: Pending Candidates ─────────────────────────────────────────
+@app.get("/api/candidates", dependencies=[Depends(require_auth)])
+def get_pending_candidates():
+    """Returns the candidates staged by today's scan, awaiting intraday entry confirmation."""
+    from jobs import _pending_candidates, _scan_date_today
+    from jobs import _strip_df
+    candidates = [_strip_df(c) for c in _pending_candidates]
+    return {
+        "scan_date": _scan_date_today.isoformat() if _scan_date_today else None,
+        "count": len(candidates),
+        "candidates": candidates,
+    }
+
+
+
 # ─── System Logs ───────────────────────────────────────────────────────────
 @app.get("/api/logs", dependencies=[Depends(require_auth)])
 def get_logs(
@@ -525,10 +617,11 @@ def trigger_scan(background_tasks: BackgroundTasks, db: Session = Depends(get_db
 
 @app.post("/api/sell-all", dependencies=[Depends(require_auth)])
 def trigger_sell(background_tasks: BackgroundTasks):
-    """Manually triggers the sell-all job in the background."""
-    from jobs import job_afternoon_sell
-    background_tasks.add_task(job_afternoon_sell)
-    return {"status": "triggered", "message": "Sell-all job started in background"}
+    """Manually trigger the exit monitor immediately (checks all exit conditions)."""
+    from jobs import job_exit_monitor
+    background_tasks.add_task(job_exit_monitor)
+    return {"status": "triggered", "message": "Exit monitor job started in background"}
+
 
 
 @app.post("/api/sell-all-ibkr", dependencies=[Depends(require_auth)])
