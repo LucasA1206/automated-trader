@@ -944,3 +944,13 @@ def job_manual_scan():
     Runs the same pipeline as job_pre_market_scan.
     """
     job_pre_market_scan()
+
+def job_manual_scan_with_deferred_buy():
+    """
+    Triggered by POST /api/scan.
+    Runs the pre-market scan, and if the market is open, immediately runs the entry monitor
+    to place orders.
+    """
+    job_manual_scan()
+    if is_market_open():
+        job_entry_monitor()
