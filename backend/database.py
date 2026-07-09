@@ -1,9 +1,13 @@
 import os
+import logging
+from datetime import datetime, timezone
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text
 # noqa: F401 – all model imports trigger table creation
 from models import Base, Setting, AccountSnapshot, ScanResult, TradeJournalEntry  # noqa: F401
+
+_db_logger = logging.getLogger(__name__)
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./blitz_trader.db")
@@ -131,6 +135,23 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def log_event(db, category: str, message: str, level: str = "INFO"):
+    """
+    Write a system log entry to the system_logs table.
+    This is the canonical implementation — importable from database or jobs.
+    """
+    from models import SystemLog
+    entry = SystemLog(
+        timestamp=datetime.now(timezone.utc),
+        level=level,
+        category=category,
+        message=message,
+    )
+    db.add(entry)
+    db.commit()
+    _db_logger.info("[%s] %s", category.upper(), message)
 
 
 def get_setting(db, key: str, default: str = None) -> str:

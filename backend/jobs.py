@@ -33,8 +33,8 @@ import time
 import json
 from datetime import datetime, timezone, timedelta, date
 
-from database import SessionLocal, get_setting
-from models import Trade, SystemLog, AIPick, AccountSnapshot, ScanResult
+from database import SessionLocal, get_setting, log_event
+from models import Trade, AIPick, AccountSnapshot, ScanResult
 from trader import IBKRClient, safe_float
 
 import pytz
@@ -116,18 +116,8 @@ def seconds_until_market_open() -> float:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def log_event(db, category: str, message: str, level: str = "INFO"):
-    """Write a system log entry."""
-    entry = SystemLog(
-        timestamp=datetime.now(timezone.utc),
-        level=level,
-        category=category,
-        message=message,
-    )
-    db.add(entry)
-    db.commit()
-    logger.info("[%s] %s", category.upper(), message)
-
+# log_event is imported from database — see database.py for the canonical definition.
+# It is re-exported here so legacy call-sites within this module continue to work.
 
 def _count_open_positions(db) -> int:
     return db.query(Trade).filter(Trade.status.in_(["open", "sold_half", "closing"])).count()
@@ -374,6 +364,43 @@ def job_pre_market_scan():
         log_event(db, "scan",
                   f"Filters complete: {len(shortlist)} candidates survived / "
                   f"{len(rejections)} rejected from {len(tickers)} universe.")
+
+        # ── Per-stage breakdown for diagnostics ───────────────────────────────
+        from collections import Counter
+        rejection_buckets = Counter()
+        for reason in rejections.values():
+            # Normalise reason to a short label
+            if reason.startswith("no_price_data") or reason.startswith("price_parse") or reason.startswith("volume_parse"):
+                rejection_buckets["no_data"] += 1
+            elif reason.startswith("price_too_low"):
+                rejection_buckets["price<$5"] += 1
+            elif reason.startswith("avg_dollar_vol_too_low"):
+                rejection_buckets["dollar_vol<$10M"] += 1
+            elif reason.startswith("insufficient_history"):
+                rejection_buckets["insufficient_history"] += 1
+            elif reason.startswith("market_cap_too_low"):
+                rejection_buckets["mkt_cap<$500M"] += 1
+            elif reason.startswith("price_below_200sma"):
+                rejection_buckets["below_200sma"] += 1
+            elif reason.startswith("atr_pct_too_low"):
+                rejection_buckets["atr<2%"] += 1
+            elif reason.startswith("atr_pct_too_high"):
+                rejection_buckets["atr>6%"] += 1
+            elif reason.startswith("rs_below_top30pct"):
+                rejection_buckets["rs_bottom70%"] += 1
+            elif reason.startswith("earnings_within"):
+                rejection_buckets["earnings_blackout"] += 1
+            elif reason.startswith("economic_blackout"):
+                rejection_buckets["econ_blackout"] += 1
+            elif reason.startswith("fcf_negative"):
+                rejection_buckets["fcf+debt"] += 1
+            else:
+                rejection_buckets["other"] += 1
+        breakdown_str = " | ".join(
+            f"{label}:{count}" for label, count in rejection_buckets.most_common()
+        )
+        log_event(db, "scan", f"🔎 Rejection breakdown: {breakdown_str}")
+
 
         if not shortlist:
             log_event(db, "scan",
