@@ -51,8 +51,9 @@ _VIX_TTL_MINUTES = 30
 _ECON_TTL_HOURS = 24
 _BATCH_PRICE_TTL_HOURS = 4
 
-# Batch download chunk size for universe pre-filter
-_BATCH_CHUNK_SIZE = 200
+# Batch download chunk size for universe pre-filter.
+# 100 keeps Yahoo Finance rate-limiter happy; 200 was too aggressive.
+_BATCH_CHUNK_SIZE = 100
 
 
 # ─── Retry helper ─────────────────────────────────────────────────────────────
@@ -123,7 +124,10 @@ def fetch_ohlcv(ticker: str, period: str = "1y") -> Optional[pd.DataFrame]:
     def _fetch():
         tk = yf.Ticker(ticker)
         df = tk.history(period=period, interval="1d", auto_adjust=True)
-        if df is None or df.empty or len(df) < 10:
+        # Use 30 as the minimum so that partial/rate-limited responses
+        # (which may return only a handful of rows) are retried rather
+        # than cached as valid data and later rejected as insufficient_history.
+        if df is None or df.empty or len(df) < 30:
             raise ValueError(f"Insufficient history for {ticker}: {len(df) if df is not None else 0} rows")
         df.index = pd.to_datetime(df.index)
         return df
@@ -151,14 +155,15 @@ def fetch_ohlcv_batch(tickers: list[str], period: str = "22d") -> dict[str, pd.D
     results: dict[str, pd.DataFrame] = {}
     total = len(tickers)
     fetched = 0
+    now = datetime.now(timezone.utc)
 
     for i in range(0, total, _BATCH_CHUNK_SIZE):
         chunk = tickers[i: i + _BATCH_CHUNK_SIZE]
+        chunk_num = i // _BATCH_CHUNK_SIZE + 1
+        total_chunks = math.ceil(total / _BATCH_CHUNK_SIZE)
         logger.info(
             "[DataLayer] Batch OHLCV: chunk %d/%d (%d tickers)…",
-            i // _BATCH_CHUNK_SIZE + 1,
-            math.ceil(total / _BATCH_CHUNK_SIZE),
-            len(chunk),
+            chunk_num, total_chunks, len(chunk),
         )
 
         def _download_chunk(ch=chunk):
@@ -174,18 +179,39 @@ def fetch_ohlcv_batch(tickers: list[str], period: str = "22d") -> dict[str, pd.D
 
         raw = _retry(_download_chunk, retries=3, base_delay=2.0, label="BatchOHLCV")
         if raw is None or raw.empty:
-            logger.warning("[DataLayer] Batch download failed for chunk starting at index %d", i)
+            logger.warning(
+                "[DataLayer] Batch download returned empty for chunk %d/%d (index %d).",
+                chunk_num, total_chunks, i,
+            )
+            time.sleep(0.5)
             continue
 
+        chunk_fetched = 0
         for ticker in chunk:
             try:
                 if isinstance(raw.columns, pd.MultiIndex):
-                    if ticker not in raw.columns.get_level_values(0):
+                    # yfinance ≥0.2.40 may return (field, ticker) or (ticker, field)
+                    # level order depending on version. Detect which level holds ticker names.
+                    level0_vals = raw.columns.get_level_values(0)
+                    level1_vals = raw.columns.get_level_values(1)
+
+                    if ticker in level0_vals:
+                        # Standard (ticker, field) ordering
+                        df = raw[ticker].dropna(how="all")
+                    elif ticker in level1_vals:
+                        # Swapped (field, ticker) ordering — transpose the selection
+                        df = raw.xs(ticker, axis=1, level=1).dropna(how="all")
+                    else:
+                        # Ticker not present in this batch result at all
                         continue
-                    df = raw[ticker].dropna(how="all")
-                else:
-                    # Single ticker returned flat
+                elif len(chunk) == 1:
+                    # Single-ticker download returns a flat DataFrame
                     df = raw.dropna(how="all")
+                else:
+                    logger.debug(
+                        "[DataLayer] Unexpected column format for %s in batch.", ticker
+                    )
+                    continue
 
                 if df is None or df.empty or len(df) < 5:
                     continue
@@ -193,11 +219,31 @@ def fetch_ohlcv_batch(tickers: list[str], period: str = "22d") -> dict[str, pd.D
                 df = _sanity_check_ohlcv(df, ticker)
                 if df is not None and not df.empty:
                     results[ticker] = df
+                    chunk_fetched += 1
                     fetched += 1
+                    # ── Populate the single-ticker OHLCV cache ──────────────────
+                    # This prevents Stage 2 (technical filter) from re-fetching
+                    # every survivor from scratch under rate-limit pressure.
+                    # Only cache if the entry is absent or stale (don't overwrite
+                    # a fresher 1-year fetch with this shorter batch window).
+                    with _cache_lock:
+                        existing = _ohlcv_cache.get(ticker)
+                        if not existing or not _is_cache_fresh(
+                            existing, ttl_hours=_OHLCV_TTL_HOURS
+                        ):
+                            _ohlcv_cache[ticker] = {
+                                "data": df,
+                                "fetched": now,
+                            }
             except Exception as exc:
                 logger.debug("[DataLayer] Batch parse failed for %s: %s", ticker, exc)
 
-        time.sleep(0.1)  # Rate-limit courtesy
+        logger.debug(
+            "[DataLayer] Chunk %d/%d: %d/%d tickers parsed successfully.",
+            chunk_num, total_chunks, chunk_fetched, len(chunk),
+        )
+        # Increased from 0.1s — gives Yahoo Finance rate limiter room to breathe
+        time.sleep(0.5)
 
     logger.info("[DataLayer] Batch OHLCV complete: %d/%d tickers with data.", fetched, total)
     return results
