@@ -45,9 +45,16 @@ logger = logging.getLogger(__name__)
 MIN_PRICE = 5.0
 MIN_AVG_DOLLAR_VOL_20D = 10_000_000.0   # $10M/day
 MIN_MARKET_CAP = 500_000_000.0          # $500M
-ATR_PCT_MIN = 2.0                       # 2% of price
-ATR_PCT_MAX = 6.0                       # 6% of price
-RS_TOP_PERCENTILE = 0.30               # Must be top 30% by relative strength
+ATR_PCT_MIN = 1.5                       # 1.5% of price (widened from 2% — admits low-vol uptrends)
+ATR_PCT_MAX = 8.0                       # 8% of price (widened from 6% — admits high-momentum growth)
+RS_TOP_PERCENTILE = 0.30               # Must be top 30% by relative strength (large-pool mode)
+
+# Minimum pool size for relative RS percentile cut.
+# Below this, use an absolute floor instead to avoid destroying small pools.
+RS_RELATIVE_CUT_MIN_POOL = 20
+# Absolute RS floors (3-month return vs SPY, in %)
+RS_ABS_FLOOR_LARGE_POOL = 0.0    # Must beat SPY over 3 months (large pool ≥ 20)
+RS_ABS_FLOOR_SMALL_POOL = -5.0   # Within 5% of SPY (small pool < 20)
 
 # Earnings blackout window in trading days (blueprint: 3 days)
 EARNINGS_BLACKOUT_TRADING_DAYS = 3
@@ -413,8 +420,20 @@ def apply_relative_strength_threshold(
     metrics_list: list[dict],
 ) -> tuple[list[dict], dict[str, str]]:
     """
-    Enforce the mandatory relative-strength requirement: must be top 30% of
-    the surviving universe by 3-month relative strength vs SPY.
+    Enforce the mandatory relative-strength requirement.
+
+    Pool-size-aware logic (prevents wiping out all candidates on thin days):
+
+    Large pool (≥ RS_RELATIVE_CUT_MIN_POOL = 20):
+      - Apply relative top-30% percentile cut AND require rs_63d > RS_ABS_FLOOR_LARGE_POOL (0%).
+      - Stock must beat SPY over 3 months AND be in the top 30% of the surviving pool.
+
+    Small pool (< 20):
+      - Skip the relative percentile cut entirely.
+      - Only apply absolute floor: rs_63d > RS_ABS_FLOOR_SMALL_POOL (-5%).
+      - Prevents the relative cut from destroying all candidates on thin-filter days.
+
+    Tickers with no RS data are passed through with a warning (no RS = no rejection).
     """
     if not metrics_list:
         return [], {}
@@ -424,22 +443,53 @@ def apply_relative_strength_threshold(
         logger.warning("[Filter] No tickers have RS data — skipping RS threshold filter.")
         return metrics_list, {}
 
-    rs_values = sorted([m["rs_63d"] for m in valid], reverse=True)
-    cutoff_idx = max(0, int(len(rs_values) * RS_TOP_PERCENTILE) - 1)
-    rs_cutoff = rs_values[cutoff_idx] if rs_values else -999
-
+    pool_size = len(valid)
     survivors = []
     rejections = {}
-    for m in metrics_list:
-        rs = m.get("rs_63d")
-        if rs is None or rs >= rs_cutoff:
-            survivors.append(m)
-        else:
-            rejections[m["ticker"]] = f"rs_below_top30pct(rs={rs:.1f}%,cutoff={rs_cutoff:.1f}%)"
+
+    if pool_size >= RS_RELATIVE_CUT_MIN_POOL:
+        # Large pool: relative top-30% cut + absolute floor
+        rs_values = sorted([m["rs_63d"] for m in valid], reverse=True)
+        cutoff_idx = max(0, int(len(rs_values) * RS_TOP_PERCENTILE) - 1)
+        rs_cutoff = rs_values[cutoff_idx]
+        mode = f"relative(top30%,cutoff={rs_cutoff:.1f}%)+abs_floor({RS_ABS_FLOOR_LARGE_POOL:.0f}%)"
+
+        for m in metrics_list:
+            rs = m.get("rs_63d")
+            if rs is None:
+                survivors.append(m)  # No data → pass through
+                continue
+            if rs >= rs_cutoff and rs > RS_ABS_FLOOR_LARGE_POOL:
+                survivors.append(m)
+            else:
+                if rs <= RS_ABS_FLOOR_LARGE_POOL:
+                    rejections[m["ticker"]] = (
+                        f"rs_abs_floor_failed(rs={rs:.1f}%,floor={RS_ABS_FLOOR_LARGE_POOL:.0f}%)"
+                    )
+                else:
+                    rejections[m["ticker"]] = (
+                        f"rs_below_top30pct(rs={rs:.1f}%,cutoff={rs_cutoff:.1f}%)"
+                    )
+    else:
+        # Small pool: absolute floor only — do not apply relative cut
+        rs_cutoff = RS_ABS_FLOOR_SMALL_POOL
+        mode = f"abs_floor_only(pool={pool_size}<{RS_RELATIVE_CUT_MIN_POOL},floor={rs_cutoff:.0f}%)"
+
+        for m in metrics_list:
+            rs = m.get("rs_63d")
+            if rs is None:
+                survivors.append(m)  # No data → pass through
+                continue
+            if rs > rs_cutoff:
+                survivors.append(m)
+            else:
+                rejections[m["ticker"]] = (
+                    f"rs_small_pool_floor_failed(rs={rs:.1f}%,floor={rs_cutoff:.0f}%)"
+                )
 
     logger.info(
-        "[Filter] RS threshold (top 30%%): %d/%d survived. Cutoff=%.1f%%",
-        len(survivors), len(metrics_list), rs_cutoff,
+        "[Filter] RS threshold [%s]: %d/%d survived.",
+        mode, len(survivors), len(metrics_list),
     )
     return survivors, rejections
 
