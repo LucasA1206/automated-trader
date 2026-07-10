@@ -243,6 +243,7 @@ def _fetch_ticker_universe() -> list[str]:
     def _parse(text: str) -> list[str]:
         lines = text.strip().splitlines()
         tickers = []
+        filtered_special = 0
         for line in lines[1:]:
             if line.startswith("File Creation Time"):
                 continue
@@ -259,11 +260,23 @@ def _fetch_ticker_universe() -> list[str]:
                 continue
             if symbol.startswith("$") or " " in symbol:
                 continue
+            # Filter warrants/rights/units/preferred with 4+ char base
             if len(symbol) > 4 and symbol[-1] in _SPECIAL_SUFFIX and len(symbol[:-1]) >= 4:
+                filtered_special += 1
+                continue
+            # Also filter 5-char symbols ending in P or R (preferred shares / rights)
+            # e.g. BANKPA, MFAPR — yfinance cannot price these and they produce no_data
+            if len(symbol) == 5 and symbol[-1] in ("P", "R"):
+                filtered_special += 1
                 continue
             if symbol.lower().endswith("test"):
                 continue
             tickers.append(symbol)
+        if filtered_special:
+            logger.debug(
+                "[Jobs] Universe parse: filtered %d special-suffix symbols (warrants/preferred/rights).",
+                filtered_special,
+            )
         return tickers
 
     merged = []
@@ -400,6 +413,19 @@ def job_pre_market_scan():
             f"{label}:{count}" for label, count in rejection_buckets.most_common()
         )
         log_event(db, "scan", f"🔎 Rejection breakdown: {breakdown_str}")
+
+        # ── Diagnostic: sample no_data tickers for operator inspection ──────────
+        no_data_tickers = [
+            t for t, r in rejections.items()
+            if r.startswith("no_price_data") or r.startswith("price_parse") or r.startswith("volume_parse")
+        ]
+        if no_data_tickers:
+            sample = no_data_tickers[:10]
+            log_event(
+                db, "scan",
+                f"🔍 no_data sample ({len(no_data_tickers)} total): {', '.join(sample)}"
+                + (" …" if len(no_data_tickers) > 10 else "")
+            )
 
 
         if not shortlist:
