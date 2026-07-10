@@ -546,6 +546,11 @@ def compute_composite_score(
 
     gap_penalty_score = _compute_gap_history_penalty(df) if df is not None else 0.0
 
+    # Small-universe guard: with < 5 candidates, percentile-rank scoring is
+    # meaningless (1 stock = 100th percentile). Flag it so the scorers can
+    # fall back to absolute thresholds.
+    _small_universe = len(universe_metrics) < 5
+
     # ── Collect universe values for percentile ranking ───────────────────────
     u_rs_63d  = [m.get("rs_63d")  for m in universe_metrics if m.get("rs_63d")  is not None]
     u_rs_126d = [m.get("rs_126d") for m in universe_metrics if m.get("rs_126d") is not None]
@@ -562,9 +567,45 @@ def compute_composite_score(
     # ── Score each metric ────────────────────────────────────────────────────
     scores: dict[str, float] = {}
 
-    scores["relative_strength"] = score_relative_strength(
-        metrics.get("rs_63d"), metrics.get("rs_126d"), u_rs_63d, u_rs_126d
-    )
+    if _small_universe:
+        # Small-universe fallback: use absolute RS thresholds instead of
+        # percentile ranking, which is meaningless for pools of < 5.
+        logger.info(
+            "[Scoring] Small universe (%d candidates) — using absolute RS/BW thresholds.",
+            len(universe_metrics),
+        )
+        rs_63d_val = metrics.get("rs_63d")
+        rs_126d_val = metrics.get("rs_126d")
+        # Map rs to 0–1: negative = bad, 0–10% alpha = moderate, >10% = strong
+        def _abs_rs_score(rs: Optional[float]) -> float:
+            if rs is None:
+                return 0.3
+            if rs < 0:
+                return max(0.0, 0.3 + rs / 20)   # -5 → 0.05, 0 → 0.3
+            return min(1.0, 0.3 + rs / 15)        # +10% → ~1.0
+        rs_score_abs = _abs_rs_score(rs_63d_val) * 0.6 + _abs_rs_score(rs_126d_val) * 0.4
+        scores["relative_strength"] = rs_score_abs
+
+        # Bollinger band width: use absolute thresholds (< 0.05 tight, > 0.15 wide)
+        bw = bb.get("band_width") if bb else None
+        if bw is None:
+            scores["breakout_quality"] = 0.3
+        elif bw < 0.04:
+            scores["breakout_quality"] = 1.0
+        elif bw < 0.07:
+            scores["breakout_quality"] = 0.75
+        elif bw < 0.12:
+            scores["breakout_quality"] = 0.5
+        else:
+            scores["breakout_quality"] = 0.2
+    else:
+        scores["relative_strength"] = score_relative_strength(
+            metrics.get("rs_63d"), metrics.get("rs_126d"), u_rs_63d, u_rs_126d
+        )
+        scores["breakout_quality"] = score_breakout_quality(
+            bb.get("band_width") if bb else None, u_bw
+        )
+
     scores["high_52w_proximity"] = score_52w_high_proximity(metrics.get("high_52w_pct"))
     scores["relative_volume"] = score_relative_volume(metrics.get("rel_vol"))
     scores["rsi_zone"] = score_rsi_zone(rsi14)
@@ -573,9 +614,6 @@ def compute_composite_score(
     )
     scores["market_cap_band"] = score_market_cap_band(metrics.get("market_cap"))
     scores["adx_trend"] = score_adx(adx14)
-    scores["breakout_quality"] = score_breakout_quality(
-        bb.get("band_width") if bb else None, u_bw
-    )
     scores["revenue_growth"] = score_revenue_growth(metrics.get("revenue_growth_yoy"))
     scores["macd_histogram"] = score_macd_histogram(macd_hist, prev_macd_hist)
     scores["eps_growth"] = score_eps_growth(metrics.get("eps_growth_yoy"))
