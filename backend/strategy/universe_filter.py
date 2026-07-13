@@ -41,13 +41,14 @@ from strategy.data_layer import (
 
 logger = logging.getLogger(__name__)
 
-# Hard-coded from blueprint Section 4/5 (do not relax dynamically — Section 6)
-MIN_PRICE = 5.0
-MIN_AVG_DOLLAR_VOL_20D = 10_000_000.0   # $10M/day
-MIN_MARKET_CAP = 500_000_000.0          # $500M
-ATR_PCT_MIN = 1.5                       # 1.5% of price (widened from 2% — admits low-vol uptrends)
-ATR_PCT_MAX = 8.0                       # 8% of price (widened from 6% — admits high-momentum growth)
-RS_TOP_PERCENTILE = 0.30               # Must be top 30% by relative strength (large-pool mode)
+# Hard-coded filter thresholds.
+# Core downside-protection filters (price > 200 SMA, RS > SPY) are NOT relaxed here.
+MIN_PRICE = 3.0                         # $3 floor (was $5 — admits legitimate small-caps in uptrends)
+MIN_AVG_DOLLAR_VOL_20D = 3_000_000.0   # $3M/day (was $10M — was rejecting ~49% of universe)
+MIN_MARKET_CAP = 150_000_000.0         # $150M (was $500M — opens mid/small-cap universe)
+ATR_PCT_MIN = 1.5                       # 1.5% of price — excludes ETFs/illiquid names
+ATR_PCT_MAX = 12.0                      # 12% of price (was 8% — admits high-momentum growth stocks)
+RS_TOP_PERCENTILE = 0.50               # Must be top 50% by relative strength (was 30% — more candidates)
 
 # Minimum pool size for relative RS percentile cut.
 # Below this, use an absolute floor instead to avoid destroying small pools.
@@ -188,7 +189,7 @@ def stage1_price_volume_filter(
 
         if avg_dollar_vol < MIN_AVG_DOLLAR_VOL_20D:
             rejection_reasons[ticker] = (
-                f"avg_dollar_vol_too_low(${avg_dollar_vol/1e6:.1f}M<$10M)"
+                f"avg_dollar_vol_too_low(${avg_dollar_vol/1e6:.1f}M<${MIN_AVG_DOLLAR_VOL_20D/1e6:.0f}M)"
             )
             continue
 
@@ -223,7 +224,7 @@ def _stage2_check_single(
     fundamentals = fetch_fundamentals(ticker)
     market_cap = fundamentals.get("market_cap", 0) if fundamentals else 0
     if market_cap and market_cap < MIN_MARKET_CAP:
-        return None, f"market_cap_too_low(${market_cap/1e6:.0f}M<$500M)"
+        return None, f"market_cap_too_low(${market_cap/1e6:.0f}M<${MIN_MARKET_CAP/1e6:.0f}M)"
 
     # Price > 200-day SMA (mandatory trend filter — highest-value single filter per blueprint)
     sma_200 = _compute_sma(closes, 200)
