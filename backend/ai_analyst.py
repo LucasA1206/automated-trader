@@ -1320,7 +1320,7 @@ worst_intraday_dip_5d, consec_up_days, pct_days_positive_20d) alongside any news
 ]"""
 
     try:
-        model = genai.GenerativeModel("gemini-2.5-pro")
+        model = genai.GenerativeModel("gemini-2.5-flash")
         response = model.generate_content(prompt)
         text = response.text.strip()
 
