@@ -58,7 +58,8 @@ NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-GEMINI_MODEL = "gemini-2.0-flash"
+# gemini-2.5-flash is available on the free tier; gemini-2.0-flash requires billing.
+GEMINI_MODEL = "gemini-2.5-flash"
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -241,30 +242,43 @@ def _call_gemini(prompt: str, ticker: str) -> Optional[dict]:
         logger.warning("[AI] GEMINI_API_KEY not set — skipping Gemini analysis for %s", ticker)
         return None
 
-    try:
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.2,
-                max_output_tokens=512,
-            ),
-        )
-        text = response.text.strip() if response.text else ""
-        if not text:
-            logger.error("[AI] Gemini returned empty response for %s", ticker)
+    model = genai.GenerativeModel(GEMINI_MODEL)
+    generation_config = genai.types.GenerationConfig(
+        temperature=0.2,
+        max_output_tokens=512,
+    )
+
+    for attempt in range(1, 4):  # Up to 3 attempts with backoff for rate limits
+        try:
+            response = model.generate_content(prompt, generation_config=generation_config)
+            text = response.text.strip() if response.text else ""
+            if not text:
+                logger.error("[AI] Gemini returned empty response for %s", ticker)
+                return None
+
+            raw = _extract_json_from_response(text)
+            if raw is None:
+                logger.error("[AI] Gemini response for %s was not parseable JSON: %s...", ticker, text[:200])
+                return None
+
+            return _validate_ai_verdict(raw, ticker, "Gemini")
+
+        except Exception as exc:
+            exc_str = str(exc).lower()
+            # Retry on rate-limit (429 / ResourceExhausted)
+            if "429" in exc_str or "resource_exhausted" in exc_str or "toomanyrequests" in exc_str.replace("_", ""):
+                wait = 15 * attempt  # 15s, 30s, 45s
+                logger.warning(
+                    "[AI] Gemini rate-limited for %s (attempt %d/3) — waiting %ds", ticker, attempt, wait
+                )
+                time.sleep(wait)
+                continue
+            # Non-retryable error (403 Forbidden etc.)
+            logger.error("[AI] Gemini call failed for %s: %s", ticker, exc)
             return None
 
-        raw = _extract_json_from_response(text)
-        if raw is None:
-            logger.error("[AI] Gemini response for %s was not parseable JSON: %s...", ticker, text[:200])
-            return None
-
-        return _validate_ai_verdict(raw, ticker, "Gemini")
-
-    except Exception as exc:
-        logger.error("[AI] Gemini call failed for %s: %s", ticker, exc)
-        return None
+    logger.error("[AI] Gemini gave up after 3 rate-limit retries for %s", ticker)
+    return None
 
 
 # ─── Cross-check model caller ─────────────────────────────────────────────────
