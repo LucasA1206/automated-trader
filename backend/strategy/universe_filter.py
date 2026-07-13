@@ -229,8 +229,8 @@ def _stage2_check_single(
     # Price > 200-day SMA (mandatory trend filter — highest-value single filter per blueprint)
     sma_200 = _compute_sma(closes, 200)
     if sma_200 is None:
-        # Less than 200 days of data — try 150d as a minimum
-        sma_200 = _compute_sma(closes, 150)
+        # Less than 200 days of data — fall back to 100d SMA (allows ~5 months of history)
+        sma_200 = _compute_sma(closes, 100)
         if sma_200 is None:
             return None, "insufficient_history_for_200sma"
 
