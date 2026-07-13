@@ -221,20 +221,12 @@ def fetch_ohlcv_batch(tickers: list[str], period: str = "22d") -> dict[str, pd.D
                     results[ticker] = df
                     chunk_fetched += 1
                     fetched += 1
-                    # ── Populate the single-ticker OHLCV cache ──────────────────
-                    # This prevents Stage 2 (technical filter) from re-fetching
-                    # every survivor from scratch under rate-limit pressure.
-                    # Only cache if the entry is absent or stale (don't overwrite
-                    # a fresher 1-year fetch with this shorter batch window).
-                    with _cache_lock:
-                        existing = _ohlcv_cache.get(ticker)
-                        if not existing or not _is_cache_fresh(
-                            existing, ttl_hours=_OHLCV_TTL_HOURS
-                        ):
-                            _ohlcv_cache[ticker] = {
-                                "data": df,
-                                "fetched": now,
-                            }
+                    # NOTE: Do NOT write the 22-day batch data into the single-ticker
+                    # _ohlcv_cache. Stage 2 calls fetch_ohlcv(period="1y") and expects
+                    # a full year of data. If we cache 22d here, Stage 2 reads the
+                    # cached 22d entry, sees len(df) < 50, and rejects every ticker
+                    # as "insufficient_history". The caches serve different purposes
+                    # and must not be conflated.
             except Exception as exc:
                 logger.debug("[DataLayer] Batch parse failed for %s: %s", ticker, exc)
 
