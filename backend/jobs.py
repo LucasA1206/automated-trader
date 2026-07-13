@@ -386,21 +386,21 @@ def job_pre_market_scan():
             if reason.startswith("no_price_data") or reason.startswith("price_parse") or reason.startswith("volume_parse"):
                 rejection_buckets["no_data"] += 1
             elif reason.startswith("price_too_low"):
-                rejection_buckets["price<$5"] += 1
+                rejection_buckets["price<$3"] += 1
             elif reason.startswith("avg_dollar_vol_too_low"):
-                rejection_buckets["dollar_vol<$10M"] += 1
+                rejection_buckets["dollar_vol<$3M"] += 1
             elif reason.startswith("insufficient_history"):
                 rejection_buckets["insufficient_history"] += 1
             elif reason.startswith("market_cap_too_low"):
-                rejection_buckets["mkt_cap<$500M"] += 1
+                rejection_buckets["mkt_cap<$150M"] += 1
             elif reason.startswith("price_below_200sma"):
                 rejection_buckets["below_200sma"] += 1
             elif reason.startswith("atr_pct_too_low"):
-                rejection_buckets["atr<2%"] += 1
+                rejection_buckets["atr<1.5%"] += 1
             elif reason.startswith("atr_pct_too_high"):
-                rejection_buckets["atr>6%"] += 1
+                rejection_buckets["atr>12%"] += 1
             elif reason.startswith("rs_below_top30pct"):
-                rejection_buckets["rs_bottom70%"] += 1
+                rejection_buckets["rs_bottom50%"] += 1
             elif reason.startswith("earnings_within"):
                 rejection_buckets["earnings_blackout"] += 1
             elif reason.startswith("economic_blackout"):
