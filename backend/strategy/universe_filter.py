@@ -220,12 +220,6 @@ def _stage2_check_single(
     closes = df["Close"]
     current_price = float(closes.iloc[-1])
 
-    # Market cap filter — fetch fundamentals for surviving tickers
-    fundamentals = fetch_fundamentals(ticker)
-    market_cap = fundamentals.get("market_cap", 0) if fundamentals else 0
-    if market_cap and market_cap < MIN_MARKET_CAP:
-        return None, f"market_cap_too_low(${market_cap/1e6:.0f}M<${MIN_MARKET_CAP/1e6:.0f}M)"
-
     # Price > 200-day SMA (mandatory trend filter — highest-value single filter per blueprint)
     sma_200 = _compute_sma(closes, 200)
     if sma_200 is None:
@@ -237,7 +231,7 @@ def _stage2_check_single(
     if current_price <= sma_200:
         return None, f"price_below_200sma(${current_price:.2f}<${sma_200:.2f})"
 
-    # ATR% band: 2%–6%
+    # ATR% band: 1.5%–12%
     atr_pct = _compute_atr_pct(df, period=14)
     if atr_pct is None:
         return None, "atr_compute_failed"
@@ -247,7 +241,13 @@ def _stage2_check_single(
     if atr_pct > ATR_PCT_MAX:
         return None, f"atr_pct_too_high({atr_pct:.2f}%>{ATR_PCT_MAX}%)"
 
-    # Relative strength — must be in top 30% (enforced at ranking stage, computed here)
+    # Market cap filter — fetch fundamentals ONLY for surviving tickers to avoid rate limiting
+    fundamentals = fetch_fundamentals(ticker)
+    market_cap = fundamentals.get("market_cap", 0) if fundamentals else 0
+    if market_cap and market_cap < MIN_MARKET_CAP:
+        return None, f"market_cap_too_low(${market_cap/1e6:.0f}M<${MIN_MARKET_CAP/1e6:.0f}M)"
+
+    # Relative strength — must be in top 50% (enforced at ranking stage, computed here)
     rs = _compute_relative_strength(df, spy_ret_63d, spy_ret_126d)
 
     # Compute additional metrics needed by scoring engine
