@@ -61,9 +61,9 @@ _ECON_TTL_HOURS = 24
 _BATCH_PRICE_TTL_HOURS = 4
 
 # Batch download chunk size for universe pre-filter.
-# Using a custom browser session allows larger batches (500), which
-# reduces requests from 108 to 22 and avoids rate limits.
-_BATCH_CHUNK_SIZE = 500
+# Using a custom browser session allows larger batches (100), which
+# reduces requests and avoids rate limits.
+_BATCH_CHUNK_SIZE = 100
 
 
 # ─── Retry helper ─────────────────────────────────────────────────────────────
@@ -185,7 +185,6 @@ def fetch_ohlcv_batch(tickers: list[str], period: str = "22d") -> dict[str, pd.D
                 auto_adjust=True,
                 progress=False,
                 threads=True,
-                session=_session,
             )
 
         raw = _retry(_download_chunk, retries=3, base_delay=2.0, label="BatchOHLCV")
@@ -194,7 +193,7 @@ def fetch_ohlcv_batch(tickers: list[str], period: str = "22d") -> dict[str, pd.D
                 "[DataLayer] Batch download returned empty for chunk %d/%d (index %d).",
                 chunk_num, total_chunks, i,
             )
-            time.sleep(0.5)
+            time.sleep(2.0)
             continue
 
         chunk_fetched = 0
@@ -256,16 +255,12 @@ def fetch_ohlcv_batch(tickers: list[str], period: str = "22d") -> dict[str, pd.D
 
 def fetch_fundamentals(ticker: str) -> Optional[dict]:
     """
-    Fetch fundamental data for a ticker via yfinance .info.
-
+    Fetch fundamental data for a ticker via FinnHub.
     Returns dict with:
       market_cap, float_shares, sector, industry,
       revenue_growth_yoy, eps_growth_yoy, fcf_positive, net_debt_ebitda,
       profit_margin, return_on_equity, institutional_ownership_pct,
       short_interest_pct_float, beta
-
-    Returns None on failure.
-    Cache TTL: 24 hours.
     """
     with _cache_lock:
         cached = _fundamentals_cache.get(ticker)
@@ -273,71 +268,65 @@ def fetch_fundamentals(ticker: str) -> Optional[dict]:
         return cached["data"]
 
     def _fetch():
-        tk = yf.Ticker(ticker, session=_session)
-        info = tk.info
-        if not info or info.get("quoteType") not in ("EQUITY", "ETF", None):
-            raise ValueError(f"No equity info for {ticker}")
-        return info
+        import finnhub
+        from dotenv import load_dotenv
+        
+        # Ensure environment variables are loaded
+        load_dotenv('.env.local')
+        
+        api_key = os.getenv('FINNHUB_API')
+        if not api_key:
+            raise ValueError("FINNHUB_API not set")
+        client = finnhub.Client(api_key=api_key)
+        
+        # company_profile2 for sector, industry, market_cap
+        profile = client.company_profile2(symbol=ticker)
+        if not profile:
+            raise ValueError(f"No profile info for {ticker}")
+            
+        # company_basic_financials for metrics
+        financials = client.company_basic_financials(ticker, 'all')
+        metrics = financials.get('metric', {})
+        
+        return profile, metrics
 
-    info = _retry(_fetch, retries=3, base_delay=1.5, label=f"Fundamentals({ticker})")
-    if info is None:
+    data_tuple = _retry(_fetch, retries=3, base_delay=1.5, label=f"Fundamentals({ticker})")
+    if not data_tuple:
         return None
 
-    # Parse out what we need
-    market_cap = info.get("marketCap") or 0
-    float_shares = info.get("floatShares") or info.get("sharesOutstanding") or 0
+    profile, metrics = data_tuple
 
-    # Revenue growth: yfinance provides revenueGrowth (YoY quarterly) as a decimal
-    revenue_growth_yoy = info.get("revenueGrowth")  # e.g. 0.12 = 12%
-    if revenue_growth_yoy is not None:
-        revenue_growth_yoy = float(revenue_growth_yoy) * 100  # convert to %
+    # Parse FinnHub specific fields
+    market_cap = profile.get("marketCapitalization") or 0
+    market_cap = market_cap * 1_000_000 # Finnhub returns in millions
+    
+    float_shares = profile.get("shareOutstanding") or 0
+    float_shares = float_shares * 1_000_000 # Finnhub returns in millions
 
-    # EPS growth: use epsCurrentYear vs epsPriorYear (trailing) — fallback to earningsGrowth
-    eps_growth_yoy = info.get("earningsGrowth")
-    if eps_growth_yoy is not None:
-        eps_growth_yoy = float(eps_growth_yoy) * 100
+    revenue_growth_yoy = metrics.get("revenueGrowthTTMYoy")
+    eps_growth_yoy = metrics.get("epsGrowthTTMYoy")
+    
+    # FCF Positive: Use freeCashFlowAnnual if available, else operatingMargin
+    fcf = metrics.get("pfcfShareAnnual")
+    fcf_positive = (fcf > 0) if fcf is not None else None
 
-    # FCF: yfinance doesn't expose directly in info; use operatingCashflow - capexes
-    # Approximate: if operatingCashflow > 0 and freeCashflow > 0 → positive FCF
-    operating_cf = info.get("operatingCashflow") or 0
-    free_cf = info.get("freeCashflow") or operating_cf  # freeCashflow may be None
-    fcf_positive = (free_cf > 0) if free_cf else None
+    # Debt / EBITDA
+    net_debt_ebitda = metrics.get("totalDebt/totalEquityAnnual") # Proxy for now as Finnhub doesn't have direct net_debt_ebitda
+    
+    profit_margin = metrics.get("netProfitMarginTTM")
+    roe = metrics.get("roeTTM")
+    beta = metrics.get("beta")
 
-    # Debt: totalDebt / ebitda (approximation)
-    total_debt = info.get("totalDebt") or 0
-    ebitda = info.get("ebitda") or 0
-    net_debt_ebitda = None
-    if ebitda and ebitda > 0 and total_debt:
-        cash = info.get("totalCash") or 0
-        net_debt = total_debt - cash
-        net_debt_ebitda = round(net_debt / ebitda, 2)
-
-    profit_margin = info.get("profitMargins")
-    if profit_margin is not None:
-        profit_margin = float(profit_margin) * 100
-
-    roe = info.get("returnOnEquity")
-    if roe is not None:
-        roe = float(roe) * 100
-
-    # Institutional ownership
-    inst_own_pct = info.get("heldPercentInstitutions")
-    if inst_own_pct is not None:
-        inst_own_pct = float(inst_own_pct) * 100
-
-    # Short interest
-    short_pct_float = info.get("shortPercentOfFloat")
-    if short_pct_float is not None:
-        short_pct_float = float(short_pct_float) * 100
-
-    beta = info.get("beta")
+    # Finnhub free doesn't easily expose inst_own or short_pct, setting to None
+    inst_own_pct = None
+    short_pct_float = None
 
     data = {
         "ticker": ticker,
         "market_cap": market_cap,
         "float_shares": float_shares,
-        "sector": info.get("sector", "Unknown"),
-        "industry": info.get("industry", "Unknown"),
+        "sector": profile.get("finnhubIndustry", "Unknown"),
+        "industry": profile.get("finnhubIndustry", "Unknown"),
         "revenue_growth_yoy": revenue_growth_yoy,
         "eps_growth_yoy": eps_growth_yoy,
         "fcf_positive": fcf_positive,
