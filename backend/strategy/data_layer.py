@@ -61,8 +61,9 @@ _ECON_TTL_HOURS = 24
 _BATCH_PRICE_TTL_HOURS = 4
 
 # Batch download chunk size for universe pre-filter.
-# 100 keeps Yahoo Finance rate-limiter happy; 200 was too aggressive.
-_BATCH_CHUNK_SIZE = 100
+# Using a custom browser session allows larger batches (500), which
+# reduces requests from 108 to 22 and avoids rate limits.
+_BATCH_CHUNK_SIZE = 500
 
 
 # ─── Retry helper ─────────────────────────────────────────────────────────────
@@ -244,8 +245,8 @@ def fetch_ohlcv_batch(tickers: list[str], period: str = "22d") -> dict[str, pd.D
             "[DataLayer] Chunk %d/%d: %d/%d tickers parsed successfully.",
             chunk_num, total_chunks, chunk_fetched, len(chunk),
         )
-        # Increased from 0.1s — gives Yahoo Finance rate limiter room to breathe
-        time.sleep(0.5)
+        # Increased to 1.0s to give Yahoo Finance rate limiter room to breathe
+        time.sleep(1.0)
 
     logger.info("[DataLayer] Batch OHLCV complete: %d/%d tickers with data.", fetched, total)
     return results
