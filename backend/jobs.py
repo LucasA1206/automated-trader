@@ -442,7 +442,7 @@ def job_pre_market_scan():
 
         # ── Step 4: Score ─────────────────────────────────────────────────────
         from strategy.data_layer import fetch_sector_etf_returns
-        from strategy.scoring_engine import score_all_candidates, compute_confidence_score
+        from strategy.scoring_engine import score_all_candidates, compute_confidence_score, SCORE_HIGH_CONVICTION, SCORE_MARGINAL
         sector_returns = fetch_sector_etf_returns()
         open_positions = _get_open_positions_with_sectors(db)
 
@@ -453,8 +453,8 @@ def job_pre_market_scan():
 
         all_scored = high_conviction + marginal + no_trade_list
         log_event(db, "scan",
-                  f"Scoring done: {len(high_conviction)} high-conviction (≥70), "
-                  f"{len(marginal)} marginal (55-69), {len(no_trade_list)} no-trade (<55).")
+                  f"Scoring done: {len(high_conviction)} high-conviction (≥{SCORE_HIGH_CONVICTION}), "
+                  f"{len(marginal)} marginal ({SCORE_MARGINAL}-{SCORE_HIGH_CONVICTION-0.1}), {len(no_trade_list)} no-trade (<{SCORE_MARGINAL}).")
 
         # ── Diagnostic: log candidate scores and top contributing metrics ─────
         from strategy.scoring_engine import WEIGHTS
@@ -465,10 +465,10 @@ def job_pre_market_scan():
 
         if not high_conviction and not marginal:
             log_event(db, "scan",
-                      "✅ No candidates scored above 55 — no trade today. "
+                      f"✅ No candidates scored above {SCORE_MARGINAL} — no trade today. "
                       "This is a valid system output.")
             from strategy.journal import log_no_trade_day, log_scan_result
-            log_no_trade_day(db, "no_scoring_threshold", "All candidates scored below 55.")
+            log_no_trade_day(db, "no_scoring_threshold", f"All candidates scored below {SCORE_MARGINAL}.")
             log_scan_result(db, scan_date, regime, regime_data["details"],
                             len(shortlist), 0, 0, "no_trade",
                             [_strip_df(c) for c in all_scored[:20]], {})
