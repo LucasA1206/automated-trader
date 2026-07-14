@@ -32,6 +32,15 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# Setup a session with browser-like headers to bypass Yahoo Finance Cloud blocks/rate limits
+_session = requests.Session()
+_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Connection": "keep-alive",
+})
+
 # ─── Cache storage ────────────────────────────────────────────────────────────
 _cache_lock = threading.Lock()
 _ohlcv_cache: dict[str, dict] = {}          # ticker -> {"data": df, "fetched": datetime}
@@ -122,7 +131,7 @@ def fetch_ohlcv(ticker: str, period: str = "1y") -> Optional[pd.DataFrame]:
         return cached["data"]
 
     def _fetch():
-        tk = yf.Ticker(ticker)
+        tk = yf.Ticker(ticker, session=_session)
         df = tk.history(period=period, interval="1d", auto_adjust=True)
         # Use 30 as the minimum so that partial/rate-limited responses
         # (which may return only a handful of rows) are retried rather
@@ -175,6 +184,7 @@ def fetch_ohlcv_batch(tickers: list[str], period: str = "22d") -> dict[str, pd.D
                 auto_adjust=True,
                 progress=False,
                 threads=True,
+                session=_session,
             )
 
         raw = _retry(_download_chunk, retries=3, base_delay=2.0, label="BatchOHLCV")
@@ -262,7 +272,7 @@ def fetch_fundamentals(ticker: str) -> Optional[dict]:
         return cached["data"]
 
     def _fetch():
-        tk = yf.Ticker(ticker)
+        tk = yf.Ticker(ticker, session=_session)
         info = tk.info
         if not info or info.get("quoteType") not in ("EQUITY", "ETF", None):
             raise ValueError(f"No equity info for {ticker}")
@@ -375,7 +385,7 @@ def fetch_next_earnings_date(ticker: str) -> Optional[date]:
         return cached["date"]
 
     def _fetch():
-        tk = yf.Ticker(ticker)
+        tk = yf.Ticker(ticker, session=_session)
         cal = tk.calendar
         if cal is None:
             return None
@@ -431,7 +441,7 @@ def fetch_vix() -> Optional[dict]:
         return cached["data"]
 
     def _fetch():
-        tk = yf.Ticker("^VIX")
+        tk = yf.Ticker("^VIX", session=_session)
         hist = tk.history(period="5d", interval="1d")
         if hist is None or hist.empty or len(hist) < 2:
             raise ValueError("Insufficient VIX history")
@@ -478,7 +488,7 @@ def fetch_spy_regime() -> Optional[dict]:
         return cached["data"]
 
     def _fetch():
-        tk = yf.Ticker("SPY")
+        tk = yf.Ticker("SPY", session=_session)
         hist = tk.history(period="1y", interval="1d")
         if hist is None or hist.empty or len(hist) < 50:
             raise ValueError("Insufficient SPY history")
@@ -530,7 +540,7 @@ def fetch_sector_etf_returns() -> dict[str, float]:
 
     def _fetch_return(etf_ticker: str, sector_name: str):
         try:
-            hist = yf.Ticker(etf_ticker).history(period="3mo", interval="1d")
+            hist = yf.Ticker(etf_ticker, session=_session).history(period="3mo", interval="1d")
             if hist is None or hist.empty or len(hist) < 5:
                 return None
             closes = hist["Close"]
@@ -680,7 +690,7 @@ def fetch_spy_returns() -> Optional[dict]:
     Used to compute relative strength of each stock vs the benchmark.
     """
     def _fetch():
-        tk = yf.Ticker("SPY")
+        tk = yf.Ticker("SPY", session=_session)
         hist = tk.history(period="7mo", interval="1d")
         if hist is None or hist.empty or len(hist) < 63:
             raise ValueError("Insufficient SPY history for RS calculation")
@@ -702,7 +712,7 @@ def estimate_vwap(ticker: str) -> Optional[float]:
     Returns None if intraday data is unavailable.
     """
     def _fetch():
-        tk = yf.Ticker(ticker)
+        tk = yf.Ticker(ticker, session=_session)
         hist = tk.history(period="1d", interval="5m")
         if hist is None or hist.empty:
             return None
@@ -785,6 +795,7 @@ def fetch_sector_etf_returns(lookback_days: int = 63) -> dict[str, float]:
             auto_adjust=True,
             progress=False,
             threads=True,
+            session=_session,
         )["Close"]
 
         for sector, etf in _SECTOR_ETFS.items():
