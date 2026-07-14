@@ -240,59 +240,60 @@ def _fetch_ticker_universe() -> list[str]:
 
     _SPECIAL_SUFFIX = set("WRUPQZ")
 
-    def _parse(text: str) -> list[str]:
-        lines = text.strip().splitlines()
+    def _fetch_screener() -> list[str]:
+        import requests
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            'Accept': 'application/json',
+            'Origin': 'https://www.nasdaq.com',
+            'Referer': 'https://www.nasdaq.com/'
+        }
+        url = "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=15000&offset=0"
+        
         tickers = []
-        filtered_special = 0
-        for line in lines[1:]:
-            if line.startswith("File Creation Time"):
-                continue
-            parts = line.split("|")
-            if len(parts) < 2:
-                continue
-            symbol = parts[0].strip().upper()
-            if not symbol:
-                continue
-            etf_flag = parts[6].strip().upper() if len(parts) > 6 else ""
-            if etf_flag == "Y":
-                continue
-            if any(c in symbol for c in (".", "+", "-", "^", "=", "/")):
-                continue
-            if symbol.startswith("$") or " " in symbol:
-                continue
-            # Filter warrants/rights/units/preferred with 4+ char base
-            if len(symbol) > 4 and symbol[-1] in _SPECIAL_SUFFIX and len(symbol[:-1]) >= 4:
-                filtered_special += 1
-                continue
-            # Also filter 5-char symbols ending in P or R (preferred shares / rights)
-            # e.g. BANKPA, MFAPR — yfinance cannot price these and they produce no_data
-            if len(symbol) == 5 and symbol[-1] in ("P", "R"):
-                filtered_special += 1
-                continue
-            if symbol.lower().endswith("test"):
-                continue
-            tickers.append(symbol)
-        if filtered_special:
-            logger.debug(
-                "[Jobs] Universe parse: filtered %d special-suffix symbols (warrants/preferred/rights).",
-                filtered_special,
-            )
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+            rows = data.get('data', {}).get('table', {}).get('rows', [])
+            
+            filtered_special = 0
+            for row in rows:
+                if not row or 'symbol' not in row:
+                    continue
+                    
+                symbol = row['symbol'].strip().upper()
+                if not symbol or any(c in symbol for c in (".", "+", "-", "^", "=", "/")):
+                    continue
+                if symbol.startswith("$") or " " in symbol:
+                    continue
+                if len(symbol) > 4 and symbol[-1] in _SPECIAL_SUFFIX and len(symbol[:-1]) >= 4:
+                    filtered_special += 1
+                    continue
+                if len(symbol) == 5 and symbol[-1] in ("P", "R"):
+                    filtered_special += 1
+                    continue
+                if symbol.lower().endswith("test"):
+                    continue
+                    
+                # Pre-filter by price to save yfinance rate limits
+                try:
+                    price_str = row.get('lastsale', '').replace('$', '').replace(',', '').strip()
+                    if price_str and float(price_str) >= 2.0:
+                        tickers.append(symbol)
+                except ValueError:
+                    # Keep if price parsing fails, let stage 1 catch it
+                    tickers.append(symbol)
+
+            if filtered_special:
+                logger.debug("[Jobs] Universe parse: filtered %d special-suffix symbols.", filtered_special)
+                
+        except Exception as exc:
+            logger.warning("[Jobs] Ticker universe fetch failed via screener: %s", exc)
+            
         return tickers
 
-    merged = []
-    for url in [
-        "https://nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
-        "https://nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
-    ]:
-        try:
-            resp = requests.get(url, timeout=20)
-            resp.raise_for_status()
-            merged += _parse(resp.text)
-        except Exception as exc:
-            logger.warning("[Jobs] Ticker universe fetch failed for %s: %s", url, exc)
-
-    seen: set[str] = set()
-    deduped = [t for t in merged if not (t in seen or seen.add(t))]
+    deduped = _fetch_screener()
 
     if len(deduped) < 100:
         logger.warning("[Jobs] Universe too small (%d) — using fallback.", len(deduped))

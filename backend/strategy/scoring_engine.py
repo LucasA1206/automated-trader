@@ -80,9 +80,10 @@ PENALTIES = {
 MAX_POSITIVE_WEIGHT = sum(WEIGHTS.values())  # ~115
 
 # Scoring thresholds per blueprint Section 5 Step 3
-SCORE_HIGH_CONVICTION = 70.0    # Full size eligibility
-SCORE_MARGINAL = 55.0           # Half size, capacity-limited
-SCORE_NO_TRADE = 55.0           # Below this = not tradable
+# Lowered thresholds due to missing data (FinnHub free doesn't provide 9 points of data)
+SCORE_HIGH_CONVICTION = 65.0    # Full size eligibility
+SCORE_MARGINAL = 45.0           # Half size, capacity-limited
+SCORE_NO_TRADE = 45.0           # Below this = not tradable
 
 
 # ─── Technical indicator helpers ──────────────────────────────────────────────
