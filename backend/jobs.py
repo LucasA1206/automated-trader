@@ -455,6 +455,13 @@ def job_pre_market_scan():
                   f"Scoring done: {len(high_conviction)} high-conviction (≥70), "
                   f"{len(marginal)} marginal (55-69), {len(no_trade_list)} no-trade (<55).")
 
+        # ── Diagnostic: log candidate scores and top contributing metrics ─────
+        from strategy.scoring_engine import WEIGHTS
+        for c in all_scored[:20]:
+            top_components = sorted(c.get("component_scores", {}).items(), key=lambda x: x[1], reverse=True)[:5]
+            comp_str = ", ".join(f"{k}: {v}/{WEIGHTS.get(k, 0)}" for k, v in top_components)
+            log_event(db, "scan", f"🔍 Scored {c['ticker']}: {c['composite_score']}/100 | Top metrics: {comp_str}")
+
         if not high_conviction and not marginal:
             log_event(db, "scan",
                       "✅ No candidates scored above 55 — no trade today. "
