@@ -1320,9 +1320,11 @@ worst_intraday_dip_5d, consec_up_days, pct_days_positive_20d) alongside any news
 ]"""
 
     try:
+        logger.info(f"Sending prompt to Gemini. Length: {len(prompt)} characters. Expected model: gemini-2.5-flash-lite")
         model = genai.GenerativeModel("gemini-2.5-flash-lite")
         response = model.generate_content(prompt)
         text = response.text.strip()
+        logger.info(f"Gemini response received. Length: {len(text)} characters.")
 
         # Strip markdown code fences if present
         if text.startswith("```"):
@@ -1345,10 +1347,13 @@ worst_intraday_dip_5d, consec_up_days, pct_days_positive_20d) alongside any news
                     "position_size_pct": float(rec.get("position_size_pct", 5.0)),
                 })
         validated.sort(key=lambda r: r["confidence"], reverse=True)
+        logger.info(f"Gemini analysis completed successfully. Returned {len(validated)} recommendations.")
         return validated
 
     except Exception as e:
         logger.error(f"Gemini analysis failed: {e}")
+        if 'text' in locals():
+            logger.error(f"Raw response text (first 500 chars): {text[:500]}")
         return []
 
 

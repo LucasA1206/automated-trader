@@ -248,17 +248,20 @@ def _call_gemini(prompt: str, ticker: str) -> Optional[dict]:
         max_output_tokens=512,
     )
 
+    logger.info("[AI] Sending prompt to Gemini for %s. Length: %d characters. Model: %s", ticker, len(prompt), GEMINI_MODEL)
+
     for attempt in range(1, 4):  # Up to 3 attempts with backoff for rate limits
         try:
             response = model.generate_content(prompt, generation_config=generation_config)
             text = response.text.strip() if response.text else ""
+            logger.info("[AI] Gemini response received for %s on attempt %d. Length: %d characters.", ticker, attempt, len(text))
             if not text:
                 logger.error("[AI] Gemini returned empty response for %s", ticker)
                 return None
 
             raw = _extract_json_from_response(text)
             if raw is None:
-                logger.error("[AI] Gemini response for %s was not parseable JSON: %s...", ticker, text[:200])
+                logger.error("[AI] Gemini response for %s was not parseable JSON. Raw text (first 500 chars): %s", ticker, text[:500])
                 return None
 
             return _validate_ai_verdict(raw, ticker, "Gemini")
@@ -269,12 +272,14 @@ def _call_gemini(prompt: str, ticker: str) -> Optional[dict]:
             if "429" in exc_str or "resource_exhausted" in exc_str or "toomanyrequests" in exc_str.replace("_", ""):
                 wait = 15 * attempt  # 15s, 30s, 45s
                 logger.warning(
-                    "[AI] Gemini rate-limited for %s (attempt %d/3) — waiting %ds", ticker, attempt, wait
+                    "[AI] Gemini rate-limited for %s (attempt %d/3) — waiting %ds. Details: %s", ticker, attempt, wait, exc
                 )
                 time.sleep(wait)
                 continue
             # Non-retryable error (403 Forbidden etc.)
-            logger.error("[AI] Gemini call failed for %s: %s", ticker, exc)
+            logger.error("[AI] Gemini call failed for %s on attempt %d: %s", ticker, attempt, exc)
+            if 'text' in locals() and text:
+                logger.error("[AI] Partial/failed Gemini response text (first 500 chars): %s", text[:500])
             return None
 
     logger.error("[AI] Gemini gave up after 3 rate-limit retries for %s", ticker)
