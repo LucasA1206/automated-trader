@@ -258,6 +258,7 @@ def _fetch_ticker_universe() -> list[str]:
             rows = data.get('data', {}).get('table', {}).get('rows', [])
             
             filtered_special = 0
+            candidates = []
             for row in rows:
                 if not row or 'symbol' not in row:
                     continue
@@ -276,26 +277,60 @@ def _fetch_ticker_universe() -> list[str]:
                 if symbol.lower().endswith("test"):
                     continue
                     
-                # Pre-filter by price and market cap to save yfinance rate limits
+                # ── Pre-filter 1: price ≥ $3 ────────────────────────────────────────
                 try:
                     price_str = row.get('lastsale', '').replace('$', '').replace(',', '').strip()
-                    if price_str:
-                        price = float(price_str)
-                        if price < 3.0:
-                            continue
-                except ValueError:
-                    pass
+                    price = float(price_str) if price_str else 0.0
+                    if price < 3.0:
+                        continue
+                except (ValueError, TypeError):
+                    price = 0.0
 
+                # ── Pre-filter 2: market cap ≥ $150M ────────────────────────────────
                 try:
                     mcap_str = row.get('marketCap', '').replace(',', '').strip()
-                    if mcap_str:
-                        mcap = float(mcap_str)
-                        if mcap < 150_000_000.0:
-                            continue
-                except ValueError:
-                    pass
+                    mcap = float(mcap_str) if mcap_str else 0.0
+                    if mcap < 150_000_000.0:
+                        continue
+                except (ValueError, TypeError):
+                    mcap = 0.0
 
+                # Collect volume for the second pass
+                try:
+                    vol_str = row.get('volume', '').replace(',', '').strip()
+                    vol = float(vol_str) if vol_str else 0.0
+                except (ValueError, TypeError):
+                    vol = 0.0
+
+                candidates.append((symbol, price, vol))
+
+            # ── Pre-filter 3: single-day dollar volume ≥ $500K ──────────────────
+            # Only apply this filter if the screener is returning real volume data.
+            # After market close, Nasdaq resets volume to 0 for all tickers, which
+            # would incorrectly eliminate everything. We check: if fewer than 20% of
+            # candidates have vol > 0, the screener is returning stale/zeroed data,
+            # and we skip this filter to avoid eliminating the entire universe.
+            # At 07:30 ET (scan time), prior-session volume is still populated.
+            with_vol = sum(1 for _, _, v in candidates if v > 0)
+            vol_filter_active = with_vol >= len(candidates) * 0.20
+            if vol_filter_active:
+                logger.info(
+                    "[Jobs] Volume pre-filter active: %d/%d candidates have vol data.",
+                    with_vol, len(candidates),
+                )
+            else:
+                logger.info(
+                    "[Jobs] Volume pre-filter SKIPPED (only %d/%d have vol data — screener may be post-market).",
+                    with_vol, len(candidates),
+                )
+
+            for symbol, price, vol in candidates:
+                if vol_filter_active:
+                    dollar_vol_1d = vol * price
+                    if dollar_vol_1d < 500_000.0:
+                        continue
                 tickers.append(symbol)
+
 
             if filtered_special:
                 logger.debug("[Jobs] Universe parse: filtered %d special-suffix symbols.", filtered_special)
