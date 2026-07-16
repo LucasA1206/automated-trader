@@ -682,7 +682,7 @@ def fetch_fundamentals_batch(tickers: list[str], max_workers: int = 8) -> dict[s
 
 def fetch_next_earnings_date(ticker: str) -> Optional[date]:
     """
-    Return the next scheduled earnings date for a ticker.
+    Return the next scheduled earnings date for a ticker via Finnhub.
     Returns None if unavailable.
     This is used for the mandatory earnings-blackout exclusion filter.
     Cache TTL: 24 hours.
@@ -693,27 +693,38 @@ def fetch_next_earnings_date(ticker: str) -> Optional[date]:
         return cached["date"]
 
     def _fetch():
-        tk = yf.Ticker(ticker, session=_session)
-        cal = tk.calendar
-        if cal is None:
+        from datetime import timedelta as _td, date as _date
+        client = _get_finnhub_client()
+        today = datetime.now(timezone.utc).date()
+        # Look 60 days ahead for upcoming earnings
+        date_from = today.strftime("%Y-%m-%d")
+        date_to   = (today + _td(days=60)).strftime("%Y-%m-%d")
+        _finnhub_rate_check()
+        cal = client.earnings_calendar(
+            _from=date_from, to=date_to, symbol=ticker, international=False
+        )
+        earnings_list = cal.get("earningsCalendar", []) if cal else []
+        if not earnings_list:
             return None
-        earn_date = None
-        if isinstance(cal, dict):
-            dates = cal.get("Earnings Date")
-            if dates:
-                d = dates[0]
-                earn_date = d.date() if hasattr(d, "date") else d
-        elif hasattr(cal, "empty") and not cal.empty:
-            if "Earnings Date" in cal.index:
-                d = cal.loc["Earnings Date"].iloc[0]
-                earn_date = d.date() if hasattr(d, "date") else d
-        return earn_date
+        # Return the earliest upcoming date
+        dates = []
+        for entry in earnings_list:
+            d_str = entry.get("date")
+            if d_str:
+                try:
+                    dates.append(_date.fromisoformat(d_str))
+                except ValueError:
+                    pass
+        future_dates = [d for d in dates if d >= today]
+        return min(future_dates) if future_dates else None
+
 
     earn_date = _retry(_fetch, retries=2, base_delay=1.0, label=f"EarningsDate({ticker})")
 
     with _cache_lock:
         _earnings_cache[ticker] = {"date": earn_date, "fetched": datetime.now(timezone.utc)}
     return earn_date
+
 
 
 def is_near_earnings(ticker: str, trading_days_buffer: int = 3) -> bool:
