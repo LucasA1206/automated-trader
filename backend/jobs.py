@@ -442,7 +442,7 @@ def job_pre_market_scan():
 
         # ── Step 4: Score ─────────────────────────────────────────────────────
         from strategy.data_layer import fetch_sector_etf_returns
-        from strategy.scoring_engine import score_all_candidates, compute_confidence_score, SCORE_HIGH_CONVICTION, SCORE_MARGINAL
+        from strategy.scoring_engine import score_all_candidates, compute_confidence_score, SCORE_HIGH_CONVICTION, SCORE_MARGINAL, WEIGHTS, MAX_POSITIVE_WEIGHT
         sector_returns = fetch_sector_etf_returns()
         open_positions = _get_open_positions_with_sectors(db)
 
@@ -456,12 +456,31 @@ def job_pre_market_scan():
                   f"Scoring done: {len(high_conviction)} high-conviction (≥{SCORE_HIGH_CONVICTION}), "
                   f"{len(marginal)} marginal ({SCORE_MARGINAL}-{SCORE_HIGH_CONVICTION-0.1}), {len(no_trade_list)} no-trade (<{SCORE_MARGINAL}).")
 
-        # ── Diagnostic: log candidate scores and top contributing metrics ─────
-        from strategy.scoring_engine import WEIGHTS
+        # ── Diagnostic: full per-metric breakdown for every scored candidate ─────────
         for c in all_scored[:20]:
-            top_components = sorted(c.get("component_scores", {}).items(), key=lambda x: x[1], reverse=True)[:5]
-            comp_str = ", ".join(f"{k}: {v}/{WEIGHTS.get(k, 0)}" for k, v in top_components)
-            log_event(db, "scan", f"🔍 Scored {c['ticker']}: {c['composite_score']}/100 | Top metrics: {comp_str}")
+            sub     = c.get("sub_scores", {})
+            gaps    = set(c.get("data_gaps", []))
+            eff_w   = c.get("effective_max_weight", MAX_POSITIVE_WEIGHT)
+            pens    = c.get("penalties", {})
+
+            # Line 1: summary — score, effective denominator, data gaps
+            gap_str = ", ".join(sorted(gaps)) if gaps else "none"
+            log_event(db, "scan", (
+                f"📊 {c['ticker']}: {c['composite_score']}/100 "
+                f"[eff_denom={eff_w}/{MAX_POSITIVE_WEIGHT}] "
+                f"| data_gaps: {gap_str}"
+            ))
+
+            # Line 2: all metric sub-scores and weighted contributions
+            parts = []
+            for k in sorted(WEIGHTS.keys()):
+                s  = sub.get(k, 0.0)
+                ws = round(s * WEIGHTS[k], 2)
+                flag = "⚫" if k in gaps else ""
+                parts.append(f"{k}={s:.2f}×{WEIGHTS[k]}={ws:.2f}{flag}")
+            pen_str = (f"si_pen={pens.get('short_interest', 0):.2f} "
+                      f"gap_hist_pen={pens.get('gap_history', 0):.2f}")
+            log_event(db, "scan", f"   ↳ {'  |  '.join(parts)}  |  {pen_str}")
 
         if not high_conviction and not marginal:
             log_event(db, "scan",
