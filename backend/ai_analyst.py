@@ -1321,7 +1321,7 @@ worst_intraday_dip_5d, consec_up_days, pct_days_positive_20d) alongside any news
 
     try:
         logger.info(f"Sending prompt to Gemini. Length: {len(prompt)} characters. Expected model: gemini-2.5-flash-lite")
-        model = genai.GenerativeModel("gemini-2.5-flash-lite")
+        model = genai.GenerativeModel("gemini-3.5-flash")
         response = model.generate_content(prompt)
         text = response.text.strip()
         logger.info(f"Gemini response received. Length: {len(text)} characters.")
