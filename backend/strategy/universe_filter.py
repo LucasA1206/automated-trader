@@ -523,9 +523,9 @@ def run_universe_filter(tickers: list[str]) -> tuple[list[dict], dict[str, str]]
     # after the large Stage 1 batch (4,435 tickers across 89 chunks).
     # Then reset the block flag so Stage 2 can attempt fresh 1-year downloads.
     logger.info(
-        "[Filter] Pausing 15s before Stage 2 to let Yahoo Finance rate limiter recover…"
+        "[Filter] Pausing 60s before Stage 2 to let Yahoo Finance rate limiter recover…"
     )
-    time.sleep(15)
+    time.sleep(60)
     reset_yfinance_block()
     s2_metrics, s2_rejections = stage2_technical_filter(s1_survivors)
     all_rejections.update(s2_rejections)

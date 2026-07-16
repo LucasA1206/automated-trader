@@ -71,6 +71,7 @@ _BATCH_PRICE_TTL_HOURS = 4
 # Smaller chunks (50) reduce per-request payload and give Yahoo Finance
 # more breathing room between requests, lowering the rate-limit hit rate.
 _BATCH_CHUNK_SIZE = 50
+_PRIME_CHUNK_SIZE = 25
 
 
 # ─── Finnhub rate limiter (free tier: 60 calls/min) ──────────────────────────
@@ -318,6 +319,7 @@ def fetch_ohlcv_batch(tickers: list[str], period: str = "22d") -> dict[str, pd.D
     now = datetime.now(timezone.utc)
     consecutive_failures = 0
     global _yfinance_blocked
+    chunk_sleep = 2.5
 
     for i in range(0, total, _BATCH_CHUNK_SIZE):
         if _yfinance_blocked:
@@ -343,20 +345,30 @@ def fetch_ohlcv_batch(tickers: list[str], period: str = "22d") -> dict[str, pd.D
                 session=_session,   # restored: browser UA avoids Yahoo rate limits
             )
 
-        raw = _retry(_download_chunk, retries=3, base_delay=4.0, label="BatchOHLCV")
+        while True:
+            raw = _retry(_download_chunk, retries=2, base_delay=4.0, label="BatchOHLCV")
+            if raw is None or raw.empty:
+                logger.warning("[DataLayer] Chunk %d empty/rate-limited. Waiting 90s before retry...", chunk_num)
+                time.sleep(90)
+                raw = _retry(_download_chunk, retries=2, base_delay=4.0, label="BatchOHLCV(Retry)")
+                if raw is None or raw.empty:
+                    consecutive_failures += 1
+                    if consecutive_failures >= 5:
+                        logger.error("[DataLayer] 5 consecutive failures. Blocking yfinance.")
+                        _yfinance_blocked = True
+                    time.sleep(30)
+                    break
+                else:
+                    consecutive_failures = 0
+                    chunk_sleep = max(chunk_sleep, 5.0)
+                    break
+            else:
+                consecutive_failures = 0
+                break
+
         if raw is None or raw.empty:
-            consecutive_failures += 1
-            if consecutive_failures >= 5:
-                logger.error("[DataLayer] Too many consecutive yfinance batch failures (%d). Setting _yfinance_blocked = True.", consecutive_failures)
-                _yfinance_blocked = True
-            logger.warning(
-                "[DataLayer] Batch download returned empty for chunk %d/%d (index %d). Consecutive failures: %d.",
-                chunk_num, total_chunks, i, consecutive_failures,
-            )
-            time.sleep(8.0)
             continue
 
-        consecutive_failures = 0
         chunk_fetched = 0
         for ticker in chunk:
             try:
@@ -405,8 +417,7 @@ def fetch_ohlcv_batch(tickers: list[str], period: str = "22d") -> dict[str, pd.D
             "[DataLayer] Chunk %d/%d: %d/%d tickers parsed successfully.",
             chunk_num, total_chunks, chunk_fetched, len(chunk),
         )
-        # 2.5s between chunks gives Yahoo Finance's rate limiter room to recover
-        time.sleep(2.5)
+        time.sleep(chunk_sleep)
 
     logger.info("[DataLayer] Batch OHLCV complete: %d/%d tickers with data.", fetched, total)
     return results
@@ -422,14 +433,15 @@ def prime_ohlcv_cache(tickers: list[str], period: str = "1y") -> None:
     fetched = 0
     consecutive_failures = 0
     global _yfinance_blocked
+    chunk_sleep = 5.0
 
-    for i in range(0, total, _BATCH_CHUNK_SIZE):
+    for i in range(0, total, _PRIME_CHUNK_SIZE):
         if _yfinance_blocked:
             logger.warning("[DataLayer] yfinance is marked as blocked. Aborting cache priming.")
             break
-        chunk = tickers[i: i + _BATCH_CHUNK_SIZE]
-        chunk_num = i // _BATCH_CHUNK_SIZE + 1
-        total_chunks = math.ceil(total / _BATCH_CHUNK_SIZE)
+        chunk = tickers[i: i + _PRIME_CHUNK_SIZE]
+        chunk_num = i // _PRIME_CHUNK_SIZE + 1
+        total_chunks = math.ceil(total / _PRIME_CHUNK_SIZE)
 
         def _download_chunk(ch=chunk):
             return yf.download(
@@ -443,20 +455,30 @@ def prime_ohlcv_cache(tickers: list[str], period: str = "1y") -> None:
                 session=_session,
             )
 
-        raw = _retry(_download_chunk, retries=3, base_delay=4.0, label="PrimeOHLCVCache")
+        while True:
+            raw = _retry(_download_chunk, retries=2, base_delay=4.0, label="PrimeOHLCVCache")
+            if raw is None or raw.empty:
+                logger.warning("[DataLayer] Prime Chunk %d empty/rate-limited. Waiting 90s before retry...", chunk_num)
+                time.sleep(90)
+                raw = _retry(_download_chunk, retries=2, base_delay=4.0, label="PrimeOHLCVCache(Retry)")
+                if raw is None or raw.empty:
+                    consecutive_failures += 1
+                    if consecutive_failures >= 5:
+                        logger.error("[DataLayer] 5 consecutive failures. Blocking yfinance.")
+                        _yfinance_blocked = True
+                    time.sleep(30)
+                    break
+                else:
+                    consecutive_failures = 0
+                    chunk_sleep = max(chunk_sleep, 6.0)
+                    break
+            else:
+                consecutive_failures = 0
+                break
+
         if raw is None or raw.empty:
-            consecutive_failures += 1
-            if consecutive_failures >= 5:
-                logger.error("[DataLayer] Too many consecutive yfinance prime failures (%d). Setting _yfinance_blocked = True.", consecutive_failures)
-                _yfinance_blocked = True
-            logger.warning(
-                "[DataLayer] Prime download returned empty for chunk %d/%d (index %d). Consecutive failures: %d.",
-                chunk_num, total_chunks, i, consecutive_failures,
-            )
-            time.sleep(8.0)
             continue
 
-        consecutive_failures = 0
         chunk_fetched = 0
         with _cache_lock:
             for ticker in chunk:
@@ -491,7 +513,7 @@ def prime_ohlcv_cache(tickers: list[str], period: str = "1y") -> None:
             "[DataLayer] Prime Chunk %d/%d: %d/%d tickers cached successfully.",
             chunk_num, total_chunks, chunk_fetched, len(chunk),
         )
-        time.sleep(2.5)
+        time.sleep(chunk_sleep)
 
     logger.info("[DataLayer] Priming complete: %d/%d tickers cached in _ohlcv_cache.", fetched, total)
 
