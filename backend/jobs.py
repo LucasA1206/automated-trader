@@ -302,7 +302,7 @@ def _fetch_ticker_universe() -> list[str]:
                 except (ValueError, TypeError):
                     vol = 0.0
 
-                candidates.append((symbol, price, vol))
+                candidates.append((symbol, price, vol, mcap))
 
             # ── Pre-filter 3: single-day dollar volume ≥ $500K ──────────────────
             # Only apply this filter if the screener is returning real volume data.
@@ -311,7 +311,7 @@ def _fetch_ticker_universe() -> list[str]:
             # candidates have vol > 0, the screener is returning stale/zeroed data,
             # and we skip this filter to avoid eliminating the entire universe.
             # At 07:30 ET (scan time), prior-session volume is still populated.
-            with_vol = sum(1 for _, _, v in candidates if v > 0)
+            with_vol = sum(1 for _, _, v, _ in candidates if v > 0)
             vol_filter_active = with_vol >= len(candidates) * 0.20
             if vol_filter_active:
                 logger.info(
@@ -324,7 +324,9 @@ def _fetch_ticker_universe() -> list[str]:
                     with_vol, len(candidates),
                 )
 
-            for symbol, price, vol in candidates:
+            # Sort by market cap descending so the most liquid stocks process first
+            candidates.sort(key=lambda x: x[3], reverse=True)
+            for symbol, price, vol, mcap in candidates:
                 if vol_filter_active:
                     dollar_vol_1d = vol * price
                     if dollar_vol_1d < 500_000.0:
