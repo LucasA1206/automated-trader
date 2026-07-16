@@ -68,9 +68,9 @@ _ECON_TTL_HOURS = 24
 _BATCH_PRICE_TTL_HOURS = 4
 
 # Batch download chunk size for universe pre-filter.
-# Using a custom browser session allows larger batches (100), which
-# reduces requests and avoids rate limits.
-_BATCH_CHUNK_SIZE = 100
+# Smaller chunks (50) reduce per-request payload and give Yahoo Finance
+# more breathing room between requests, lowering the rate-limit hit rate.
+_BATCH_CHUNK_SIZE = 50
 
 
 # ─── Finnhub rate limiter (free tier: 60 calls/min) ──────────────────────────
@@ -343,17 +343,17 @@ def fetch_ohlcv_batch(tickers: list[str], period: str = "22d") -> dict[str, pd.D
                 session=_session,   # restored: browser UA avoids Yahoo rate limits
             )
 
-        raw = _retry(_download_chunk, retries=3, base_delay=2.0, label="BatchOHLCV")
+        raw = _retry(_download_chunk, retries=3, base_delay=4.0, label="BatchOHLCV")
         if raw is None or raw.empty:
             consecutive_failures += 1
-            if consecutive_failures >= 3:
-                logger.error("[DataLayer] Too many consecutive yfinance batch failures. Setting _yfinance_blocked = True.")
+            if consecutive_failures >= 5:
+                logger.error("[DataLayer] Too many consecutive yfinance batch failures (%d). Setting _yfinance_blocked = True.", consecutive_failures)
                 _yfinance_blocked = True
             logger.warning(
-                "[DataLayer] Batch download returned empty for chunk %d/%d (index %d).",
-                chunk_num, total_chunks, i,
+                "[DataLayer] Batch download returned empty for chunk %d/%d (index %d). Consecutive failures: %d.",
+                chunk_num, total_chunks, i, consecutive_failures,
             )
-            time.sleep(5.0)
+            time.sleep(8.0)
             continue
 
         consecutive_failures = 0
@@ -405,8 +405,8 @@ def fetch_ohlcv_batch(tickers: list[str], period: str = "22d") -> dict[str, pd.D
             "[DataLayer] Chunk %d/%d: %d/%d tickers parsed successfully.",
             chunk_num, total_chunks, chunk_fetched, len(chunk),
         )
-        # Increased to 1.0s to give Yahoo Finance rate limiter room to breathe
-        time.sleep(1.0)
+        # 2.5s between chunks gives Yahoo Finance's rate limiter room to recover
+        time.sleep(2.5)
 
     logger.info("[DataLayer] Batch OHLCV complete: %d/%d tickers with data.", fetched, total)
     return results
@@ -443,17 +443,17 @@ def prime_ohlcv_cache(tickers: list[str], period: str = "1y") -> None:
                 session=_session,
             )
 
-        raw = _retry(_download_chunk, retries=3, base_delay=2.0, label="PrimeOHLCVCache")
+        raw = _retry(_download_chunk, retries=3, base_delay=4.0, label="PrimeOHLCVCache")
         if raw is None or raw.empty:
             consecutive_failures += 1
-            if consecutive_failures >= 3:
-                logger.error("[DataLayer] Too many consecutive yfinance prime failures. Setting _yfinance_blocked = True.")
+            if consecutive_failures >= 5:
+                logger.error("[DataLayer] Too many consecutive yfinance prime failures (%d). Setting _yfinance_blocked = True.", consecutive_failures)
                 _yfinance_blocked = True
             logger.warning(
-                "[DataLayer] Prime download returned empty for chunk %d/%d (index %d).",
-                chunk_num, total_chunks, i,
+                "[DataLayer] Prime download returned empty for chunk %d/%d (index %d). Consecutive failures: %d.",
+                chunk_num, total_chunks, i, consecutive_failures,
             )
-            time.sleep(5.0)
+            time.sleep(8.0)
             continue
 
         consecutive_failures = 0
@@ -491,7 +491,7 @@ def prime_ohlcv_cache(tickers: list[str], period: str = "1y") -> None:
             "[DataLayer] Prime Chunk %d/%d: %d/%d tickers cached successfully.",
             chunk_num, total_chunks, chunk_fetched, len(chunk),
         )
-        time.sleep(1.0)
+        time.sleep(2.5)
 
     logger.info("[DataLayer] Priming complete: %d/%d tickers cached in _ohlcv_cache.", fetched, total)
 
@@ -994,6 +994,22 @@ def estimate_vwap(ticker: str) -> Optional[float]:
 
 
 # ─── Cache management ─────────────────────────────────────────────────────────
+
+def reset_yfinance_block() -> None:
+    """Reset the yfinance rate-limit block flag between pipeline stages.
+
+    Called by universe_filter between Stage 1 (22d batch) and Stage 2 (1y prime)
+    so that a rate-limit hit in Stage 1 does not permanently prevent Stage 2 from
+    downloading 1-year OHLCV data for the (much smaller) set of Stage 1 survivors.
+    """
+    global _yfinance_blocked
+    if _yfinance_blocked:
+        logger.info(
+            "[DataLayer] Resetting _yfinance_blocked flag between pipeline stages. "
+            "Yahoo Finance may have recovered — Stage 2 will attempt fresh downloads."
+        )
+    _yfinance_blocked = False
+
 
 def clear_all_caches():
     """Clear all data caches. Call at the start of each daily scan run."""

@@ -46,6 +46,11 @@ from typing import Optional
 
 import requests
 import google.generativeai as genai
+from dotenv import load_dotenv
+
+# Load .env.local so API keys are available whether or not the shell pre-loaded them.
+# Searches from CWD upward — finds the root .env.local regardless of working directory.
+load_dotenv(".env.local", override=False)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +62,7 @@ NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 # Configure Gemini
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+
 
 # gemini-2.5-flash is available on the free tier; gemini-2.0-flash requires billing.
 GEMINI_MODEL = "gemini-2.5-flash"
