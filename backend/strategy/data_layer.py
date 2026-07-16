@@ -320,6 +320,9 @@ def fetch_ohlcv_batch(tickers: list[str], period: str = "22d") -> dict[str, pd.D
     global _yfinance_blocked
 
     for i in range(0, total, _BATCH_CHUNK_SIZE):
+        if _yfinance_blocked:
+            logger.warning("[DataLayer] yfinance is marked as blocked. Aborting batch download.")
+            break
         chunk = tickers[i: i + _BATCH_CHUNK_SIZE]
         chunk_num = i // _BATCH_CHUNK_SIZE + 1
         total_chunks = math.ceil(total / _BATCH_CHUNK_SIZE)
@@ -350,7 +353,7 @@ def fetch_ohlcv_batch(tickers: list[str], period: str = "22d") -> dict[str, pd.D
                 "[DataLayer] Batch download returned empty for chunk %d/%d (index %d).",
                 chunk_num, total_chunks, i,
             )
-            time.sleep(2.0)
+            time.sleep(5.0)
             continue
 
         consecutive_failures = 0
@@ -421,6 +424,9 @@ def prime_ohlcv_cache(tickers: list[str], period: str = "1y") -> None:
     global _yfinance_blocked
 
     for i in range(0, total, _BATCH_CHUNK_SIZE):
+        if _yfinance_blocked:
+            logger.warning("[DataLayer] yfinance is marked as blocked. Aborting cache priming.")
+            break
         chunk = tickers[i: i + _BATCH_CHUNK_SIZE]
         chunk_num = i // _BATCH_CHUNK_SIZE + 1
         total_chunks = math.ceil(total / _BATCH_CHUNK_SIZE)
@@ -447,7 +453,7 @@ def prime_ohlcv_cache(tickers: list[str], period: str = "1y") -> None:
                 "[DataLayer] Prime download returned empty for chunk %d/%d (index %d).",
                 chunk_num, total_chunks, i,
             )
-            time.sleep(2.0)
+            time.sleep(5.0)
             continue
 
         consecutive_failures = 0
@@ -991,6 +997,8 @@ def estimate_vwap(ticker: str) -> Optional[float]:
 
 def clear_all_caches():
     """Clear all data caches. Call at the start of each daily scan run."""
+    global _yfinance_blocked
+    _yfinance_blocked = False
     with _cache_lock:
         _ohlcv_cache.clear()
         _fundamentals_cache.clear()

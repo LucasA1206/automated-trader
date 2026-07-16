@@ -228,8 +228,8 @@ RESPOND IN VALID JSON ONLY — no other text before or after the JSON:
 
 IMPORTANT: 
 - Only reason from the data provided above. Do not invent data not given.
-- Be decisive. Use "proceed": false only if you see a concrete reason, not just uncertainty.
-- conviction < 60 should generally mean proceed: false.
+- Be decisive and lenient. Use "proceed": false only if you see a concrete, high-risk red flag (e.g. major SEC investigation, imminent bankruptcy, severe macro headwind), not just general uncertainty or moderate technical pullback.
+- conviction < 55 should generally mean proceed: false.
 """
     return prompt
 
@@ -424,7 +424,7 @@ def analyze_candidate(candidate: dict, regime_status: str) -> dict:
 
         # Both agree
         avg_conviction = int((gemini_verdict["conviction"] + crosscheck_verdict["conviction"]) / 2)
-        final_proceed = gemini_proceed and avg_conviction >= 60
+        final_proceed = gemini_proceed and avg_conviction >= 55
         return {
             "ticker": ticker,
             "proceed": final_proceed,
@@ -441,7 +441,7 @@ def analyze_candidate(candidate: dict, regime_status: str) -> dict:
     # Only one model available
     verdict = gemini_verdict or crosscheck_verdict
     model_name = "Gemini" if gemini_verdict else "CrossCheck"
-    final_proceed = verdict["proceed"] and verdict["conviction"] >= 65  # Higher threshold for single model
+    final_proceed = verdict["proceed"] and verdict["conviction"] >= 60  # Higher threshold for single model
     return {
         "ticker": ticker,
         "proceed": final_proceed,
