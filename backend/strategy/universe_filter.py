@@ -37,6 +37,7 @@ from strategy.data_layer import (
     is_near_earnings,
     is_economic_blackout_day,
     fetch_spy_returns,
+    prime_ohlcv_cache,
 )
 
 logger = logging.getLogger(__name__)
@@ -310,6 +311,9 @@ def stage2_technical_filter(
     where metrics_list contains dicts with all computed technical data.
     """
     logger.info("[Filter] Stage 2: technical filter on %d tickers.", len(tickers))
+
+    # Prime the 1-year OHLCV cache in batch to avoid yfinance rate limits
+    prime_ohlcv_cache(tickers, period="1y")
 
     # Need SPY returns for relative strength calculation
     spy_returns = fetch_spy_returns()
