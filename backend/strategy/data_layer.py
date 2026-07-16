@@ -35,6 +35,17 @@ logger = logging.getLogger(__name__)
 
 # Setup a session with browser-like headers to bypass Yahoo Finance Cloud blocks/rate limits
 from requests.adapters import HTTPAdapter
+
+class TimeoutHTTPAdapter(HTTPAdapter):
+    def __init__(self, *args, **kwargs):
+        self.timeout = kwargs.pop("timeout", 10)
+        super().__init__(*args, **kwargs)
+
+    def send(self, request, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = self.timeout
+        return super().send(request, **kwargs)
+
 _session = requests.Session()
 _session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -43,7 +54,7 @@ _session.headers.update({
     "Connection": "keep-alive",
 })
 # Scale pool connection size to prevent pool exhaustion warnings when multithreading
-_adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100)
+_adapter = TimeoutHTTPAdapter(pool_connections=100, pool_maxsize=100)
 _session.mount("https://", _adapter)
 _session.mount("http://", _adapter)
 
