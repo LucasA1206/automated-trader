@@ -46,9 +46,19 @@ class TimeoutHTTPAdapter(HTTPAdapter):
             kwargs["timeout"] = self.timeout
         return super().send(request, **kwargs)
 
+import random
+
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
+]
+
 _session = requests.Session()
 _session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": random.choice(_USER_AGENTS),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
     "Connection": "keep-alive",
@@ -57,6 +67,13 @@ _session.headers.update({
 _adapter = TimeoutHTTPAdapter(pool_connections=100, pool_maxsize=100)
 _session.mount("https://", _adapter)
 _session.mount("http://", _adapter)
+
+def _rotate_yf_session():
+    """Clear cookies and rotate User-Agent to bypass Yahoo Finance rate limits."""
+    global _session
+    _session.cookies.clear()
+    _session.headers.update({"User-Agent": random.choice(_USER_AGENTS)})
+    logger.debug("[DataLayer] Rotated yfinance session User-Agent and cleared cookies.")
 
 # ─── Cache storage ────────────────────────────────────────────────────────────
 _cache_lock = threading.Lock()
@@ -226,7 +243,13 @@ def _retry(fn, retries: int = 3, base_delay: float = 1.0, label: str = ""):
         try:
             return fn()
         except Exception as exc:
+            exc_str = str(exc).lower()
             wait = base_delay * (2 ** (attempt - 1))
+            
+            if "too many requests" in exc_str or "rate limit" in exc_str or "429" in exc_str:
+                _rotate_yf_session()
+                wait = max(wait, 10.0)  # enforce minimum 10s wait for rate limits
+                
             if attempt < retries:
                 logger.warning(
                     "%s attempt %d/%d failed: %s — retrying in %.1fs",
@@ -814,7 +837,7 @@ def fetch_vix() -> Optional[dict]:
             "spike_3d_pct": round(spike_3d, 2),
         }
 
-    data = _retry(_fetch, retries=3, base_delay=2.0, label="VIX")
+    data = _retry(_fetch, retries=5, base_delay=5.0, label="VIX")
     if data is None:
         logger.error("[DataLayer] Failed to fetch VIX — regime check cannot proceed safely.")
         return None
@@ -864,7 +887,7 @@ def fetch_spy_regime() -> Optional[dict]:
             "day_return_pct": round(day_return_pct, 2),
         }
 
-    data = _retry(_fetch, retries=3, base_delay=2.0, label="SPY_regime")
+    data = _retry(_fetch, retries=5, base_delay=5.0, label="SPY_regime")
     if data is None:
         return None
 
