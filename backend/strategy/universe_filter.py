@@ -43,12 +43,12 @@ logger = logging.getLogger(__name__)
 
 # Hard-coded filter thresholds.
 # Core downside-protection filters (price > 200 SMA, RS > SPY) are NOT relaxed here.
-MIN_PRICE = 3.0                         # $3 floor (was $5 — admits legitimate small-caps in uptrends)
-MIN_AVG_DOLLAR_VOL_20D = 3_000_000.0   # $3M/day (was $10M — was rejecting ~49% of universe)
-MIN_MARKET_CAP = 150_000_000.0         # $150M (was $500M — opens mid/small-cap universe)
-ATR_PCT_MIN = 1.5                       # 1.5% of price — excludes ETFs/illiquid names
-ATR_PCT_MAX = 12.0                      # 12% of price (was 8% — admits high-momentum growth stocks)
-RS_TOP_PERCENTILE = 0.50               # Must be top 50% by relative strength (was 30% — more candidates)
+MIN_PRICE = 5.0                         # $5 floor (blueprint Section 4 mandatory)
+MIN_AVG_DOLLAR_VOL_20D = 10_000_000.0  # $10M/day (blueprint: ensures liquidity for execution)
+MIN_MARKET_CAP = 500_000_000.000       # $500M (blueprint: stability/quality preference)
+ATR_PCT_MIN = 2.0                       # 2% of price — excludes ETFs/illiquid names
+ATR_PCT_MAX = 6.0                       # 6% of price (blueprint Section 4)
+RS_TOP_PERCENTILE = 0.30               # Must be in top 30% by relative strength (blueprint Section 4)
 
 # Minimum pool size for relative RS percentile cut.
 # Below this, use an absolute floor instead to avoid destroying small pools.

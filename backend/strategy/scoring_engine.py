@@ -79,11 +79,11 @@ PENALTIES = {
 
 MAX_POSITIVE_WEIGHT = sum(WEIGHTS.values())  # ~115
 
-# Scoring thresholds per blueprint Section 5 Step 3
-# Lowered thresholds due to missing data (FinnHub free doesn't provide 9 points of data)
-SCORE_HIGH_CONVICTION = 65.0    # Full size eligibility
-SCORE_MARGINAL = 45.0           # Half size, capacity-limited
-SCORE_NO_TRADE = 45.0           # Below this = not tradable
+# Scoring thresholds per blueprint Section 5 Step 3 (original values; never
+# change without a documented backtest — see diagnosis_report.md for context).
+SCORE_HIGH_CONVICTION = 70.0    # Full size eligibility
+SCORE_MARGINAL = 55.0           # Half size, capacity-limited
+SCORE_NO_TRADE = 55.0           # Below this = not tradable
 
 
 # ─── Technical indicator helpers ──────────────────────────────────────────────
@@ -567,6 +567,7 @@ def compute_composite_score(
 
     # ── Score each metric ────────────────────────────────────────────────────
     scores: dict[str, float] = {}
+    data_gaps: dict[str, bool] = {}  # True = no real data; metric excluded from denominator
 
     if _small_universe:
         # Small-universe fallback: use absolute RS thresholds instead of
@@ -607,41 +608,95 @@ def compute_composite_score(
             bb.get("band_width") if bb else None, u_bw
         )
 
+    # ── Technical indicators (sourced from OHLCV — never missing for stage-2 survivors) ──
+    data_gaps["relative_strength"]  = False
+    data_gaps["breakout_quality"]   = False
+    data_gaps["high_52w_proximity"] = False
+    data_gaps["relative_volume"]    = False
+    data_gaps["adx_trend"]          = adx14 is None
+    data_gaps["rsi_zone"]           = rsi14 is None
+    data_gaps["macd_histogram"]     = macd_hist is None
+    data_gaps["bollinger_position"] = bb is None
+
     scores["high_52w_proximity"] = score_52w_high_proximity(metrics.get("high_52w_pct"))
-    scores["relative_volume"] = score_relative_volume(metrics.get("rel_vol"))
-    scores["rsi_zone"] = score_rsi_zone(rsi14)
-    scores["sector_rs"] = score_sector_rs(
-        metrics.get("sector"), sector_returns, u_sector_rets
-    )
-    scores["market_cap_band"] = score_market_cap_band(metrics.get("market_cap"))
-    scores["adx_trend"] = score_adx(adx14)
-    scores["revenue_growth"] = score_revenue_growth(metrics.get("revenue_growth_yoy"))
-    scores["macd_histogram"] = score_macd_histogram(macd_hist, prev_macd_hist)
-    scores["eps_growth"] = score_eps_growth(metrics.get("eps_growth_yoy"))
-    scores["fcf_quality"] = score_fcf(metrics.get("fcf_positive"))
-    scores["debt_ratio"] = score_debt(metrics.get("net_debt_ebitda"))
-    scores["float_size"] = score_float(metrics.get("float_shares"))
+    scores["relative_volume"]    = score_relative_volume(metrics.get("rel_vol"))
+    scores["rsi_zone"]           = score_rsi_zone(rsi14)
+    scores["adx_trend"]          = score_adx(adx14)
+    scores["macd_histogram"]     = score_macd_histogram(macd_hist, prev_macd_hist)
     scores["bollinger_position"] = score_bollinger_position(
         bb.get("pct_b") if bb else None
     )
-    scores["beta"] = score_beta(metrics.get("beta"))
-    scores["profit_margins"] = score_profit_margins(metrics.get("profit_margin"))
-    scores["analyst_revisions"] = 0.3     # Not computed (no free source); neutral score
-    scores["institutional_own"] = score_institutional_ownership(
-        metrics.get("institutional_ownership_pct")
-    )
-    scores["insider_buying"] = 0.0        # Not computed (no free real-time source)
-    scores["options_activity"] = 0.0      # Not computed (no free options-flow source)
 
-    # Penalties
+    # ── Sector / market structure (— yfinance ETFs + Finnhub profile) ───────────────────
+    sector_val = metrics.get("sector")
+    sector_ret = sector_returns.get(sector_val) if sector_val else None
+    data_gaps["sector_rs"]       = sector_ret is None   # None when ICB label unmapped or no return data
+    data_gaps["market_cap_band"] = not bool(metrics.get("market_cap"))
+    data_gaps["float_size"]      = not bool(metrics.get("float_shares"))
+
+    scores["sector_rs"]       = score_sector_rs(sector_val, sector_returns, u_sector_rets)
+    scores["market_cap_band"] = score_market_cap_band(metrics.get("market_cap"))
+    scores["float_size"]      = score_float(metrics.get("float_shares"))
+
+    # ── Beta ───────────────────────────────────────────────────────────────────────
+    beta_raw = metrics.get("beta")
+    data_gaps["beta"] = beta_raw is None
+    scores["beta"] = score_beta(beta_raw)
+
+    # ── Fundamental metrics (may be null when Finnhub data is unavailable) ─────────────
+    revenue_growth_raw = metrics.get("revenue_growth_yoy")
+    data_gaps["revenue_growth"] = revenue_growth_raw is None
+    scores["revenue_growth"] = score_revenue_growth(revenue_growth_raw)
+
+    eps_growth_raw = metrics.get("eps_growth_yoy")
+    data_gaps["eps_growth"] = eps_growth_raw is None
+    scores["eps_growth"] = score_eps_growth(eps_growth_raw)
+
+    fcf_positive_raw = metrics.get("fcf_positive")
+    data_gaps["fcf_quality"] = fcf_positive_raw is None
+    scores["fcf_quality"] = score_fcf(fcf_positive_raw)
+
+    debt_raw = metrics.get("net_debt_ebitda")
+    data_gaps["debt_ratio"] = debt_raw is None
+    scores["debt_ratio"] = score_debt(debt_raw)
+
+    margin_raw = metrics.get("profit_margin")
+    data_gaps["profit_margins"] = margin_raw is None
+    scores["profit_margins"] = score_profit_margins(margin_raw)
+
+    inst_own_raw = metrics.get("institutional_ownership_pct")
+    data_gaps["institutional_own"] = inst_own_raw is None
+    scores["institutional_own"] = score_institutional_ownership(inst_own_raw)
+
+    # ── Permanent gaps (no free real-time source exists) ───────────────────────────
+    # Marked as gaps so they are excluded from the denominator on every ticker.
+    # This means they never silently penalise tickers with missing data.
+    data_gaps["analyst_revisions"] = True   # no free real-time source
+    data_gaps["insider_buying"]    = True   # no free real-time source
+    data_gaps["options_activity"]  = True   # no free real-time source
+    scores["analyst_revisions"]    = 0.0
+    scores["insider_buying"]       = 0.0
+    scores["options_activity"]     = 0.0
+
+    # Penalties (these remain outside the renormalised denominator logic)
     penalty_short = score_short_interest_penalty(metrics.get("short_interest_pct_float"))
     penalty_gap   = gap_penalty_score
 
-    # ── Weighted sum ─────────────────────────────────────────────────────────
+    # ── Renormalised weighted sum ──────────────────────────────────────────────────
+    # Metrics with no data are excluded from both the numerator and the
+    # denominator.  This means a data gap is never silently scored as 0,
+    # which would incorrectly penalise every ticker with missing data.
+    gap_metric_names: set[str] = {m for m, is_gap in data_gaps.items() if is_gap}
+
+    effective_max_weight = sum(
+        WEIGHTS[m] for m in WEIGHTS if m not in gap_metric_names
+    )
     positive_total = sum(
         scores[metric] * WEIGHTS[metric]
         for metric in WEIGHTS
+        if metric not in gap_metric_names
     )
+
     # Penalties reduce from the positive total
     penalty_total = (
         penalty_short * abs(PENALTIES["short_interest"]) +
@@ -649,9 +704,9 @@ def compute_composite_score(
     )
 
     raw_score = max(0.0, positive_total - penalty_total)
-    composite = round(raw_score / MAX_POSITIVE_WEIGHT * 100, 1)
+    composite  = round(raw_score / effective_max_weight * 100, 1) if effective_max_weight > 0 else 0.0
 
-    # ── Classification per blueprint Section 5 Step 3 ────────────────────────
+    # ── Classification per blueprint Section 5 Step 3 ─────────────────────────────
     if composite >= SCORE_HIGH_CONVICTION:
         classification = "high_conviction"
     elif composite >= SCORE_MARGINAL:
@@ -660,37 +715,45 @@ def compute_composite_score(
         classification = "no_trade"
 
     return {
-        "ticker": metrics["ticker"],
-        "composite_score": composite,
-        "classification": classification,
+        "ticker":           metrics["ticker"],
+        "composite_score":  composite,
+        "classification":   classification,
+        # Weighted contribution per metric (gap metrics excluded — not scored)
         "component_scores": {
-            k: round(v * WEIGHTS.get(k, 0), 2) for k, v in scores.items()
+            k: round(v * WEIGHTS.get(k, 0), 2)
+            for k, v in scores.items()
+            if k not in gap_metric_names
         },
+        # Raw 0–1 sub-score for every metric (including gaps, for audit log)
+        "sub_scores": {k: round(v, 3) for k, v in scores.items()},
+        # Metrics excluded from scoring due to missing data
+        "data_gaps":            sorted(gap_metric_names),
+        "effective_max_weight": effective_max_weight,  # denominator used for this ticker
         "penalties": {
             "short_interest": round(penalty_short * abs(PENALTIES["short_interest"]), 2),
-            "gap_history": round(penalty_gap * abs(PENALTIES["gap_history"]), 2),
+            "gap_history":    round(penalty_gap   * abs(PENALTIES["gap_history"]),    2),
         },
         "technical_indicators": {
-            "rsi_14": rsi14,
+            "rsi_14":         rsi14,
             "macd_histogram": round(macd_hist, 4) if macd_hist is not None else None,
-            "adx_14": adx14,
-            "bb_pct_b": bb.get("pct_b") if bb else None,
-            "bb_band_width": bb.get("band_width") if bb else None,
+            "adx_14":         adx14,
+            "bb_pct_b":       bb.get("pct_b")      if bb else None,
+            "bb_band_width":  bb.get("band_width") if bb else None,
         },
-        "price": metrics.get("price"),
-        "atr_pct": metrics.get("atr_pct"),
-        "atr_abs": metrics.get("atr_abs"),
-        "rs_63d": metrics.get("rs_63d"),
-        "rs_126d": metrics.get("rs_126d"),
-        "sector": metrics.get("sector"),
-        "market_cap": metrics.get("market_cap"),
-        "days_to_earnings": None,  # Computed separately via data_layer
+        "price":                    metrics.get("price"),
+        "atr_pct":                  metrics.get("atr_pct"),
+        "atr_abs":                  metrics.get("atr_abs"),
+        "rs_63d":                   metrics.get("rs_63d"),
+        "rs_126d":                  metrics.get("rs_126d"),
+        "sector":                   metrics.get("sector"),
+        "market_cap":               metrics.get("market_cap"),
+        "days_to_earnings":         None,
         "short_interest_pct_float": metrics.get("short_interest_pct_float"),
-        "rel_vol": metrics.get("rel_vol"),
-        "sma_20": metrics.get("sma_20"),
-        "sma_50": metrics.get("sma_50"),
-        "sma_200": metrics.get("sma_200"),
-        "high_52w_pct": metrics.get("high_52w_pct"),
+        "rel_vol":                  metrics.get("rel_vol"),
+        "sma_20":                   metrics.get("sma_20"),
+        "sma_50":                   metrics.get("sma_50"),
+        "sma_200":                  metrics.get("sma_200"),
+        "high_52w_pct":             metrics.get("high_52w_pct"),
     }
 
 
@@ -796,7 +859,9 @@ def score_all_candidates(
     no_trade        = [c for c in scored if c["classification"] == "no_trade"]
 
     logger.info(
-        "[Scoring] Results: %d high-conviction (≥70), %d marginal (55-69), %d no-trade (<55).",
-        len(high_conviction), len(marginal), len(no_trade),
+        "[Scoring] Results: %d high-conviction (≥%.0f), %d marginal (%.0f–%.1f), %d no-trade (<%.0f).",
+        len(high_conviction), SCORE_HIGH_CONVICTION,
+        len(marginal), SCORE_MARGINAL, SCORE_HIGH_CONVICTION - 0.1,
+        len(no_trade), SCORE_MARGINAL,
     )
     return high_conviction, marginal, no_trade

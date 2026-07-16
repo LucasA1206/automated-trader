@@ -22,6 +22,7 @@ import time
 import logging
 import threading
 import math
+from collections import deque
 from datetime import datetime, timezone, timedelta, date
 from typing import Optional
 import concurrent.futures
@@ -64,6 +65,144 @@ _BATCH_PRICE_TTL_HOURS = 4
 # Using a custom browser session allows larger batches (100), which
 # reduces requests and avoids rate limits.
 _BATCH_CHUNK_SIZE = 100
+
+
+# ─── Finnhub rate limiter (free tier: 60 calls/min) ──────────────────────────
+# A sliding-window token bucket that serialises all Finnhub API calls to stay
+# comfortably under the free-tier limit (we target 50 calls/min = 1 per 1.2s).
+# All callers must invoke _finnhub_rate_check() before each Finnhub API call.
+
+_FINNHUB_RATE_WINDOW  = 60.0   # seconds
+_FINNHUB_RATE_LIMIT   = 50     # calls per window (conservative vs 60 hard limit)
+_finnhub_call_times: deque = deque()   # timestamps of recent calls
+_finnhub_rate_lock  = threading.Lock()
+
+_finnhub_client_singleton = None
+_finnhub_client_lock = threading.Lock()
+
+
+def _finnhub_rate_check() -> None:
+    """Block the calling thread until a Finnhub call slot is available."""
+    while True:
+        with _finnhub_rate_lock:
+            now = time.time()
+            # Evict timestamps outside the rolling window
+            while _finnhub_call_times and now - _finnhub_call_times[0] > _FINNHUB_RATE_WINDOW:
+                _finnhub_call_times.popleft()
+            if len(_finnhub_call_times) < _FINNHUB_RATE_LIMIT:
+                _finnhub_call_times.append(now)
+                return
+        # Window is full — wait 1 second and try again
+        time.sleep(1.0)
+
+
+def _get_finnhub_client():
+    """Return a module-level cached Finnhub client (created once, thread-safe)."""
+    global _finnhub_client_singleton
+    with _finnhub_client_lock:
+        if _finnhub_client_singleton is None:
+            import finnhub
+            from dotenv import load_dotenv
+            load_dotenv('.env.local')
+            api_key = os.getenv('FINNHUB_API')
+            if not api_key:
+                raise ValueError("FINNHUB_API not set — cannot initialise Finnhub client")
+            _finnhub_client_singleton = finnhub.Client(api_key=api_key)
+    return _finnhub_client_singleton
+
+
+# ─── Finnhub ICB → GICS sector mapping ───────────────────────────────────────
+# Finnhub's company_profile2 `finnhubIndustry` field uses industry labels that
+# do NOT match standard GICS sector names.  The mapping below was derived from
+# live API inspection of the actual strings Finnhub returns for a representative
+# universe of US equities.  Without this translation, score_sector_rs() always
+# falls back to its neutral 0.3 default because the lookup never finds a match.
+#
+# Note: Finnhub does not expose a canonical `gsector` field on the free tier,
+# so we map the more granular `finnhubIndustry` string to GICS sectors.
+
+_FINNHUB_ICB_TO_GICS: dict[str, str] = {
+    # ── Technology ──────────────────────────────────────────────────────────
+    "Electronic Technology":    "Technology",
+    "Technology Services":      "Technology",
+    "Semiconductors":           "Technology",
+    "Software":                 "Technology",
+    "Internet Software/Services": "Technology",
+    # ── Healthcare ──────────────────────────────────────────────────────────
+    "Health Technology":        "Healthcare",
+    "Health Services":          "Healthcare",
+    "Health Care":              "Healthcare",
+    "Biotechnology":            "Healthcare",
+    "Pharmaceuticals":          "Healthcare",
+    "Medical Supplies":         "Healthcare",
+    "Hospital/Nursing Management": "Healthcare",
+    # ── Financials ──────────────────────────────────────────────────────────
+    "Finance":                  "Financials",
+    "Banks":                    "Financials",
+    "Insurance":                "Financials",
+    "Investment Banks/Brokers": "Financials",
+    "Savings Banks":            "Financials",
+    "Investment Trusts/Mutual Funds": "Financials",
+    "Financial Conglomerates":  "Financials",
+    # ── Consumer Discretionary / Cyclical ───────────────────────────────────
+    "Consumer Durables":        "Consumer Cyclical",
+    "Retail Trade":             "Consumer Cyclical",
+    "Distribution Services":    "Consumer Cyclical",
+    "Consumer Services":        "Consumer Cyclical",
+    "Textiles, Apparel & Luxury Goods": "Consumer Cyclical",
+    "Automobiles":              "Consumer Cyclical",
+    "Hotels & Entertainment Services": "Consumer Cyclical",
+    "Movies/Entertainment":     "Consumer Cyclical",
+    "Media":                    "Consumer Cyclical",
+    # ── Consumer Defensive / Staples ────────────────────────────────────────
+    "Consumer Non-Durables":    "Consumer Defensive",
+    "Food Retailing":           "Consumer Defensive",
+    "Food Distributors":        "Consumer Defensive",
+    "Tobacco":                  "Consumer Defensive",
+    "Beverages: Non-Alcoholic": "Consumer Defensive",
+    "Beverages: Alcoholic":     "Consumer Defensive",
+    # ── Industrials ─────────────────────────────────────────────────────────
+    "Commercial Services":      "Industrials",
+    "Commercial Services & Supplies": "Industrials",
+    "Industrial Services":      "Industrials",
+    "Producer Manufacturing":   "Industrials",
+    "Transportation":           "Industrials",
+    "Construction":             "Industrials",
+    "Aerospace & Defense":      "Industrials",
+    "Engineering & Construction": "Industrials",
+    "Air Freight/Couriers":     "Industrials",
+    "Railroads":                "Industrials",
+    "Trucking":                 "Industrials",
+    # ── Basic Materials ─────────────────────────────────────────────────────
+    "Process Industries":       "Basic Materials",
+    "Non-Energy Minerals":      "Basic Materials",
+    "Metals & Mining":          "Basic Materials",
+    "Steel":                    "Basic Materials",
+    "Chemicals":                "Basic Materials",
+    "Containers/Packaging":     "Basic Materials",
+    "Paper/Forest Products":    "Basic Materials",
+    # ── Energy ──────────────────────────────────────────────────────────────
+    "Energy Minerals":          "Energy",
+    "Energy Services":          "Energy",
+    "Oil & Gas Production":     "Energy",
+    "Oil Refining/Marketing":   "Energy",
+    # ── Utilities ───────────────────────────────────────────────────────────
+    "Utilities":                "Utilities",
+    "Electric Utilities":       "Utilities",
+    "Gas Distributors":         "Utilities",
+    "Water Utilities":          "Utilities",
+    # ── Communication Services ──────────────────────────────────────────────
+    "Communications":           "Communication Services",
+    "Wireless Telecommunications": "Communication Services",
+    "Broadcasting":             "Communication Services",
+    # ── Real Estate ─────────────────────────────────────────────────────────
+    "Real Estate":              "Real Estate",
+    "Real Estate Investment Trusts": "Real Estate",
+    "Real Estate Development":  "Real Estate",
+    # ── No ETF proxy (mapped to empty string → sector_rs gap) ───────────────
+    "Miscellaneous":            "",
+    "Government":               "",
+}
 
 
 # ─── Retry helper ─────────────────────────────────────────────────────────────
@@ -185,6 +324,7 @@ def fetch_ohlcv_batch(tickers: list[str], period: str = "22d") -> dict[str, pd.D
                 auto_adjust=True,
                 progress=False,
                 threads=True,
+                session=_session,   # restored: browser UA avoids Yahoo rate limits
             )
 
         raw = _retry(_download_chunk, retries=3, base_delay=2.0, label="BatchOHLCV")
@@ -255,12 +395,28 @@ def fetch_ohlcv_batch(tickers: list[str], period: str = "22d") -> dict[str, pd.D
 
 def fetch_fundamentals(ticker: str) -> Optional[dict]:
     """
-    Fetch fundamental data for a ticker via FinnHub.
+    Fetch fundamental data for a ticker via Finnhub.
+
     Returns dict with:
-      market_cap, float_shares, sector, industry,
-      revenue_growth_yoy, eps_growth_yoy, fcf_positive, net_debt_ebitda,
-      profit_margin, return_on_equity, institutional_ownership_pct,
-      short_interest_pct_float, beta
+      market_cap, float_shares, sector (GICS-mapped), industry,
+      revenue_growth_yoy (%), eps_growth_yoy (%), fcf_positive (bool|None),
+      net_debt_ebitda (ratio|None), profit_margin (%), return_on_equity (%),
+      institutional_ownership_pct (None — not on free tier),
+      short_interest_pct_float (None — not on free tier), beta,
+      data_gaps (list[str] — metrics with no Finnhub data for this ticker)
+
+    Returns None on failure (fail-safe). Cache TTL: 24 hours.
+
+    Unit-conversion notes (all corrected from original Finnhub migration):
+      - Finnhub returns growth/margin fields as decimals (e.g. 0.12 = 12%).
+        We multiply by 100 so the scoring engine's percentage thresholds work.
+      - FCF uses freeCashFlowAnnual (dollar amount) to get the sign; the
+        original pfcfShareAnnual was a P/FCF *ratio* that is always positive.
+      - Net Debt/EBITDA is computed from netDebtAnnual / ebitdaAnnual;
+        the original totalDebt/totalEquityAnnual was a dimensionally
+        incompatible proxy with mismatched scoring thresholds.
+      - Sector is translated from Finnhub ICB labels to GICS names so that
+        score_sector_rs() can look up the matching sector ETF return.
     """
     with _cache_lock:
         cached = _fundamentals_cache.get(ticker)
@@ -268,74 +424,131 @@ def fetch_fundamentals(ticker: str) -> Optional[dict]:
         return cached["data"]
 
     def _fetch():
-        import finnhub
-        from dotenv import load_dotenv
-        
-        # Ensure environment variables are loaded
-        load_dotenv('.env.local')
-        
-        api_key = os.getenv('FINNHUB_API')
-        if not api_key:
-            raise ValueError("FINNHUB_API not set")
-        client = finnhub.Client(api_key=api_key)
-        
-        # company_profile2 for sector, industry, market_cap
+        client = _get_finnhub_client()
+
+        # Rate-limit each individual API call
+        _finnhub_rate_check()
         profile = client.company_profile2(symbol=ticker)
         if not profile:
             raise ValueError(f"No profile info for {ticker}")
-            
-        # company_basic_financials for metrics
-        financials = client.company_basic_financials(ticker, 'all')
-        metrics = financials.get('metric', {})
-        
-        return profile, metrics
 
-    data_tuple = _retry(_fetch, retries=3, base_delay=1.5, label=f"Fundamentals({ticker})")
+        _finnhub_rate_check()
+        financials = client.company_basic_financials(ticker, 'all')
+        raw_metrics = financials.get('metric', {}) if financials else {}
+
+        return profile, raw_metrics
+
+    data_tuple = _retry(_fetch, retries=3, base_delay=2.0, label=f"Fundamentals({ticker})")
     if not data_tuple:
         return None
 
-    profile, metrics = data_tuple
+    profile, raw_metrics = data_tuple
+    data_gaps: list[str] = []  # metrics Finnhub couldn't provide for this ticker
 
-    # Parse FinnHub specific fields
-    market_cap = profile.get("marketCapitalization") or 0
-    market_cap = market_cap * 1_000_000 # Finnhub returns in millions
-    
-    float_shares = profile.get("shareOutstanding") or 0
-    float_shares = float_shares * 1_000_000 # Finnhub returns in millions
+    # ── Market cap / float ───────────────────────────────────────────────────
+    market_cap = (profile.get("marketCapitalization") or 0) * 1_000_000  # Finnhub: millions
+    float_shares = (profile.get("shareOutstanding") or 0) * 1_000_000   # shares outstanding (best proxy)
 
-    revenue_growth_yoy = metrics.get("revenueGrowthTTMYoy")
-    eps_growth_yoy = metrics.get("epsGrowthTTMYoy")
-    
-    # FCF Positive: Use freeCashFlowAnnual if available, else operatingMargin
-    fcf = metrics.get("pfcfShareAnnual")
-    fcf_positive = (fcf > 0) if fcf is not None else None
+    # ── Sector: translate Finnhub ICB label → GICS name for sector ETF lookup ─
+    icb_industry = profile.get("finnhubIndustry") or "Unknown"
+    gics_sector  = _FINNHUB_ICB_TO_GICS.get(icb_industry, "")  # empty string = unmapped
+    if not gics_sector:
+        # Unmapped industry — leave sector unknown so score_sector_rs falls back
+        # to its neutral score rather than looking up a non-existent ETF.
+        gics_sector = "Unknown"
+        data_gaps.append("sector_rs")  # flag so scoring engine can log it
 
-    # Debt / EBITDA
-    net_debt_ebitda = metrics.get("totalDebt/totalEquityAnnual") # Proxy for now as Finnhub doesn't have direct net_debt_ebitda
-    
-    profit_margin = metrics.get("netProfitMarginTTM")
-    roe = metrics.get("roeTTM")
-    beta = metrics.get("beta")
+    # ── Revenue growth YoY (%) ───────────────────────────────────────────────
+    # Finnhub returns revenueGrowthTTMYoy already as a percentage value
+    # (e.g. 45.5 means 45.5% growth).  No conversion needed.
+    _rev_raw = raw_metrics.get("revenueGrowthTTMYoy")
+    if _rev_raw is not None:
+        revenue_growth_yoy: Optional[float] = round(float(_rev_raw), 2)
+    else:
+        revenue_growth_yoy = None
+        data_gaps.append("revenue_growth")
 
-    # Finnhub free doesn't easily expose inst_own or short_pct, setting to None
-    inst_own_pct = None
-    short_pct_float = None
+    # ── EPS growth YoY (%) ───────────────────────────────────────────────────
+    # Same convention: already a percentage.
+    _eps_raw = raw_metrics.get("epsGrowthTTMYoy")
+    if _eps_raw is not None:
+        eps_growth_yoy: Optional[float] = round(float(_eps_raw), 2)
+    else:
+        eps_growth_yoy = None
+        data_gaps.append("eps_growth")
+
+    # ── FCF positive flag ─────────────────────────────────────────────────────
+    # Use freeCashFlowAnnual (absolute dollars) to determine sign.
+    # The original pfcfShareAnnual is a Price/FCF *ratio* (always positive when
+    # price > 0), which made the positive-FCF test nearly meaningless.
+    _fcf_annual = raw_metrics.get("freeCashFlowAnnual")
+    if _fcf_annual is not None:
+        fcf_positive: Optional[bool] = float(_fcf_annual) > 0
+    else:
+        # Fallback: try TTM per-share (dollar amount, not ratio)
+        _fcf_ps = raw_metrics.get("freeCashFlowPerShareTTM")
+        if _fcf_ps is not None:
+            fcf_positive = float(_fcf_ps) > 0
+        else:
+            fcf_positive = None
+            data_gaps.append("fcf_quality")
+
+    # ── Net Debt / EBITDA ─────────────────────────────────────────────────────
+    # Compute the actual ratio from raw financials.
+    # The original used totalDebt/totalEquityAnnual (D/E) which is dimensionally
+    # incompatible with the scoring thresholds calibrated for Net Debt/EBITDA.
+    _net_debt = raw_metrics.get("netDebtAnnual")
+    _ebitda   = raw_metrics.get("ebitdaAnnual")
+    if _net_debt is not None and _ebitda is not None and float(_ebitda) != 0:
+        net_debt_ebitda: Optional[float] = round(float(_net_debt) / float(_ebitda), 2)
+    else:
+        net_debt_ebitda = None
+        data_gaps.append("debt_ratio")
+
+    # ── Profit margin (%) ─────────────────────────────────────────────────────
+    # Finnhub returns netProfitMarginTTM as a percentage (e.g. 3.02 = 3.02%).
+    # No conversion needed — the scoring thresholds (5, 10, 15, 20) are calibrated
+    # to this percentage scale.
+    _margin_raw = raw_metrics.get("netProfitMarginTTM")
+    if _margin_raw is not None:
+        profit_margin: Optional[float] = round(float(_margin_raw), 2)
+    else:
+        profit_margin = None
+        data_gaps.append("profit_margins")
+
+    # ── Return on equity (%) ─────────────────────────────────────────────────
+    # Finnhub also returns roeTTM as a percentage value.
+    _roe_raw = raw_metrics.get("roeTTM")
+    roe: Optional[float] = round(float(_roe_raw), 2) if _roe_raw is not None else None
+
+    # ── Beta ─────────────────────────────────────────────────────────────────
+    _beta_raw = raw_metrics.get("beta")
+    beta: Optional[float] = float(_beta_raw) if _beta_raw is not None else None
+    if beta is None:
+        data_gaps.append("beta")
+
+    # ── Institutional ownership / short interest ──────────────────────────────
+    # Finnhub free tier does not expose these. They remain None so the scoring
+    # engine's data-gap renormalization excludes them from the denominator.
+    inst_own_pct: Optional[float] = None
+    short_pct_float: Optional[float] = None
 
     data = {
-        "ticker": ticker,
-        "market_cap": market_cap,
-        "float_shares": float_shares,
-        "sector": profile.get("finnhubIndustry", "Unknown"),
-        "industry": profile.get("finnhubIndustry", "Unknown"),
-        "revenue_growth_yoy": revenue_growth_yoy,
-        "eps_growth_yoy": eps_growth_yoy,
-        "fcf_positive": fcf_positive,
-        "net_debt_ebitda": net_debt_ebitda,
-        "profit_margin": profit_margin,
-        "return_on_equity": roe,
-        "institutional_ownership_pct": inst_own_pct,
-        "short_interest_pct_float": short_pct_float,
-        "beta": beta,
+        "ticker":                    ticker,
+        "market_cap":                market_cap,
+        "float_shares":              float_shares,
+        "sector":                    gics_sector,          # GICS-mapped
+        "industry":                  icb_industry,         # raw ICB label for reference
+        "revenue_growth_yoy":        revenue_growth_yoy,   # % or None
+        "eps_growth_yoy":            eps_growth_yoy,       # % or None
+        "fcf_positive":              fcf_positive,         # bool or None
+        "net_debt_ebitda":           net_debt_ebitda,      # ratio or None
+        "profit_margin":             profit_margin,        # % or None
+        "return_on_equity":          roe,                  # % or None
+        "institutional_ownership_pct": inst_own_pct,      # None (free tier)
+        "short_interest_pct_float":  short_pct_float,     # None (free tier)
+        "beta":                      beta,
+        "data_gaps":                 data_gaps,            # list of gap metric names
     }
 
     with _cache_lock:
@@ -506,49 +719,11 @@ def fetch_spy_regime() -> Optional[dict]:
     return data
 
 
-def fetch_sector_etf_returns() -> dict[str, float]:
-    """
-    Fetch 3-month returns for major sector ETFs (used for sector relative strength scoring).
-    Returns dict: sector_name -> 3-month return %.
-    Cache TTL: 6 hours (alongside OHLCV).
-    """
-    sector_etfs = {
-        "Technology": "XLK",
-        "Healthcare": "XLV",
-        "Financials": "XLF",
-        "Energy": "XLE",
-        "Consumer Discretionary": "XLY",
-        "Consumer Staples": "XLP",
-        "Industrials": "XLI",
-        "Materials": "XLB",
-        "Utilities": "XLU",
-        "Real Estate": "XLRE",
-        "Communication Services": "XLC",
-    }
-
-    results: dict[str, float] = {}
-
-    def _fetch_return(etf_ticker: str, sector_name: str):
-        try:
-            hist = yf.Ticker(etf_ticker, session=_session).history(period="3mo", interval="1d")
-            if hist is None or hist.empty or len(hist) < 5:
-                return None
-            closes = hist["Close"]
-            ret = (float(closes.iloc[-1]) / float(closes.iloc[0]) - 1) * 100
-            return sector_name, round(ret, 2)
-        except Exception as exc:
-            logger.debug("[DataLayer] Sector ETF %s failed: %s", etf_ticker, exc)
-            return None
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        futures = [pool.submit(_fetch_return, etf, sector) for sector, etf in sector_etfs.items()]
-        for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            if result:
-                sector_name, ret = result
-                results[sector_name] = ret
-
-    return results
+# NOTE: The canonical fetch_sector_etf_returns() implementation is defined
+# further below using _SECTOR_ETFS (which uses GICS names matching the
+# ICB→GICS mapping in _FINNHUB_ICB_TO_GICS).  This duplicate with mismatched
+# GICS key names ("Consumer Discretionary" vs "Consumer Cyclical" etc.) has
+# been removed to prevent silent sector-lookup failures.
 
 
 # ─── Economic Calendar (FRED) ─────────────────────────────────────────────────
