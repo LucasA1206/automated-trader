@@ -276,14 +276,26 @@ def _fetch_ticker_universe() -> list[str]:
                 if symbol.lower().endswith("test"):
                     continue
                     
-                # Pre-filter by price to save yfinance rate limits
+                # Pre-filter by price and market cap to save yfinance rate limits
                 try:
                     price_str = row.get('lastsale', '').replace('$', '').replace(',', '').strip()
-                    if price_str and float(price_str) >= 2.0:
-                        tickers.append(symbol)
+                    if price_str:
+                        price = float(price_str)
+                        if price < 3.0:
+                            continue
                 except ValueError:
-                    # Keep if price parsing fails, let stage 1 catch it
-                    tickers.append(symbol)
+                    pass
+
+                try:
+                    mcap_str = row.get('marketCap', '').replace(',', '').strip()
+                    if mcap_str:
+                        mcap = float(mcap_str)
+                        if mcap < 150_000_000.0:
+                            continue
+                except ValueError:
+                    pass
+
+                tickers.append(symbol)
 
             if filtered_special:
                 logger.debug("[Jobs] Universe parse: filtered %d special-suffix symbols.", filtered_special)
@@ -400,7 +412,7 @@ def job_pre_market_scan():
                 rejection_buckets["atr<1.5%"] += 1
             elif reason.startswith("atr_pct_too_high"):
                 rejection_buckets["atr>12%"] += 1
-            elif reason.startswith("rs_below_top30pct"):
+            elif reason.startswith("rs_below_top50pct"):
                 rejection_buckets["rs_bottom50%"] += 1
             elif reason.startswith("earnings_within"):
                 rejection_buckets["earnings_blackout"] += 1

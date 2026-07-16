@@ -42,14 +42,13 @@ from strategy.data_layer import (
 
 logger = logging.getLogger(__name__)
 
-# Hard-coded filter thresholds.
-# Core downside-protection filters (price > 200 SMA, RS > SPY) are NOT relaxed here.
-MIN_PRICE = 5.0                         # $5 floor (blueprint Section 4 mandatory)
-MIN_AVG_DOLLAR_VOL_20D = 10_000_000.0  # $10M/day (blueprint: ensures liquidity for execution)
-MIN_MARKET_CAP = 500_000_000.000       # $500M (blueprint: stability/quality preference)
-ATR_PCT_MIN = 2.0                       # 2% of price — excludes ETFs/illiquid names
-ATR_PCT_MAX = 6.0                       # 6% of price (blueprint Section 4)
-RS_TOP_PERCENTILE = 0.30               # Must be in top 30% by relative strength (blueprint Section 4)
+# Hard-coded filter thresholds (relaxed per user request to improve yield).
+MIN_PRICE = 3.0                         # $3 floor (relaxed from $5)
+MIN_AVG_DOLLAR_VOL_20D = 3_000_000.0   # $3M/day (relaxed from $10M)
+MIN_MARKET_CAP = 150_000_000.0          # $150M (relaxed from $500M)
+ATR_PCT_MIN = 1.5                       # 1.5% of price (relaxed from 2.0%)
+ATR_PCT_MAX = 12.0                      # 12% of price (relaxed from 6.0%)
+RS_TOP_PERCENTILE = 0.50               # Must be in top 50% by relative strength (relaxed from top 30%)
 
 # Minimum pool size for relative RS percentile cut.
 # Below this, use an absolute floor instead to avoid destroying small pools.
@@ -453,11 +452,11 @@ def apply_relative_strength_threshold(
     rejections = {}
 
     if pool_size >= RS_RELATIVE_CUT_MIN_POOL:
-        # Large pool: relative top-30% cut + absolute floor
+        # Large pool: relative top-50% cut + absolute floor
         rs_values = sorted([m["rs_63d"] for m in valid], reverse=True)
         cutoff_idx = max(0, int(len(rs_values) * RS_TOP_PERCENTILE) - 1)
         rs_cutoff = rs_values[cutoff_idx]
-        mode = f"relative(top30%,cutoff={rs_cutoff:.1f}%)+abs_floor({RS_ABS_FLOOR_LARGE_POOL:.0f}%)"
+        mode = f"relative(top50%,cutoff={rs_cutoff:.1f}%)+abs_floor({RS_ABS_FLOOR_LARGE_POOL:.0f}%)"
 
         for m in metrics_list:
             rs = m.get("rs_63d")
@@ -473,7 +472,7 @@ def apply_relative_strength_threshold(
                     )
                 else:
                     rejections[m["ticker"]] = (
-                        f"rs_below_top30pct(rs={rs:.1f}%,cutoff={rs_cutoff:.1f}%)"
+                        f"rs_below_top50pct(rs={rs:.1f}%,cutoff={rs_cutoff:.1f}%)"
                     )
     else:
         # Small pool: absolute floor only — do not apply relative cut
