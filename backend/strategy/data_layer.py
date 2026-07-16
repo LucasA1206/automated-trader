@@ -103,19 +103,14 @@ def _finnhub_rate_check() -> None:
         time.sleep(1.0)
 
 
-def _get_finnhub_client():
-    """Return a module-level cached Finnhub client (created once, thread-safe)."""
-    global _finnhub_client_singleton
-    with _finnhub_client_lock:
-        if _finnhub_client_singleton is None:
-            import finnhub
-            from dotenv import load_dotenv
-            load_dotenv('.env.local')
-            api_key = os.getenv('FINNHUB_API')
-            if not api_key:
-                raise ValueError("FINNHUB_API not set — cannot initialise Finnhub client")
-            _finnhub_client_singleton = finnhub.Client(api_key=api_key)
-    return _finnhub_client_singleton
+def _get_finnhub_api_key():
+    import os
+    from dotenv import load_dotenv
+    load_dotenv('.env.local')
+    api_key = os.getenv('FINNHUB_API')
+    if not api_key:
+        raise ValueError("FINNHUB_API not set")
+    return api_key
 
 
 # ─── Finnhub ICB → GICS sector mapping ───────────────────────────────────────
@@ -442,6 +437,10 @@ def prime_ohlcv_cache(tickers: list[str], period: str = "1y") -> None:
         chunk = tickers[i: i + _PRIME_CHUNK_SIZE]
         chunk_num = i // _PRIME_CHUNK_SIZE + 1
         total_chunks = math.ceil(total / _PRIME_CHUNK_SIZE)
+        logger.info(
+            "[DataLayer] Prime OHLCV: chunk %d/%d (%d tickers)…",
+            chunk_num, total_chunks, len(chunk),
+        )
 
         def _download_chunk(ch=chunk):
             return yf.download(
@@ -551,16 +550,20 @@ def fetch_fundamentals(ticker: str) -> Optional[dict]:
         return cached["data"]
 
     def _fetch():
-        client = _get_finnhub_client()
+        api_key = _get_finnhub_api_key()
 
         # Rate-limit each individual API call
         _finnhub_rate_check()
-        profile = client.company_profile2(symbol=ticker)
+        resp_prof = _session.get(f"https://finnhub.io/api/v1/stock/profile2?symbol={ticker}&token={api_key}", timeout=10)
+        resp_prof.raise_for_status()
+        profile = resp_prof.json()
         if not profile:
             raise ValueError(f"No profile info for {ticker}")
 
         _finnhub_rate_check()
-        financials = client.company_basic_financials(ticker, 'all')
+        resp_fin = _session.get(f"https://finnhub.io/api/v1/stock/metric?symbol={ticker}&metric=all&token={api_key}", timeout=10)
+        resp_fin.raise_for_status()
+        financials = resp_fin.json()
         raw_metrics = financials.get('metric', {}) if financials else {}
 
         return profile, raw_metrics
@@ -716,15 +719,17 @@ def fetch_next_earnings_date(ticker: str) -> Optional[date]:
 
     def _fetch():
         from datetime import timedelta as _td, date as _date
-        client = _get_finnhub_client()
+        api_key = _get_finnhub_api_key()
         today = datetime.now(timezone.utc).date()
         # Look 60 days ahead for upcoming earnings
         date_from = today.strftime("%Y-%m-%d")
         date_to   = (today + _td(days=60)).strftime("%Y-%m-%d")
         _finnhub_rate_check()
-        cal = client.earnings_calendar(
-            _from=date_from, to=date_to, symbol=ticker, international=False
-        )
+        
+        resp = _session.get(f"https://finnhub.io/api/v1/calendar/earnings?from={date_from}&to={date_to}&symbol={ticker}&token={api_key}", timeout=10)
+        resp.raise_for_status()
+        cal = resp.json()
+        
         earnings_list = cal.get("earningsCalendar", []) if cal else []
         if not earnings_list:
             return None
