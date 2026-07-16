@@ -328,7 +328,15 @@ def stage2_technical_filter(
             pool.submit(_stage2_check_single, t, spy_ret_63d, spy_ret_126d): t
             for t in tickers
         }
+        
+        processed = 0
+        total_tasks = len(futures)
+        
         for future in concurrent.futures.as_completed(futures):
+            processed += 1
+            if processed % 50 == 0 or processed == total_tasks:
+                logger.info("[Filter] Stage 2 progress: processed %d/%d tickers...", processed, total_tasks)
+                
             ticker = futures[future]
             try:
                 metrics, reason = future.result()
@@ -373,7 +381,14 @@ def stage3_event_filter(
     survivors: list[dict] = []
     rejection_reasons: dict[str, str] = {}
 
+    processed = 0
+    total_tasks = len(metrics_list)
+    
     for m in metrics_list:
+        processed += 1
+        if processed % 50 == 0 or processed == total_tasks:
+            logger.info("[Filter] Stage 3 progress: checked earnings for %d/%d tickers...", processed, total_tasks)
+            
         ticker = m["ticker"]
         if check_earnings and is_near_earnings(ticker, EARNINGS_BLACKOUT_TRADING_DAYS):
             rejection_reasons[ticker] = "earnings_within_3d"
