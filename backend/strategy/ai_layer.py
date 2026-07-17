@@ -65,7 +65,7 @@ if GEMINI_API_KEY:
 
 
 # gemini-2.5-flash is available on the free tier; gemini-2.0-flash requires billing.
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-2.5-flash-lite"
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
