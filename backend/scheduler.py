@@ -2,7 +2,7 @@
 scheduler.py — APScheduler configuration for the systematic trading strategy.
 
 Schedule (all times Eastern, Mon-Fri only):
-  07:30  pre_market_scan  — full pipeline: universe → filter → score → AI → candidates staged
+  06:30  pre_market_scan  — full pipeline: universe → filter → score → AI → candidates staged
   09:30  exit_monitor     — check all open positions against exit rules (runs until 16:00)
   09:45  entry_monitor    — place orders for confirmed candidates (runs until 15:30)
   15:45  eod_snapshot     — capture daily NetLiquidation snapshot
@@ -36,18 +36,19 @@ def create_scheduler() -> BackgroundScheduler:
 
     scheduler = BackgroundScheduler(timezone=ET)
 
-    # 07:30 ET Mon-Fri — full pre-market scan
+    # 06:30 ET Mon-Fri — full pre-market scan
     # Runs BEFORE market open to identify candidates. No orders placed here.
+    # Started at 06:30 to allow 3 hours before open (scan takes 2+ hours).
     scheduler.add_job(
         func=job_pre_market_scan,
         trigger=CronTrigger(
             day_of_week="mon-fri",
-            hour=7,
+            hour=6,
             minute=30,
             timezone=ET,
         ),
         id="pre_market_scan",
-        name="Pre-Market Scan (07:30 ET)",
+        name="Pre-Market Scan (06:30 ET)",
         replace_existing=True,
         misfire_grace_time=600,   # 10 min grace — scan is long-running
         max_instances=1,
