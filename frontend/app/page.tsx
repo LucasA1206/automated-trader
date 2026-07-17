@@ -8,9 +8,9 @@ import PortfolioTab from '@/components/PortfolioTab';
 import TradeHistoryTab from '@/components/TradeHistoryTab';
 import SystemLogsTab from '@/components/SystemLogsTab';
 import SettingsTab from '@/components/SettingsTab';
-import AIPicksTab from '@/components/AIPicksTab';
+import AIAnalysisTab from '@/components/AIAnalysisTab';
 
-export type Tab = 'portfolio' | 'trades' | 'ai-picks' | 'logs' | 'settings';
+export type Tab = 'portfolio' | 'trades' | 'ai-analysis' | 'logs' | 'settings';
 
 export default function Home() {
   const { token, username, logout, authFetch } = useAuth();
@@ -74,7 +74,7 @@ export default function Home() {
       <main className="main-content">
         {activeTab === 'portfolio'  && <PortfolioTab authFetch={authFetch} />}
         {activeTab === 'trades'     && <TradeHistoryTab authFetch={authFetch} />}
-        {activeTab === 'ai-picks'   && <AIPicksTab authFetch={authFetch} />}
+        {activeTab === 'ai-analysis'  && <AIAnalysisTab authFetch={authFetch} />}
         {activeTab === 'logs'       && <SystemLogsTab authFetch={authFetch} />}
         {activeTab === 'settings'   && (
           <SettingsTab

@@ -427,6 +427,136 @@ def get_scan_history(limit: int = 10, db: Session = Depends(get_db)):
     }
 
 
+# ─── AI Analysis (full per-day breakdown) ─────────────────────────────────
+@app.get("/api/ai-analysis", dependencies=[Depends(require_auth)])
+def get_ai_analysis(limit: int = 30, db: Session = Depends(get_db)):
+    """
+    Returns a per-day breakdown of ALL stocks the AI analyzed, including:
+    - Their technical/fundamental metrics (from scan_results.candidates_json)
+    - Whether the AI approved or denied them (proceed field)
+    - AI rationale (entry_notes, key_risk, final_decision)
+    - Confidence score from ai_picks for approved stocks
+    - Scan-level context (regime, action_taken, candidate counts)
+    """
+    import json as _json
+
+    # Fetch scan results (up to `limit` days)
+    results = (
+        db.query(ScanResult)
+        .order_by(ScanResult.scan_date.desc())
+        .limit(limit)
+        .all()
+    )
+
+    if not results:
+        return {"days": [], "total_days": 0}
+
+    # Build a lookup of approved picks keyed by (scan_date_str, ticker)
+    # to enrich approved candidates with the confidence stored in ai_picks
+    scan_date_strs = [r.scan_date.isoformat() for r in results if r.scan_date]
+    all_picks = (
+        db.query(AIPick)
+        .filter(AIPick.scan_date.in_([r.scan_date for r in results if r.scan_date]))
+        .all()
+    )
+    picks_by_key: dict = {}
+    for p in all_picks:
+        key = (p.scan_date.isoformat() if p.scan_date else None, p.ticker)
+        picks_by_key[key] = {
+            "confidence": p.confidence,
+            "position_size_pct": p.position_size_pct,
+            "rank": p.rank,
+        }
+
+    days = []
+    for r in results:
+        date_str = r.scan_date.isoformat() if r.scan_date else None
+        raw_candidates = _json.loads(r.candidates_json) if r.candidates_json else []
+
+        enriched = []
+        for c in raw_candidates:
+            ticker = c.get("ticker", "")
+            pick_info = picks_by_key.get((date_str, ticker), {})
+
+            # Determine approval from the verdict fields stored in the candidate
+            # (jobs.py merges scored + verdict dicts together in Step 6)
+            proceed = c.get("proceed")
+            final_decision = c.get("final_decision", "")
+
+            # If proceed is None, it means this candidate didn't make it to AI
+            # (only candidates in candidates_for_ai get verdict fields).
+            # Candidates stored in the "no_scoring_threshold" / "no_trade" paths
+            # won't have verdict fields at all.
+            if proceed is None and not final_decision:
+                ai_status = "not_sent_to_ai"
+            elif proceed:
+                ai_status = "approved"
+            else:
+                ai_status = "rejected"
+
+            enriched.append({
+                "ticker": ticker,
+                "ai_status": ai_status,
+                # Metrics
+                "composite_score": c.get("composite_score"),
+                "classification": c.get("classification"),
+                "price": c.get("price"),
+                "sector": c.get("sector"),
+                "market_cap": c.get("market_cap"),
+                "atr_pct": c.get("atr_pct"),
+                "rel_vol": c.get("rel_vol"),
+                "rs_63d": c.get("rs_63d"),
+                "rs_126d": c.get("rs_126d"),
+                "high_52w_pct": c.get("high_52w_pct"),
+                "short_interest_pct_float": c.get("short_interest_pct_float"),
+                "technical_indicators": c.get("technical_indicators", {}),
+                "component_scores": c.get("component_scores", {}),
+                "sub_scores": c.get("sub_scores", {}),
+                "data_gaps": c.get("data_gaps", []),
+                "penalties": c.get("penalties", {}),
+                # AI verdict fields
+                "proceed": proceed,
+                "conviction": c.get("conviction"),
+                "entry_notes": c.get("entry_notes", ""),
+                "key_risk": c.get("key_risk", ""),
+                "final_decision": final_decision,
+                "models_agree": c.get("models_agree"),
+                "gemini_raw": c.get("gemini_raw"),
+                "crosscheck_raw": c.get("crosscheck_raw"),
+                # From ai_picks table (approved stocks only)
+                "confidence": pick_info.get("confidence"),
+                "position_size_pct": pick_info.get("position_size_pct"),
+                "rank": pick_info.get("rank"),
+            })
+
+        # Sort: approved first (by rank), then rejected, then not_sent
+        def sort_key(c):
+            order = {"approved": 0, "rejected": 1, "not_sent_to_ai": 2}
+            return (order.get(c["ai_status"], 3), -(c.get("composite_score") or 0))
+        enriched.sort(key=sort_key)
+
+        approved_count = sum(1 for c in enriched if c["ai_status"] == "approved")
+        rejected_count = sum(1 for c in enriched if c["ai_status"] == "rejected")
+        not_sent_count = sum(1 for c in enriched if c["ai_status"] == "not_sent_to_ai")
+
+        days.append({
+            "scan_date": date_str,
+            "regime_status": r.regime_status,
+            "regime_details": r.regime_details,
+            "action_taken": r.action_taken,
+            "candidates_count": r.candidates_count,
+            "high_conviction_count": r.high_conviction_count,
+            "marginal_count": r.marginal_count,
+            "approved_count": approved_count,
+            "rejected_count": rejected_count,
+            "not_sent_count": not_sent_count,
+            "candidates": enriched,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        })
+
+    return {"days": days, "total_days": len(days)}
+
+
 # ─── Strategy: Risk State ──────────────────────────────────────────────────
 @app.get("/api/risk-state", dependencies=[Depends(require_auth)])
 def get_risk_state(db: Session = Depends(get_db)):
