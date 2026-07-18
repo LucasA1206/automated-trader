@@ -4,11 +4,11 @@ scheduler.py — APScheduler configuration for the systematic trading strategy.
 Schedule (all times Eastern, Mon-Fri only):
   06:30  pre_market_scan  — full pipeline: universe → filter → score → AI → candidates staged
   09:30  exit_monitor     — check all open positions against exit rules (runs until 16:00)
-  09:45  entry_monitor    — place orders for confirmed candidates (runs until 15:30)
+  09:30  entry_monitor    — place orders for confirmed candidates (runs until 15:30)
   15:45  eod_snapshot     — capture daily NetLiquidation snapshot
 
 Exit monitor starts at 09:30 (market open) to catch any gaps or overnight events.
-Entry monitor starts at 09:45 (15-min after open) — never in the first 15 minutes.
+Entry monitor starts at 09:30 (market open).
 """
 
 import logging
@@ -71,8 +71,8 @@ def create_scheduler() -> BackgroundScheduler:
         max_instances=1,          # Prevent concurrent runs (idempotent sell guards)
     )
 
-    # 09:45–15:30 ET, every 5 min, Mon-Fri — entry monitor
-    # Avoids first 15 min of trading (blueprint Section 8 time gate).
+    # 09:30–15:30 ET, every 5 min, Mon-Fri — entry monitor
+    # Starts at market open.
     # Stops at 15:30 to avoid entries 30 min before close.
     scheduler.add_job(
         func=job_entry_monitor,
