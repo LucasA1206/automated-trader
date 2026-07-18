@@ -4,7 +4,7 @@ Entry Engine — Phase 6
 Implements intraday entry confirmation rules from blueprint Section 8.
 
 These rules are applied AFTER the pre-market scan has identified candidates.
-During market hours (09:45–15:30 ET), the entry monitor checks each candidate
+During market hours (09:30–15:30 ET), the entry monitor checks each candidate
 for intraday confirmation before placing a limit order.
 
 Entry confirmation rules (ALL must be met):
@@ -15,8 +15,8 @@ Entry confirmation rules (ALL must be met):
   4. ADX ≥ 20: trend is strong enough to trade
   5. VWAP reclaim: intraday price > today's VWAP (confirms intraday momentum)
   6. Volume confirmation: current intraday volume on pace for ≥ 1.2× 20-day avg
-  7. Time gate: only place new entries between 09:45–15:30 ET
-     (no entries in first 15 minutes or last 30 minutes of session)
+  7. Time gate: only place new entries between 09:30–15:30 ET
+     (no entries in last 30 minutes of session)
 
 Entry order type: LIMIT at the asking price (not MKT) to avoid slippage.
 If the limit order doesn't fill within 20 minutes, cancel and wait for next bar.
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 # Entry time gate (ET hours)
 ENTRY_START_HOUR = 9
-ENTRY_START_MINUTE = 45
+ENTRY_START_MINUTE = 30
 ENTRY_END_HOUR = 15
 ENTRY_END_MINUTE = 30
 
