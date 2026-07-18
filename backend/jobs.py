@@ -729,9 +729,7 @@ def job_entry_monitor():
             log_event(db, "buy",
                       f"🟢 {ticker}: placing limit order — "
                       f"{shares} shares @ ${limit_price:.4f} (limit) | "
-                      f"stop=${stop_price:.4f} | 1.5R=${partial_target:.4f} | "
-                      f"score={candidate.get('composite_score', 0):.1f} | "
-                      f"confidence={order_info.get('confidence_score', 0)}")
+                      f"stop=${stop_price:.4f} | 1.5R=${partial_target:.4f}")
 
             # Place limit buy order
             result = client.place_limit_buy_order(ticker, shares, limit_price)
@@ -739,6 +737,10 @@ def job_entry_monitor():
             if not result.get("success"):
                 log_event(db, "buy",
                           f"❌ {ticker}: limit order failed — {result.get('error')}", "ERROR")
+                # Remove candidate from pending list to prevent infinite retries and log spam
+                with _pending_candidates_lock:
+                    _pending_candidates = [c for c in _pending_candidates
+                                           if c.get("ticker") != ticker]
                 continue
 
             fill_price = result.get("price", limit_price)
