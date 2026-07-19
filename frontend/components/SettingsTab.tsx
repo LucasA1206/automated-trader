@@ -47,6 +47,23 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
     fetchSettings();
   }, [fetchSettings]);
 
+  useEffect(() => {
+    const checkStatus = async () => {
+      try {
+        const res = await authFetch('/api/scan/status');
+        if (res.ok) {
+          const data = await res.json();
+          setScanning(data.running);
+        }
+      } catch (err) {
+        console.error("Failed to check scan status:", err);
+      }
+    };
+    checkStatus();
+    const interval = setInterval(checkStatus, 2000);
+    return () => clearInterval(interval);
+  }, [authFetch]);
+
   const save = async (patch: Partial<Settings>) => {
     setSaving(true);
     setSaveMsg('');
@@ -101,10 +118,19 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
       setSaveMsg('✅ Scan triggered! Check System Logs for progress.');
     } catch {
       setSaveMsg('❌ Failed to trigger scan.');
-    } finally {
       setScanning(false);
-      setTimeout(() => setSaveMsg(''), 5000);
     }
+    setTimeout(() => setSaveMsg(''), 5000);
+  };
+
+  const stopScan = async () => {
+    try {
+      await authFetch('/api/scan/stop', { method: 'POST' });
+      setSaveMsg('🛑 Scan cancellation requested.');
+    } catch {
+      setSaveMsg('❌ Failed to stop scan.');
+    }
+    setTimeout(() => setSaveMsg(''), 5000);
   };
 
   const sellAllIBKR = async () => {
@@ -624,10 +650,10 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
           <button
             id="btn-trigger-scan"
             className="btn btn-primary"
-            onClick={triggerScan}
-            disabled={scanning}
+            onClick={scanning ? stopScan : triggerScan}
+            style={scanning ? { backgroundColor: 'var(--accent-red)', borderColor: 'var(--accent-red)' } : {}}
           >
-            {scanning ? '⏳ Scanning...' : '🔍 Run Scan Now'}
+            {scanning ? '🛑 Stop Running Scan' : '🔍 Run Scan Now'}
           </button>
         </div>
       </div>
