@@ -52,6 +52,8 @@ _pending_candidates: list[dict] = []
 _pending_candidates_lock = threading.Lock()
 _scan_date_today: date | None = None
 
+_scan_cancel_event = threading.Event()
+_scan_running = False
 
 # ---------------------------------------------------------------------------
 # Persistent keepalive — a single IBKRClient that stays connected between jobs
@@ -370,7 +372,14 @@ def job_pre_market_scan():
     NO orders are placed here. This job only STAGES candidates.
     The entry monitor job places orders after intraday confirmation.
     """
-    global _pending_candidates, _scan_date_today
+    global _pending_candidates, _scan_date_today, _scan_running, _scan_cancel_event
+
+    if _scan_running:
+        logger.warning("[Jobs] Scan is already running. Ignoring trigger.")
+        return
+
+    _scan_running = True
+    _scan_cancel_event.clear()
 
     db = SessionLocal()
     try:
@@ -419,10 +428,18 @@ def job_pre_market_scan():
         tickers = _fetch_ticker_universe()
         log_event(db, "scan", f"Universe: {len(tickers)} tickers loaded.")
 
+        if _scan_cancel_event.is_set():
+            log_event(db, "scan", "🛑 Scan cancelled by user.")
+            return
+
         # ── Step 3: Mandatory filters ─────────────────────────────────────────
         from strategy.universe_filter import run_universe_filter
         log_event(db, "scan", f"🔬 Applying mandatory filters…")
         shortlist, rejections = run_universe_filter(tickers)
+
+        if _scan_cancel_event.is_set():
+            log_event(db, "scan", "🛑 Scan cancelled by user.")
+            return
 
         log_event(db, "scan",
                   f"Filters complete: {len(shortlist)} candidates survived / "
@@ -495,6 +512,10 @@ def job_pre_market_scan():
         sector_returns = fetch_sector_etf_returns()
         open_positions = _get_open_positions_with_sectors(db)
 
+        if _scan_cancel_event.is_set():
+            log_event(db, "scan", "🛑 Scan cancelled by user.")
+            return
+
         log_event(db, "scan", f"📈 Scoring {len(shortlist)} candidates…")
         high_conviction, marginal, no_trade_list = score_all_candidates(
             shortlist, sector_returns, regime, open_positions
@@ -545,6 +566,10 @@ def job_pre_market_scan():
         # ── Step 5: AI analysis ───────────────────────────────────────────────
         candidates_for_ai = high_conviction[:10] + marginal[:5]  # Top 15 max
         log_event(db, "scan", f"🤖 Running AI analysis on {len(candidates_for_ai)} top candidates…")
+
+        if _scan_cancel_event.is_set():
+            log_event(db, "scan", "🛑 Scan cancelled by user.")
+            return
 
         from strategy.ai_layer import analyze_candidates_batch
         verdicts = analyze_candidates_batch(
@@ -624,6 +649,7 @@ def job_pre_market_scan():
         except Exception:
             pass
     finally:
+        _scan_running = False
         db.close()
 
 

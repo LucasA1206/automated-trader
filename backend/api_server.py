@@ -744,6 +744,17 @@ def trigger_scan(background_tasks: BackgroundTasks, db: Session = Depends(get_db
         "deferred": True,
     }
 
+@app.get("/api/scan/status", dependencies=[Depends(require_auth)])
+def get_scan_status():
+    from jobs import _scan_running
+    return {"running": _scan_running}
+
+@app.post("/api/scan/stop", dependencies=[Depends(require_auth)])
+def stop_scan():
+    from jobs import _scan_cancel_event
+    _scan_cancel_event.set()
+    return {"status": "stopping", "message": "Scan cancellation requested."}
+
 
 @app.post("/api/sell-all", dependencies=[Depends(require_auth)])
 def trigger_sell(background_tasks: BackgroundTasks):
