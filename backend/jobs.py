@@ -754,8 +754,8 @@ def job_entry_monitor():
 
             log_event(db, "buy",
                       f"🟢 {ticker}: placing limit order — "
-                      f"{shares} shares @ ${limit_price:.4f} (limit) | "
-                      f"stop=${stop_price:.4f} | 1.5R=${partial_target:.4f}")
+                      f"{shares} shares @ ${limit_price:.2f} (limit) | "
+                      f"stop=${stop_price:.2f} | 1.5R=${partial_target:.4f}")
 
             # Place limit buy order
             result = client.place_limit_buy_order(ticker, shares, limit_price)
@@ -815,8 +815,8 @@ def job_entry_monitor():
             )
 
             log_event(db, "buy",
-                      f"✅ {ticker}: {shares} shares bought @ ${fill_price:.4f} | "
-                      f"stop=${stop_price:.4f} | "
+                      f"✅ {ticker}: {shares} shares bought @ ${fill_price:.2f} | "
+                      f"stop=${stop_price:.2f} | "
                       f"1.5R target=${partial_target:.4f} | "
                       f"risk=${order_info.get('risk_dollar', 0):.2f}")
 

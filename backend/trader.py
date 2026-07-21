@@ -34,6 +34,23 @@ def safe_float(value, fallback: float = 0.0) -> float:
         return fallback
 
 
+def round_to_tick(price: float) -> float:
+    """Round a price to the minimum IBKR tick size to avoid Warning 110.
+
+    IBKR requires prices to conform to minimum price variation rules:
+      - Stocks >= $1.00  → tick = $0.01  (2 decimal places)
+      - Stocks < $1.00   → tick = $0.0001 (4 decimal places, 'sub-penny' stocks)
+
+    Submitting a price like $59.1891 to a >= $1 stock triggers Warning 110
+    ("The price does not conform to the minimum price variation") which leaves
+    the order stuck in PendingSubmit and eventually auto-cancelled by IBKR.
+    """
+    if price >= 1.0:
+        return round(price, 2)
+    else:
+        return round(price, 4)
+
+
 class IBKRClient:
     """Manages connection and trading operations with IB Gateway."""
 
@@ -503,44 +520,109 @@ class IBKRClient:
         """
         Places a DAY limit buy order at the specified price.
         Used by the entry monitor (blueprint Section 8).
-        Waits up to 5 minutes for fill; cancels if not filled.
+
+        The price is snapped to the correct IBKR tick size before submission
+        (Warning 110 prevention).  After placing, we wait up to 30 s to catch
+        an immediate fill or hard rejection (Cancelled/Inactive).  If the order
+        is still working after 30 s we treat it as successfully submitted — it
+        is a DAY order so IBKR will attempt to fill it for the rest of the
+        session without us holding the scheduler thread open.
         """
         try:
             if not self.ib.isConnected():
                 self.connect()
 
+            # Snap price to valid IBKR tick size to avoid Warning 110
+            ticked_price = round_to_tick(limit_price)
+            if ticked_price != limit_price:
+                logger.info(
+                    "place_limit_buy_order(%s): price snapped %.4f → %.2f (tick rounding)",
+                    ticker, limit_price, ticked_price,
+                )
+            limit_price = ticked_price
+
             contract = Stock(ticker, "SMART", "USD")
             self.ib.qualifyContracts(contract)
 
+            # Track Warning 110 (price variation) so we can fail fast
+            warning_110 = [False]
+
+            def _on_error(reqId, errorCode, errorString, contract):
+                if errorCode == 110:
+                    warning_110[0] = True
+
+            self.ib.errorEvent += _on_error
+
             order = LimitOrder("BUY", shares, limit_price)
             order.tif = "DAY"
-            logger.info("Placing LIMIT BUY for %s: %d shares @ $%.4f", ticker, shares, limit_price)
+            logger.info("Placing LIMIT BUY for %s: %d shares @ $%.2f", ticker, shares, limit_price)
             trade = self.ib.placeOrder(contract, order)
 
+            # Wait up to 30 s — enough to catch an immediate fill or hard rejection.
+            # If the order is still 'Submitted'/'PreSubmitted' after 30 s it is
+            # working at IBKR and will fill during the session without us polling.
             filled = False
             terminal_statuses = {"Cancelled", "Inactive"}
-            for _ in range(600):  # 600 x 0.5 s = 5 min max
+            for _ in range(60):  # 60 × 0.5 s = 30 s
                 self.ib.sleep(0.5)
                 status = trade.orderStatus.status
                 if status == "Filled":
                     filled = True
                     break
-                if status in terminal_statuses:
+                if status in terminal_statuses or warning_110[0]:
                     break
+
+            self.ib.errorEvent -= _on_error
+
+            if warning_110[0]:
+                # Price variation error — cancel and report clearly
+                try:
+                    self.ib.cancelOrder(order)
+                    self.ib.sleep(1.0)
+                except Exception:
+                    pass
+                return {
+                    "success": False, "ticker": ticker,
+                    "error": (
+                        f"IBKR rejected limit price ${limit_price:.2f} (Warning 110: "
+                        "price does not conform to minimum price variation). "
+                        "Order cancelled."
+                    ),
+                }
 
             if not filled:
                 if trade.fills:
+                    # Fills present despite non-Filled status (IBKR paper quirk)
                     filled = True
                 else:
-                    try:
-                        self.ib.cancelOrder(order)
-                        self.ib.sleep(1.0)
-                    except Exception:
-                        pass
                     status = trade.orderStatus.status
+                    if status in terminal_statuses:
+                        # Hard rejection — cancel cleanly and report
+                        try:
+                            self.ib.cancelOrder(order)
+                            self.ib.sleep(1.0)
+                        except Exception:
+                            pass
+                        return {
+                            "success": False, "ticker": ticker,
+                            "error": f"Limit order rejected immediately (status: {status}).",
+                        }
+                    # Still working (Submitted / PreSubmitted) — treat as success.
+                    # The DAY order remains live at IBKR for the rest of the session.
+                    logger.info(
+                        "LIMIT BUY for %s still working after 30 s (status=%s) — "
+                        "order is live at IBKR, will fill during session.",
+                        ticker, status,
+                    )
                     return {
-                        "success": False, "ticker": ticker,
-                        "error": f"Limit order did not fill (status: {status}). Cancelled."
+                        "success": True,
+                        "ticker": ticker,
+                        "shares": shares,
+                        "price": round(limit_price, 2),
+                        "fees": 0.0,
+                        "total_cost": round(limit_price * shares, 2),
+                        "order_id": str(trade.order.orderId),
+                        "status": status,
                     }
 
             fill_price = limit_price
@@ -553,7 +635,7 @@ class IBKRClient:
                     if getattr(f, "commissionReport", None) and getattr(f.commissionReport, "commission", None) is not None
                 )
 
-            logger.info("LIMIT BUY filled: %s x %d @ $%.4f", ticker, shares, fill_price)
+            logger.info("LIMIT BUY filled: %s x %d @ $%.2f", ticker, shares, fill_price)
             return {
                 "success": True,
                 "ticker": ticker,
@@ -581,9 +663,12 @@ class IBKRClient:
             contract = Stock(ticker, "SMART", "USD")
             self.ib.qualifyContracts(contract)
 
+            # Snap stop price to valid tick size (prevents Warning 110)
+            stop_price = round_to_tick(stop_price)
+
             order = StopOrder("SELL", shares, stop_price)
             order.tif = "GTC"  # Good-Till-Cancelled
-            logger.info("Placing native STOP order for %s: %d shares @ $%.4f (GTC)",
+            logger.info("Placing native STOP order for %s: %d shares @ $%.2f (GTC)",
                         ticker, shares, stop_price)
             trade = self.ib.placeOrder(contract, order)
             self.ib.sleep(0.5)
@@ -703,8 +788,9 @@ class IBKRClient:
         Returns a dict with stop/TP prices and order IDs (best-effort).
         """
         try:
-            stop_price   = round(fill_price * (1 - stop_pct),   4)
-            profit_price = round(fill_price * (1 + profit_pct), 4)
+            # Snap both prices to valid tick sizes (avoids Warning 110)
+            stop_price   = round_to_tick(fill_price * (1 - stop_pct))
+            profit_price = round_to_tick(fill_price * (1 + profit_pct))
 
             oca_group = f"OCA_{ticker}_{int(time.time())}"
 
@@ -727,7 +813,7 @@ class IBKRClient:
             self.ib.sleep(0.5)   # let the gateway acknowledge both legs
 
             logger.info(
-                "Bracket orders placed for %s: TP=%.4f (orderId=%s), SL=%.4f (orderId=%s), OCA=%s",
+                "Bracket orders placed for %s: TP=%.2f (orderId=%s), SL=%.2f (orderId=%s), OCA=%s",
                 ticker, profit_price, tp_trade.order.orderId,
                 stop_price,  sl_trade.order.orderId, oca_group,
             )
