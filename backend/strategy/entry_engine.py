@@ -108,8 +108,8 @@ def check_entry_confirmation(candidate: dict, db=None, ignore_time_gate: bool = 
         return False, "outside_entry_window", None
 
     # ── Fetch fresh intraday data ────────────────────────────────────────────
-    df = fetch_ohlcv(ticker, period="22d")
-    if df is None or df.empty or len(df) < 20:
+    df = fetch_ohlcv(ticker, period="60d")
+    if df is None or df.empty or len(df) < 15:
         return False, "insufficient_data", None
 
     closes = df["Close"]

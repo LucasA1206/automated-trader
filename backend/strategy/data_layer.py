@@ -314,11 +314,16 @@ def fetch_ohlcv(ticker: str, period: str = "1y") -> Optional[pd.DataFrame]:
     def _fetch():
         tk = yf.Ticker(ticker, session=_session)
         df = tk.history(period=period, interval="1d", auto_adjust=True)
-        # Use 30 as the minimum so that partial/rate-limited responses
-        # (which may return only a handful of rows) are retried rather
-        # than cached as valid data and later rejected as insufficient_history.
-        if df is None or df.empty or len(df) < 30:
-            raise ValueError(f"Insufficient history for {ticker}: {len(df) if df is not None else 0} rows")
+        p_lower = str(period).lower()
+        if p_lower in ("1d", "5d", "10d", "15d", "22d", "1mo"):
+            min_rows = 10
+        elif p_lower in ("60d", "2mo", "3mo"):
+            min_rows = 20
+        else:
+            min_rows = 25
+
+        if df is None or df.empty or len(df) < min_rows:
+            raise ValueError(f"Insufficient history for {ticker}: {len(df) if df is not None else 0} rows (min required: {min_rows})")
         df.index = pd.to_datetime(df.index)
         return df
 
