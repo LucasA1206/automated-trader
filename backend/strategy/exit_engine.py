@@ -188,7 +188,7 @@ def check_exit_conditions(
     # ── 2. ATR expansion exit ────────────────────────────────────────────────
     if atr_entry and atr_entry > 0:
         # Fetch current ATR (approximate via recent OHLCV)
-        df = fetch_ohlcv(ticker, period="22d")
+        df = fetch_ohlcv(ticker, period="60d")
         if df is not None and len(df) >= 15:
             from strategy.universe_filter import _compute_atr
             current_atr = _compute_atr(df, 14)
@@ -234,7 +234,7 @@ def check_exit_conditions(
     # ── 5. Trailing stop (Chandelier) ─────────────────────────────────────────
     # After partial exit or after 5 days, activate Chandelier trail
     if (status == "sold_half" or holding_days >= 5) and atr_entry:
-        df = fetch_ohlcv(ticker, period="22d")
+        df = fetch_ohlcv(ticker, period="60d")
         if df is not None and len(df) >= 3:
             # Highest high since entry (approximate: highest in recent period)
             recent_period = min(holding_days + 3, len(df))
@@ -271,7 +271,7 @@ def check_exit_conditions(
 
     # ── 6. MA trend break ────────────────────────────────────────────────────
     if holding_days >= MIN_DAYS_FOR_MA_EXIT:
-        df = fetch_ohlcv(ticker, period="22d")
+        df = fetch_ohlcv(ticker, period="60d")
         if df is not None and len(df) >= MA_TREND_BREAK_WINDOW:
             sma_20 = float(df["Close"].rolling(MA_TREND_BREAK_WINDOW).mean().iloc[-1])
             if current_price < sma_20:
