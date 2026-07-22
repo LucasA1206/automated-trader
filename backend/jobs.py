@@ -662,6 +662,29 @@ def _strip_df(candidate: dict) -> dict:
 # Job 2: Entry Monitor (09:45–15:30 ET, every 5 min)
 # ---------------------------------------------------------------------------
 
+def ensure_pending_candidates_loaded(db):
+    """
+    If _pending_candidates is empty, attempt to reload today's (or most recent) staged candidates
+    from the ScanResult in DB.
+    """
+    global _pending_candidates, _scan_date_today
+    with _pending_candidates_lock:
+        if not _pending_candidates:
+            from models import ScanResult
+            import json
+            scan = db.query(ScanResult).order_by(ScanResult.scan_date.desc(), ScanResult.created_at.desc()).first()
+            if scan and scan.candidates_json:
+                try:
+                    loaded = json.loads(scan.candidates_json)
+                    if loaded:
+                        _pending_candidates = loaded
+                        _scan_date_today = scan.scan_date
+                        logger.info(f"[EntryMonitor] Restored {len(loaded)} pending candidates from DB scan date {scan.scan_date}")
+                        log_event(db, "system", f"Restored {len(loaded)} pending candidates from scan on {scan.scan_date}")
+                except Exception as exc:
+                    logger.error(f"[EntryMonitor] Error restoring candidates from DB: {exc}")
+
+
 def job_entry_monitor():
     """
     Checks pending candidates for intraday entry confirmation.
@@ -680,6 +703,8 @@ def job_entry_monitor():
 
         if not is_market_open():
             return
+
+        ensure_pending_candidates_loaded(db)
 
         with _pending_candidates_lock:
             candidates = list(_pending_candidates)
@@ -740,6 +765,7 @@ def job_entry_monitor():
                 account_equity=account_equity,
                 open_positions=open_positions,
                 risk_engine=risk_engine,
+                db=db,
             )
 
             if order_info is None:
@@ -1111,3 +1137,201 @@ def job_manual_scan_with_deferred_buy():
     job_manual_scan()
     if is_market_open():
         job_entry_monitor()
+
+
+def job_manual_entry_monitor(force: bool = False) -> dict:
+    """
+    Manually triggers an entry monitor round for all pending/staged candidates.
+    If force=True, evaluates candidates even outside normal entry window.
+    Returns summary dict with details for each candidate.
+    """
+    global _pending_candidates, _scan_date_today
+
+    db = SessionLocal()
+    results = []
+    try:
+        ensure_pending_candidates_loaded(db)
+
+        with _pending_candidates_lock:
+            candidates = list(_pending_candidates)
+
+        if not candidates:
+            return {
+                "success": False,
+                "message": "No pending candidates found for entry.",
+                "evaluated": 0,
+                "placed": 0,
+                "candidates": [],
+            }
+
+        trading_mode = get_setting(db, "trading_mode", "paper")
+        client = IBKRClient(trading_mode=trading_mode)
+        if not client.connect():
+            msg = "Could not connect to IBKR Gateway."
+            log_event(db, "ibkr", f"Manual entry round failed: {msg}", "WARNING")
+            return {
+                "success": False,
+                "message": msg,
+                "evaluated": len(candidates),
+                "placed": 0,
+                "candidates": [],
+            }
+        client.start_keepalive(interval=30)
+
+        account = client.get_account_summary()
+        account_equity = account.get("NetLiquidation", 0)
+
+        if account_equity <= 0:
+            msg = "Account equity is 0 or unavailable."
+            log_event(db, "ibkr", f"Manual entry round failed: {msg}", "WARNING")
+            client.disconnect()
+            return {
+                "success": False,
+                "message": msg,
+                "evaluated": len(candidates),
+                "placed": 0,
+                "candidates": [],
+            }
+
+        open_positions = _get_open_positions_with_sectors(db)
+
+        from strategy.risk_engine import get_risk_engine
+        from strategy.entry_engine import prepare_entry_order
+        risk_engine = get_risk_engine()
+
+        placed_this_cycle = 0
+
+        for candidate in candidates[:]:
+            ticker = candidate["ticker"]
+
+            existing = db.query(Trade).filter(
+                Trade.ticker == ticker,
+                Trade.status.in_(["open", "sold_half", "closing"]),
+            ).first()
+            if existing:
+                results.append({
+                    "ticker": ticker,
+                    "status": "already_open",
+                    "reason": "Trade already active in portfolio",
+                })
+                continue
+
+            order_info = prepare_entry_order(
+                candidate=candidate,
+                account_equity=account_equity,
+                open_positions=open_positions,
+                risk_engine=risk_engine,
+                db=db,
+                ignore_time_gate=force,
+            )
+
+            if order_info is None:
+                results.append({
+                    "ticker": ticker,
+                    "status": "blocked",
+                    "reason": "Did not meet entry confirmation or risk limits",
+                })
+                continue
+
+            shares = order_info["shares"]
+            limit_price = order_info["limit_price"]
+            stop_price  = order_info["stop_price"]
+            partial_target = order_info["partial_target_price"]
+            atr_abs     = order_info["atr_abs"]
+            sector      = order_info["sector"]
+
+            log_event(db, "buy",
+                      f"🟢 [Manual Entry] {ticker}: placing limit order — "
+                      f"{shares} shares @ ${limit_price:.2f} (limit) | "
+                      f"stop=${stop_price:.2f} | 1.5R=${partial_target:.4f}")
+
+            result = client.place_limit_buy_order(ticker, shares, limit_price)
+
+            if not result.get("success"):
+                err_msg = result.get("error", "Unknown error")
+                log_event(db, "buy", f"❌ {ticker}: limit order failed — {err_msg}", "ERROR")
+                results.append({
+                    "ticker": ticker,
+                    "status": "order_failed",
+                    "reason": err_msg,
+                })
+                with _pending_candidates_lock:
+                    _pending_candidates = [c for c in _pending_candidates if c.get("ticker") != ticker]
+                continue
+
+            fill_price = result.get("price", limit_price)
+            order_id   = result.get("order_id", "")
+
+            stop_result = client.place_stop_order(ticker, shares, stop_price)
+            stop_order_id = stop_result.get("order_id") if stop_result.get("success") else None
+
+            trade = Trade(
+                ticker=ticker,
+                shares=shares,
+                buy_price=fill_price,
+                buy_time=datetime.now(timezone.utc),
+                status="open",
+                mode=trading_mode,
+                order_id=str(order_id),
+                ai_reason=candidate.get("entry_notes", ""),
+                stop_price=stop_price,
+                stop_order_id=str(stop_order_id) if stop_order_id else None,
+                partial_target_price=partial_target,
+                partial_sold=False,
+                atr_at_entry=atr_abs,
+                entry_composite_score=candidate.get("composite_score"),
+                sector=sector,
+            )
+            db.add(trade)
+            db.commit()
+
+            from strategy.journal import log_trade_event
+            log_trade_event(
+                db, trade.id, "entry",
+                details=order_info.get("entry_reason", ""),
+                composite_score=candidate.get("composite_score"),
+                confidence_score=order_info.get("confidence_score"),
+                stop_price=stop_price,
+                ai_gemini_json=candidate.get("gemini_raw"),
+                ai_crosscheck_json=candidate.get("crosscheck_raw"),
+                regime_at_event=order_info.get("regime"),
+            )
+
+            log_event(db, "buy",
+                      f"✅ [Manual Entry] {ticker}: {shares} shares bought @ ${fill_price:.2f} | "
+                      f"stop=${stop_price:.2f} | 1.5R target=${partial_target:.4f}")
+
+            placed_this_cycle += 1
+            results.append({
+                "ticker": ticker,
+                "status": "order_placed",
+                "shares": shares,
+                "limit_price": limit_price,
+            })
+            with _pending_candidates_lock:
+                _pending_candidates = [c for c in _pending_candidates if c.get("ticker") != ticker]
+
+        client.disconnect()
+
+        log_event(db, "buy", f"Manual entry round finished: {placed_this_cycle} order(s) placed out of {len(candidates)} candidates.")
+
+        return {
+            "success": True,
+            "message": f"Manual entry round complete: {placed_this_cycle} order(s) placed.",
+            "evaluated": len(candidates),
+            "placed": placed_this_cycle,
+            "candidates": results,
+        }
+
+    except Exception as exc:
+        logger.exception("Manual entry monitor crashed: %s", exc)
+        return {
+            "success": False,
+            "message": f"Error: {exc}",
+            "evaluated": 0,
+            "placed": 0,
+            "candidates": [],
+        }
+    finally:
+        db.close()
+

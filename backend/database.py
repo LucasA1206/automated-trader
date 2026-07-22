@@ -117,6 +117,13 @@ def init_db():
             "scan_enabled": "true",            # pause/resume auto scanning
             "trader_enabled": "true",          # Master switch
             "margin_upgrade_alerted": "false",
+            "entry_macd_check": "false",       # Intraday MACD turning check (false = loosened/disabled)
+            "entry_min_rel_vol": "0.4",        # Minimum relative volume for entry (0.4x)
+            "entry_rsi_min": "30",             # RSI entry lower threshold
+            "entry_rsi_max": "70",             # RSI entry upper threshold
+            "entry_pullback_max_pct": "5.0",   # Max % price above 20-day SMA
+            "entry_vwap_required": "false",    # Require price > VWAP for entry
+            "entry_adx_min": "15",             # Minimum ADX threshold
         }
         for key, value in defaults.items():
             existing = db.query(Setting).filter(Setting.key == key).first()
