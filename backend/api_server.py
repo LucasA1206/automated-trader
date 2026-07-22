@@ -174,6 +174,13 @@ class SettingsBulkUpdate(BaseModel):
     scan_enabled: Optional[str] = None
     account_type: Optional[str] = None
     trader_enabled: Optional[str] = None
+    entry_macd_check: Optional[str] = None
+    entry_min_rel_vol: Optional[str] = None
+    entry_rsi_min: Optional[str] = None
+    entry_rsi_max: Optional[str] = None
+    entry_pullback_max_pct: Optional[str] = None
+    entry_vwap_required: Optional[str] = None
+    entry_adx_min: Optional[str] = None
 
 
 def _sync_strategy_settings(db: Session, account_type: str) -> None:
@@ -602,18 +609,31 @@ def get_risk_state(db: Session = Depends(get_db)):
     return {"available": True, **state}
 
 
-# ─── Strategy: Pending Candidates ─────────────────────────────────────────
+# ─── Strategy: Pending Candidates & Manual Buy Round ───────────────────────
 @app.get("/api/candidates", dependencies=[Depends(require_auth)])
-def get_pending_candidates():
+def get_pending_candidates(db: Session = Depends(get_db)):
     """Returns the candidates staged by today's scan, awaiting intraday entry confirmation."""
-    from jobs import _pending_candidates, _scan_date_today
-    from jobs import _strip_df
+    from jobs import _pending_candidates, _scan_date_today, _strip_df, ensure_pending_candidates_loaded
+    ensure_pending_candidates_loaded(db)
     candidates = [_strip_df(c) for c in _pending_candidates]
     return {
         "scan_date": _scan_date_today.isoformat() if _scan_date_today else None,
         "count": len(candidates),
         "candidates": candidates,
     }
+
+
+@app.post("/api/entry-monitor", dependencies=[Depends(require_auth)])
+@app.post("/api/candidates/retry-buy", dependencies=[Depends(require_auth)])
+def trigger_entry_monitor(force: bool = Query(False)):
+    """
+    Manually triggers an entry monitor cycle for all pending/staged candidates.
+    Reloads candidates from today's scan if needed, and evaluates buy conditions.
+    If force=True, evaluates buy conditions even outside normal entry window.
+    """
+    from jobs import job_manual_entry_monitor
+    result = job_manual_entry_monitor(force=force)
+    return result
 
 
 

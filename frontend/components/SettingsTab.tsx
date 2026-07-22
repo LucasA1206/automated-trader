@@ -10,6 +10,13 @@ interface Settings {
   scan_enabled: string;
   trader_enabled: string;
   account_type: string;
+  entry_macd_check?: string;
+  entry_min_rel_vol?: string;
+  entry_rsi_min?: string;
+  entry_rsi_max?: string;
+  entry_pullback_max_pct?: string;
+  entry_vwap_required?: string;
+  entry_adx_min?: string;
 }
 
 type AuthFetch = (url: string, init?: RequestInit) => Promise<Response>;
@@ -28,9 +35,17 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
     scan_enabled: 'true',
     trader_enabled: 'true',
     account_type: 'trading_cash',
+    entry_macd_check: 'false',
+    entry_min_rel_vol: '0.4',
+    entry_rsi_min: '30',
+    entry_rsi_max: '70',
+    entry_pullback_max_pct: '5.0',
+    entry_vwap_required: 'false',
+    entry_adx_min: '15',
   });
   const [saving, setSaving] = useState(false);
   const [scanning, setScanning] = useState(false);
+  const [runningEntryMonitor, setRunningEntryMonitor] = useState(false);
   const [selling, setSelling] = useState(false);
   const [saveMsg, setSaveMsg] = useState('');
   const [showLiveWarning, setShowLiveWarning] = useState(false);
@@ -131,6 +146,25 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
       setSaveMsg('❌ Failed to stop scan.');
     }
     setTimeout(() => setSaveMsg(''), 5000);
+  };
+
+  const triggerEntryMonitor = async (force = true) => {
+    setRunningEntryMonitor(true);
+    setSaveMsg('');
+    try {
+      const res = await authFetch(`/api/entry-monitor?force=${force}`, { method: 'POST' });
+      const data = await res.json();
+      if (res.ok) {
+        setSaveMsg(`⚡ ${data.message || 'Buy round completed.'} (${data.placed || 0} order(s) placed)`);
+      } else {
+        setSaveMsg(`❌ Buy round failed: ${data.detail || 'Unknown error'}`);
+      }
+    } catch {
+      setSaveMsg('❌ Network error during buy round.');
+    } finally {
+      setRunningEntryMonitor(false);
+      setTimeout(() => setSaveMsg(''), 6000);
+    }
   };
 
   const sellAllIBKR = async () => {
@@ -655,6 +689,164 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
           >
             {scanning ? '🛑 Stop Running Scan' : '🔍 Run Scan Now'}
           </button>
+        </div>
+
+        <div className="setting-row">
+          <div className="setting-info">
+            <div className="setting-label">Run Buy Round (Retry Pending Entries)</div>
+            <div className="setting-desc">
+              Evaluate all pending candidate stocks that passed pre-market scan and attempt buy orders immediately.
+              Useful after loosening restrictions or retrying staged candidates.
+            </div>
+          </div>
+          <button
+            id="btn-trigger-buy-round"
+            className="btn btn-primary"
+            onClick={() => triggerEntryMonitor(true)}
+            disabled={runningEntryMonitor}
+            style={{ backgroundColor: '#22c55e', borderColor: '#22c55e' }}
+          >
+            {runningEntryMonitor ? '⏳ Processing Buy Round...' : '⚡ Run Buy Round Now'}
+          </button>
+        </div>
+      </div>
+
+      {/* Entry Confirmation Rules */}
+      <div className="settings-section">
+        <h3 style={{ color: 'var(--accent-green, #22c55e)' }}>Entry Confirmation Rules (Intraday Filters)</h3>
+        <p>Fine-tune the intraday hurdle requirements for placing buy orders on pre-scanned candidates.</p>
+
+        <div className="setting-row">
+          <div className="setting-info">
+            <div className="setting-label">Intraday MACD Histogram Turning Check</div>
+            <div className="setting-desc">
+              Require 15-min MACD histogram to be positive or turning upward.
+              (Turn OFF / set to false to avoid blocking candidates during healthy intraday pullbacks).
+            </div>
+          </div>
+          <label className="toggle" id="toggle-entry-macd">
+            <input
+              type="checkbox"
+              checked={settings.entry_macd_check === 'true'}
+              onChange={(e) => save({ entry_macd_check: e.target.checked ? 'true' : 'false' })}
+              disabled={saving}
+            />
+            <span className="toggle-slider" />
+          </label>
+        </div>
+
+        <div className="setting-row">
+          <div className="setting-info">
+            <div className="setting-label">Require VWAP Reclaim</div>
+            <div className="setting-desc">Require current stock price to be strictly above today's VWAP before entry.</div>
+          </div>
+          <label className="toggle" id="toggle-entry-vwap">
+            <input
+              type="checkbox"
+              checked={settings.entry_vwap_required === 'true'}
+              onChange={(e) => save({ entry_vwap_required: e.target.checked ? 'true' : 'false' })}
+              disabled={saving}
+            />
+            <span className="toggle-slider" />
+          </label>
+        </div>
+
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+            gap: 12,
+            marginTop: 16,
+          }}
+        >
+          <div style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 12, padding: '14px 16px' }}>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+              Min Relative Vol (x)
+            </div>
+            <div style={{ marginTop: 6 }}>
+              <input
+                type="number"
+                step="0.1"
+                min="0.1"
+                max="5.0"
+                value={settings.entry_min_rel_vol ?? '0.4'}
+                onChange={(e) => setSettings({...settings, entry_min_rel_vol: e.target.value})}
+                onBlur={(e) => save({ entry_min_rel_vol: e.target.value })}
+                disabled={saving}
+                style={{ background: 'var(--bg-card)', border: '1px solid var(--border-bright)', color: 'var(--text-primary)', padding: '4px 8px', borderRadius: 6, fontSize: 16, fontWeight: 700, width: '90px', outline: 'none' }}
+              />
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>Lower threshold allows buying pullbacks on lighter volume</div>
+          </div>
+
+          <div style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 12, padding: '14px 16px' }}>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+              RSI Range (Min – Max)
+            </div>
+            <div style={{ marginTop: 6, display: 'flex', gap: 6, alignItems: 'center' }}>
+              <input
+                type="number"
+                min="10"
+                max="90"
+                value={settings.entry_rsi_min ?? '30'}
+                onChange={(e) => setSettings({...settings, entry_rsi_min: e.target.value})}
+                onBlur={(e) => save({ entry_rsi_min: e.target.value })}
+                disabled={saving}
+                style={{ background: 'var(--bg-card)', border: '1px solid var(--border-bright)', color: 'var(--text-primary)', padding: '4px 8px', borderRadius: 6, fontSize: 16, fontWeight: 700, width: '65px', outline: 'none' }}
+              />
+              <span style={{ color: 'var(--text-muted)' }}>–</span>
+              <input
+                type="number"
+                min="10"
+                max="90"
+                value={settings.entry_rsi_max ?? '70'}
+                onChange={(e) => setSettings({...settings, entry_rsi_max: e.target.value})}
+                onBlur={(e) => save({ entry_rsi_max: e.target.value })}
+                disabled={saving}
+                style={{ background: 'var(--bg-card)', border: '1px solid var(--border-bright)', color: 'var(--text-primary)', padding: '4px 8px', borderRadius: 6, fontSize: 16, fontWeight: 700, width: '65px', outline: 'none' }}
+              />
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>Allowed intraday RSI window</div>
+          </div>
+
+          <div style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 12, padding: '14px 16px' }}>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+              Max Pullback % (20d SMA)
+            </div>
+            <div style={{ marginTop: 6 }}>
+              <input
+                type="number"
+                step="0.5"
+                min="1.0"
+                max="15.0"
+                value={settings.entry_pullback_max_pct ?? '5.0'}
+                onChange={(e) => setSettings({...settings, entry_pullback_max_pct: e.target.value})}
+                onBlur={(e) => save({ entry_pullback_max_pct: e.target.value })}
+                disabled={saving}
+                style={{ background: 'var(--bg-card)', border: '1px solid var(--border-bright)', color: 'var(--text-primary)', padding: '4px 8px', borderRadius: 6, fontSize: 16, fontWeight: 700, width: '90px', outline: 'none' }}
+              />
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>Max % price can be above 20-day SMA</div>
+          </div>
+
+          <div style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 12, padding: '14px 16px' }}>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+              Min ADX Threshold
+            </div>
+            <div style={{ marginTop: 6 }}>
+              <input
+                type="number"
+                min="5"
+                max="50"
+                value={settings.entry_adx_min ?? '15'}
+                onChange={(e) => setSettings({...settings, entry_adx_min: e.target.value})}
+                onBlur={(e) => save({ entry_adx_min: e.target.value })}
+                disabled={saving}
+                style={{ background: 'var(--bg-card)', border: '1px solid var(--border-bright)', color: 'var(--text-primary)', padding: '4px 8px', borderRadius: 6, fontSize: 16, fontWeight: 700, width: '90px', outline: 'none' }}
+              />
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>Trend strength minimum threshold</div>
+          </div>
         </div>
       </div>
 

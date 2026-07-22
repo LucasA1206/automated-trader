@@ -45,12 +45,13 @@ ENTRY_END_HOUR = 15
 ENTRY_END_MINUTE = 30
 
 # Intraday confirmation thresholds per blueprint Section 8
-RSI_ENTRY_MIN = 40
-RSI_ENTRY_MAX = 55
-ADX_MIN = 20
-PULLBACK_ZONE_MAX_PCT = 3.0    # Price ≤ 3% above 20-day SMA
-VWAP_RECLAIM_REQUIRED = True
-MIN_REL_VOL_INTRADAY = 1.2    # Intraday volume must be on pace for 1.2× avg
+# Loosened default thresholds for intraday entry confirmation
+RSI_ENTRY_MIN = 30
+RSI_ENTRY_MAX = 70
+ADX_MIN = 15
+PULLBACK_ZONE_MAX_PCT = 5.0    # Price ≤ 5% above 20-day SMA
+VWAP_RECLAIM_REQUIRED = False
+MIN_REL_VOL_INTRADAY = 0.4    # Intraday volume threshold (0.4x)
 LIMIT_ORDER_PREMIUM_PCT = 0.1  # Place limit 0.1% above current ask (ensure fill)
 
 
@@ -64,7 +65,7 @@ def is_within_entry_window() -> bool:
     return after_start and before_end
 
 
-def check_entry_confirmation(candidate: dict) -> tuple[bool, str, Optional[float]]:
+def check_entry_confirmation(candidate: dict, db=None, ignore_time_gate: bool = False) -> tuple[bool, str, Optional[float]]:
     """
     Apply intraday entry confirmation rules to a pre-scanned candidate.
 
@@ -76,8 +77,34 @@ def check_entry_confirmation(candidate: dict) -> tuple[bool, str, Optional[float
     """
     ticker = candidate.get("ticker", "UNKNOWN")
 
+    # ── Fetch thresholds from DB if available ─────────────────────────
+    macd_check_enabled = False
+    min_rel_vol = MIN_REL_VOL_INTRADAY
+    rsi_min = RSI_ENTRY_MIN
+    rsi_max = RSI_ENTRY_MAX
+    pullback_max_pct = PULLBACK_ZONE_MAX_PCT
+    vwap_required = VWAP_RECLAIM_REQUIRED
+    adx_min = ADX_MIN
+
+    try:
+        from database import SessionLocal, get_setting
+        _db = db or SessionLocal()
+        try:
+            macd_check_enabled = get_setting(_db, "entry_macd_check", "false").lower() == "true"
+            min_rel_vol = float(get_setting(_db, "entry_min_rel_vol", str(MIN_REL_VOL_INTRADAY)))
+            rsi_min = float(get_setting(_db, "entry_rsi_min", str(RSI_ENTRY_MIN)))
+            rsi_max = float(get_setting(_db, "entry_rsi_max", str(RSI_ENTRY_MAX)))
+            pullback_max_pct = float(get_setting(_db, "entry_pullback_max_pct", str(PULLBACK_ZONE_MAX_PCT)))
+            vwap_required = get_setting(_db, "entry_vwap_required", "false").lower() == "true"
+            adx_min = float(get_setting(_db, "entry_adx_min", str(ADX_MIN)))
+        finally:
+            if db is None:
+                _db.close()
+    except Exception as exc:
+        logger.warning("[Entry] Failed to load DB settings for entry confirmation, using defaults: %s", exc)
+
     # ── Rule 0: Time gate ────────────────────────────────────────────────────
-    if not is_within_entry_window():
+    if not ignore_time_gate and not is_within_entry_window():
         return False, "outside_entry_window", None
 
     # ── Fetch fresh intraday data ────────────────────────────────────────────
@@ -95,51 +122,49 @@ def check_entry_confirmation(candidate: dict) -> tuple[bool, str, Optional[float
         return False, "sma_20_unavailable", None
 
     pct_above_sma = ((current_price - sma_20) / sma_20) * 100
-    if pct_above_sma > PULLBACK_ZONE_MAX_PCT:
+    if pct_above_sma > pullback_max_pct:
         return False, (
             f"price_extended: {pct_above_sma:.2f}% above 20d SMA "
-            f"(limit: {PULLBACK_ZONE_MAX_PCT}%)"
+            f"(limit: {pullback_max_pct}%)"
         ), None
 
-    # ── Rule 2: RSI 40–55 ─────────────────────────────────────────────────────
+    # ── Rule 2: RSI zone ──────────────────────────────────────────────────────
     rsi = _compute_rsi(closes, 14)
     if rsi is None:
         return False, "rsi_unavailable", None
-    if not (RSI_ENTRY_MIN <= rsi <= RSI_ENTRY_MAX):
-        return False, f"rsi_outside_zone: RSI={rsi:.1f} (target {RSI_ENTRY_MIN}-{RSI_ENTRY_MAX})", None
+    if not (rsi_min <= rsi <= rsi_max):
+        return False, f"rsi_outside_zone: RSI={rsi:.1f} (target {rsi_min}-{rsi_max})", None
 
-    # ── Rule 3: MACD histogram turning upward ────────────────────────────────
+    # ── Rule 3: MACD histogram check (optional/loosened) ──────────────────────
     macd_hist = _compute_macd_histogram(closes)
     if macd_hist is None:
         return False, "macd_unavailable", None
 
-    # Check if MACD is recovering (positive or rising from negative)
-    prev_macd = _compute_macd_histogram(closes.iloc[:-1]) if len(closes) >= 27 else None
-    macd_ok = macd_hist > 0 or (prev_macd is not None and macd_hist > prev_macd)
-    if not macd_ok:
-        return False, f"macd_not_turning: histogram={macd_hist:.4f} (falling negative)", None
+    if macd_check_enabled:
+        prev_macd = _compute_macd_histogram(closes.iloc[:-1]) if len(closes) >= 27 else None
+        macd_ok = macd_hist > 0 or (prev_macd is not None and macd_hist > prev_macd)
+        if not macd_ok:
+            return False, f"macd_not_turning: histogram={macd_hist:.4f} (falling negative)", None
 
-    # ── Rule 4: ADX ≥ 20 ─────────────────────────────────────────────────────
+    # ── Rule 4: ADX threshold ────────────────────────────────────────────────
     adx = _compute_adx(df, 14)
     if adx is None:
         logger.warning("[Entry] %s: ADX unavailable — allowing entry (fail-open for ADX only)", ticker)
-    elif adx < ADX_MIN:
-        return False, f"adx_weak: ADX={adx:.1f} < {ADX_MIN}", None
+    elif adx < adx_min:
+        return False, f"adx_weak: ADX={adx:.1f} < {adx_min}", None
 
     # ── Rule 5: VWAP reclaim ─────────────────────────────────────────────────
-    if VWAP_RECLAIM_REQUIRED:
+    if vwap_required:
         vwap = estimate_vwap(ticker)
         if vwap is not None and current_price < vwap:
             return False, f"below_vwap: price ${current_price:.4f} < VWAP ${vwap:.4f}", None
 
     # ── Rule 6: Volume confirmation ───────────────────────────────────────────
-    # Use daily relative volume as proxy (intraday volume data not always available)
     rel_vol = candidate.get("rel_vol")
-    if rel_vol is not None and rel_vol < MIN_REL_VOL_INTRADAY:
-        return False, f"low_rel_vol: {rel_vol:.2f}x < {MIN_REL_VOL_INTRADAY}x required", None
+    if rel_vol is not None and rel_vol < min_rel_vol:
+        return False, f"low_rel_vol: {rel_vol:.2f}x < {min_rel_vol}x required", None
 
     # ── All rules passed — compute limit order price ──────────────────────────
-    # Set limit 0.1% above current price to ensure fill
     limit_price = round(current_price * (1 + LIMIT_ORDER_PREMIUM_PCT / 100), 4)
 
     logger.info(
@@ -157,6 +182,8 @@ def prepare_entry_order(
     account_equity: float,
     open_positions: list,
     risk_engine,
+    db=None,
+    ignore_time_gate: bool = False,
 ) -> Optional[dict]:
     """
     Full entry preparation: check confirmation, compute position size and stops,
@@ -175,7 +202,7 @@ def prepare_entry_order(
     confidence = candidate.get("confidence_score", 80)
 
     # ── Intraday entry confirmation ───────────────────────────────────────────
-    eligible, reason, limit_price = check_entry_confirmation(candidate)
+    eligible, reason, limit_price = check_entry_confirmation(candidate, db=db, ignore_time_gate=ignore_time_gate)
     if not eligible:
         logger.info("[Entry] %s blocked by entry confirmation: %s", ticker, reason)
         return None

@@ -544,6 +544,27 @@ export default function AIAnalysisTab({ authFetch }: { authFetch: AuthFetch }) {
   const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null);
   const [filterStatus, setFilterStatus] = useState<'all' | 'approved' | 'rejected' | 'not_sent_to_ai'>('all');
   const [expandedDays, setExpandedDays] = useState<Set<string>>(new Set());
+  const [runningBuyRound, setRunningBuyRound] = useState(false);
+  const [buyRoundMsg, setBuyRoundMsg] = useState('');
+
+  const triggerBuyRound = async () => {
+    setRunningBuyRound(true);
+    setBuyRoundMsg('');
+    try {
+      const res = await authFetch('/api/entry-monitor?force=true', { method: 'POST' });
+      const data = await res.json();
+      if (res.ok) {
+        setBuyRoundMsg(`⚡ ${data.message || 'Buy round completed.'} (${data.placed || 0} placed)`);
+      } else {
+        setBuyRoundMsg(`❌ ${data.detail || 'Buy round failed'}`);
+      }
+    } catch {
+      setBuyRoundMsg('❌ Network error');
+    } finally {
+      setRunningBuyRound(false);
+      setTimeout(() => setBuyRoundMsg(''), 6000);
+    }
+  };
 
   const fetchData = useCallback(async () => {
     try {
@@ -581,29 +602,44 @@ export default function AIAnalysisTab({ authFetch }: { authFetch: AuthFetch }) {
   const hasDays = (data?.days?.length ?? 0) > 0;
 
   return (
-    <div>
+    <div style={{ maxWidth: 1100, margin: '0 auto' }}>
       {/* ── Header ─────────────────────────────────────────────────────── */}
-      <div className="page-header">
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <div>
-            <h2>AI Analysis</h2>
-            <p>
-              Full breakdown of every stock the AI evaluated — metrics, decision & rationale
-              {lastRefreshed && ` · Refreshed ${lastRefreshed.toLocaleTimeString()}`}
-            </p>
-          </div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button
-              className="btn btn-outline btn-icon"
-              onClick={fetchData}
-              title="Refresh"
-              id="btn-refresh-analysis"
-            >
-              🔄
-            </button>
-          </div>
+      <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 16 }}>
+        <div>
+          <h2>AI Stock Analysis</h2>
+          <p>
+            Complete historical log of daily stock screening and AI verdicts
+            {lastRefreshed && ` · Refreshed ${lastRefreshed.toLocaleTimeString()}`}
+          </p>
+        </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button
+            className="btn btn-primary"
+            onClick={triggerBuyRound}
+            disabled={runningBuyRound}
+            style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', fontSize: 13 }}
+          >
+            {runningBuyRound ? '⏳ Running...' : '⚡ Run Buy Round'}
+          </button>
+          <button
+            className="btn btn-outline btn-icon"
+            onClick={fetchData}
+            title="Refresh"
+            id="btn-refresh-analysis"
+          >
+            🔄
+          </button>
         </div>
       </div>
+
+      {buyRoundMsg && (
+        <div style={{
+          padding: '10px 16px', borderRadius: 8, marginBottom: 16, fontSize: 13, fontWeight: 600,
+          background: 'var(--bg-card)', border: '1px solid var(--border-bright)', color: 'var(--text-primary)'
+        }}>
+          {buyRoundMsg}
+        </div>
+      )}
 
       {/* ── Filter pills ───────────────────────────────────────────────── */}
       {!loading && hasDays && (
