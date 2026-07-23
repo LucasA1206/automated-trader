@@ -31,7 +31,7 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
     trading_mode: 'paper',
     paper_strategy: 'cash',
     daily_budget_pct: '100',
-    max_positions: '5',
+    max_positions: '8',
     scan_enabled: 'true',
     trader_enabled: 'true',
     account_type: 'trading_cash',

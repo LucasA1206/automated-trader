@@ -113,7 +113,7 @@ def init_db():
             "account_type": "trading_cash",    # trading_cash | investment_cash
             "paper_strategy": "cash",          # cash | margin comparison preset
             "daily_budget_pct": "100",         # % of available cash per daily cycle
-            "max_positions": "4",              # max concurrent positions (blueprint: 4)
+            "max_positions": "8",              # max concurrent positions (updated to 8)
             "scan_enabled": "true",            # pause/resume auto scanning
             "trader_enabled": "true",          # Master switch
             "margin_upgrade_alerted": "false",

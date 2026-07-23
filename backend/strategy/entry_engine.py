@@ -35,6 +35,7 @@ from typing import Optional
 from strategy.data_layer import fetch_ohlcv, estimate_vwap
 from strategy.scoring_engine import _compute_rsi, _compute_macd_histogram, _compute_adx
 from strategy.exit_engine import compute_initial_stop, compute_partial_target
+from strategy.risk_engine import DEFAULT_RISK_PER_TRADE_PCT
 
 logger = logging.getLogger(__name__)
 
@@ -223,7 +224,7 @@ def prepare_entry_order(
         account_equity=account_equity,
         entry_price=limit_price,
         stop_price=stop_price,
-        risk_pct=1.0,
+        risk_pct=DEFAULT_RISK_PER_TRADE_PCT,
         confidence=confidence,
         classification=classification,
     )

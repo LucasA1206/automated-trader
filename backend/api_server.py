@@ -186,7 +186,7 @@ class SettingsBulkUpdate(BaseModel):
 def _sync_strategy_settings(db: Session, account_type: str) -> None:
     """Keep derived strategy settings aligned with the selected strategy preset."""
     set_setting(db, "daily_budget_pct", "100")
-    set_setting(db, "max_positions", "5")
+    set_setting(db, "max_positions", "8")
 
 
 def _normalize_account_type(value: str | None) -> str:
@@ -680,7 +680,7 @@ def get_settings(db: Session = Depends(get_db)):
     if "daily_budget_pct" not in settings:
         settings["daily_budget_pct"] = "100"
     if "max_positions" not in settings:
-        settings["max_positions"] = "5"
+        settings["max_positions"] = "8"
     return settings
 
 
