@@ -30,8 +30,8 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # ─── Hard limits from blueprint Section 7/10 ─────────────────────────────────
-MAX_POSITIONS = 4
-MAX_PORTFOLIO_HEAT_PCT = 4.0      # Total % of equity at risk across all stops
+MAX_POSITIONS = 8
+MAX_PORTFOLIO_HEAT_PCT = 10.0     # Total % of equity at risk across all stops
 MAX_DAILY_LOSS_PCT = 2.0          # Halt new entries if daily loss exceeds this
 MAX_WEEKLY_LOSS_PCT = 6.0         # Halt all new entries for the week
 DRAWDOWN_WARN_PCT = 10.0          # Soft limit: halt new entries, log alert
@@ -40,8 +40,8 @@ MAX_SINGLE_POSITION_PCT = 25.0    # Max % of equity in any one position
 MAX_SECTOR_POSITIONS = 2          # Max concurrent positions in the same sector
 
 # Position sizing: 1× ATR below entry = hard stop
-# Risk per trade: 1% of account equity (for standard sizing)
-DEFAULT_RISK_PER_TRADE_PCT = 1.0  # % of account equity risked per trade
+# Risk per trade: 2.5% of account equity (increased from 1.0%)
+DEFAULT_RISK_PER_TRADE_PCT = 2.5  # % of account equity risked per trade
 
 
 class RiskEngine:
