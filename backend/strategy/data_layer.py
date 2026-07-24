@@ -158,6 +158,12 @@ _FINNHUB_ICB_TO_GICS: dict[str, str] = {
     "Semiconductors":           "Technology",
     "Software":                 "Technology",
     "Internet Software/Services": "Technology",
+    "Technology":               "Technology",
+    "IT Services":              "Technology",
+    "Software—Infrastructure":  "Technology",
+    "Software—Application":     "Technology",
+    "Semiconductors & Semiconductor Equipment": "Technology",
+
     # ── Healthcare ──────────────────────────────────────────────────────────
     "Health Technology":        "Healthcare",
     "Health Services":          "Healthcare",
@@ -166,24 +172,36 @@ _FINNHUB_ICB_TO_GICS: dict[str, str] = {
     "Pharmaceuticals":          "Healthcare",
     "Medical Supplies":         "Healthcare",
     "Hospital/Nursing Management": "Healthcare",
+    "Biotechnology & Medical Research": "Healthcare",
+    "Medical Devices":          "Healthcare",
+
     # ── Financials ──────────────────────────────────────────────────────────
     "Finance":                  "Financials",
     "Banks":                    "Financials",
+    "Banking":                  "Financials",
     "Insurance":                "Financials",
     "Investment Banks/Brokers": "Financials",
     "Savings Banks":            "Financials",
     "Investment Trusts/Mutual Funds": "Financials",
     "Financial Conglomerates":  "Financials",
+    "Financial Services":       "Financials",
+
     # ── Consumer Discretionary / Cyclical ───────────────────────────────────
     "Consumer Durables":        "Consumer Cyclical",
     "Retail Trade":             "Consumer Cyclical",
+    "Retail":                   "Consumer Cyclical",
     "Distribution Services":    "Consumer Cyclical",
     "Consumer Services":        "Consumer Cyclical",
+    "Consumer products":        "Consumer Cyclical",
     "Textiles, Apparel & Luxury Goods": "Consumer Cyclical",
     "Automobiles":              "Consumer Cyclical",
     "Hotels & Entertainment Services": "Consumer Cyclical",
+    "Hotels, Restaurants & Leisure": "Consumer Cyclical",
     "Movies/Entertainment":     "Consumer Cyclical",
     "Media":                    "Consumer Cyclical",
+    "Restaurants":              "Consumer Cyclical",
+    "Specialty Retail":         "Consumer Cyclical",
+
     # ── Consumer Defensive / Staples ────────────────────────────────────────
     "Consumer Non-Durables":    "Consumer Defensive",
     "Food Retailing":           "Consumer Defensive",
@@ -191,6 +209,9 @@ _FINNHUB_ICB_TO_GICS: dict[str, str] = {
     "Tobacco":                  "Consumer Defensive",
     "Beverages: Non-Alcoholic": "Consumer Defensive",
     "Beverages: Alcoholic":     "Consumer Defensive",
+    "Consumer Staples":         "Consumer Defensive",
+    "Personal Products":        "Consumer Defensive",
+
     # ── Industrials ─────────────────────────────────────────────────────────
     "Commercial Services":      "Industrials",
     "Commercial Services & Supplies": "Industrials",
@@ -203,6 +224,8 @@ _FINNHUB_ICB_TO_GICS: dict[str, str] = {
     "Air Freight/Couriers":     "Industrials",
     "Railroads":                "Industrials",
     "Trucking":                 "Industrials",
+    "Building Products":        "Industrials",
+
     # ── Basic Materials ─────────────────────────────────────────────────────
     "Process Industries":       "Basic Materials",
     "Non-Energy Minerals":      "Basic Materials",
@@ -211,16 +234,20 @@ _FINNHUB_ICB_TO_GICS: dict[str, str] = {
     "Chemicals":                "Basic Materials",
     "Containers/Packaging":     "Basic Materials",
     "Paper/Forest Products":    "Basic Materials",
+
     # ── Energy ──────────────────────────────────────────────────────────────
     "Energy Minerals":          "Energy",
     "Energy Services":          "Energy",
     "Oil & Gas Production":     "Energy",
     "Oil Refining/Marketing":   "Energy",
+    "Oil, Gas & Consumable Fuels": "Energy",
+
     # ── Utilities ───────────────────────────────────────────────────────────
     "Utilities":                "Utilities",
     "Electric Utilities":       "Utilities",
     "Gas Distributors":         "Utilities",
     "Water Utilities":          "Utilities",
+
     # ── Communication Services ──────────────────────────────────────────────
     "Communications":           "Communication Services",
     "Wireless Telecommunications": "Communication Services",
@@ -233,6 +260,51 @@ _FINNHUB_ICB_TO_GICS: dict[str, str] = {
     "Miscellaneous":            "",
     "Government":               "",
 }
+
+
+def resolve_gics_sector(raw_str: str) -> str:
+    """Map raw industry/sector string (Finnhub or yfinance) to GICS sector name."""
+    if not raw_str or raw_str == "Unknown":
+        return "Unknown"
+
+    if raw_str in _FINNHUB_ICB_TO_GICS:
+        mapped = _FINNHUB_ICB_TO_GICS[raw_str]
+        if mapped:
+            return mapped
+
+    GICS_SECTORS = {
+        "Technology", "Healthcare", "Financials", "Consumer Cyclical",
+        "Consumer Defensive", "Industrials", "Basic Materials", "Energy",
+        "Utilities", "Communication Services", "Real Estate"
+    }
+    if raw_str in GICS_SECTORS:
+        return raw_str
+
+    s_lower = raw_str.lower()
+    if any(k in s_lower for k in ["bank", "finan", "insur", "broker", "invest", "trust"]):
+        return "Financials"
+    if any(k in s_lower for k in ["tech", "softw", "semiconduct", "hardware", "internet"]):
+        return "Technology"
+    if any(k in s_lower for k in ["health", "bio", "pharm", "medic", "hospital"]):
+        return "Healthcare"
+    if any(k in s_lower for k in ["food retailing", "food distributor", "tobacco", "beverage", "consumer non-durable", "consumer staple"]):
+        return "Consumer Defensive"
+    if any(k in s_lower for k in ["retail", "consumer", "durable", "apparel", "auto", "hotel", "restaurant", "leisure", "entertainment", "luxury"]):
+        return "Consumer Cyclical"
+    if any(k in s_lower for k in ["industr", "commercial", "transport", "aerospace", "defense", "construction", "freight", "trucking", "railroad"]):
+        return "Industrials"
+    if any(k in s_lower for k in ["metal", "min", "chem", "steel", "material", "packaging"]):
+        return "Basic Materials"
+    if any(k in s_lower for k in ["energy", "oil", "gas"]):
+        return "Energy"
+    if any(k in s_lower for k in ["utilit", "electric", "water"]):
+        return "Utilities"
+    if any(k in s_lower for k in ["real estate", "reit"]):
+        return "Real Estate"
+    if any(k in s_lower for k in ["communicat", "telecom", "media", "broadcast"]):
+        return "Communication Services"
+
+    return "Unknown"
 
 
 # ─── Retry helper ─────────────────────────────────────────────────────────────
@@ -620,10 +692,8 @@ def fetch_fundamentals(ticker: str) -> Optional[dict]:
 
     # ── Sector: translate Finnhub ICB label → GICS name for sector ETF lookup ─
     icb_industry = profile.get("finnhubIndustry") or "Unknown"
-    gics_sector  = _FINNHUB_ICB_TO_GICS.get(icb_industry, "")  # empty string = unmapped
-    if not gics_sector:
-        # Unmapped industry — leave sector unknown so score_sector_rs falls back
-        # to its neutral score rather than looking up a non-existent ETF.
+    gics_sector  = resolve_gics_sector(icb_industry)
+    if not gics_sector or gics_sector == "Unknown":
         gics_sector = "Unknown"
         data_gaps.append("sector_rs")  # flag so scoring engine can log it
 

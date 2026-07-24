@@ -173,6 +173,12 @@ def check_exit_conditions(
 
     # ── 1. Hard stop-loss ────────────────────────────────────────────────────
     effective_stop = stop or (entry * 0.95)  # Fallback: 5% stop if not set
+
+    # Compute fallback targets if missing on legacy/auto-registered trades
+    if not partial_target and entry > 0 and effective_stop > 0 and entry > effective_stop:
+        partial_target = compute_partial_target(entry, effective_stop)
+    if not atr_entry and entry > 0 and effective_stop > 0 and entry > effective_stop:
+        atr_entry = (entry - effective_stop) / 1.75
     if current_price <= effective_stop:
         return ExitSignal(
             action="full_exit",
