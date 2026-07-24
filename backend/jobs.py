@@ -129,13 +129,26 @@ def _get_open_positions_with_sectors(db) -> list[dict]:
     """Return open trades as list of dicts including sector for risk engine."""
     trades = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
     result = []
+    from strategy.data_layer import fetch_fundamentals, resolve_gics_sector
     for t in trades:
+        sector = getattr(t, "sector", None)
+        if not sector or sector == "Unknown":
+            try:
+                fund = fetch_fundamentals(t.ticker) or {}
+                raw_sec = fund.get("sector")
+                raw_ind = fund.get("industry")
+                sector = resolve_gics_sector(raw_sec if raw_sec and raw_sec != "Unknown" else raw_ind)
+                if sector and sector != "Unknown":
+                    t.sector = sector
+                    db.commit()
+            except Exception:
+                sector = "Unknown"
         result.append({
             "ticker": t.ticker,
             "shares": t.shares,
             "buy_price": t.buy_price,
             "stop_price": t.stop_price,
-            "sector": getattr(t, "sector", "Unknown") or "Unknown",
+            "sector": sector or "Unknown",
             "status": t.status,
         })
     return result
@@ -155,13 +168,16 @@ def _reconcile_stale_db_trades(db, live_tickers: set[str]) -> None:
 
 
 def _sync_untracked_ibkr_positions(db, live_positions: list[dict], trading_mode: str) -> None:
-    """Ensure every live IBKR position has a matching DB trade record."""
+    """Ensure every live IBKR position has a matching DB trade record with sector & stop targets."""
     open_tickers = set(
         t.ticker for t in db.query(Trade).filter(
             Trade.status.in_(["open", "sold_half", "closing"]),
             Trade.mode == trading_mode,
         ).all()
     )
+    from strategy.data_layer import fetch_fundamentals, resolve_gics_sector
+    from strategy.exit_engine import compute_partial_target
+
     for pos in live_positions:
         ticker = pos["ticker"]
         if ticker in open_tickers:
@@ -170,6 +186,15 @@ def _sync_untracked_ibkr_positions(db, live_positions: list[dict], trading_mode:
         shares = pos.get("shares", 0)
         if shares == 0:
             continue
+
+        fund = fetch_fundamentals(ticker) or {}
+        raw_sec = fund.get("sector")
+        raw_ind = fund.get("industry")
+        sector = resolve_gics_sector(raw_sec if raw_sec and raw_sec != "Unknown" else raw_ind)
+
+        stop_price = round(avg_cost * 0.95, 4) if avg_cost else None
+        partial_target = compute_partial_target(avg_cost, stop_price) if avg_cost and stop_price else None
+
         ghost_trade = Trade(
             ticker=ticker,
             shares=shares,
@@ -180,14 +205,15 @@ def _sync_untracked_ibkr_positions(db, live_positions: list[dict], trading_mode:
             fees=0.0,
             realised_partial_pnl=0.0,
             ai_reason="[Auto-registered: position found in IBKR but missing from DB]",
-            # Conservative safety stop at 5% below avg cost
-            stop_price=round(avg_cost * 0.95, 4) if avg_cost else None,
+            sector=sector or "Unknown",
+            stop_price=stop_price,
+            partial_target_price=partial_target,
         )
         db.add(ghost_trade)
         db.commit()
         log_event(db, "system",
                   f"⚠️ Untracked IBKR position detected: {ticker} "
-                  f"({shares} shares @ avg ${avg_cost:.2f}). DB record created.")
+                  f"({shares} shares @ avg ${avg_cost:.2f}, sector={sector}). DB record created.")
 
 
 def _get_peak_equity(db) -> float:

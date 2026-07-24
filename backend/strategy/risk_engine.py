@@ -216,16 +216,17 @@ class RiskEngine:
                 )
 
         # ── Gate 7: Sector concentration ─────────────────────────────────────
-        same_sector_count = sum(
-            1 for p in open_positions
-            if p.get("sector", "Unknown") == sector and
-               p.get("status") in ("open", "sold_half")
-        )
-        if same_sector_count >= MAX_SECTOR_POSITIONS:
-            return False, (
-                f"sector_cap: already {same_sector_count} positions in sector '{sector}' "
-                f"(max {MAX_SECTOR_POSITIONS})"
+        if sector and sector != "Unknown":
+            same_sector_count = sum(
+                1 for p in open_positions
+                if p.get("sector") == sector and
+                   p.get("status") in ("open", "sold_half")
             )
+            if same_sector_count >= MAX_SECTOR_POSITIONS:
+                return False, (
+                    f"sector_cap: already {same_sector_count} positions in sector '{sector}' "
+                    f"(max {MAX_SECTOR_POSITIONS})"
+                )
 
         # ── Gate 8: Single position size cap ─────────────────────────────────
         position_value = proposed_shares * entry_price
