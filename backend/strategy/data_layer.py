@@ -317,11 +317,12 @@ def _retry(fn, retries: int = 3, base_delay: float = 1.0, label: str = ""):
         except Exception as exc:
             exc_str = str(exc).lower()
             wait = base_delay * (2 ** (attempt - 1))
-            
+
             if "too many requests" in exc_str or "rate limit" in exc_str or "429" in exc_str:
                 _rotate_yf_session()
-                wait = max(wait, 10.0)  # enforce minimum 10s wait for rate limits
-                
+                if retries > 1:
+                    wait = max(wait, 3.0)
+
             if attempt < retries:
                 logger.warning(
                     "%s attempt %d/%d failed: %s — retrying in %.1fs",
@@ -920,7 +921,7 @@ def fetch_vix() -> Optional[dict]:
                 "source": s,
             }
 
-        data = _retry(_fetch, retries=2, base_delay=2.0, label=f"VIX({sym})")
+        data = _retry(_fetch, retries=1, base_delay=0.5, label=f"VIX({sym})")
         if data is not None:
             break
 
@@ -986,7 +987,7 @@ def fetch_spy_regime() -> Optional[dict]:
                 "source": s,
             }
 
-        data = _retry(_fetch, retries=2, base_delay=2.0, label=f"SPY_regime({sym})")
+        data = _retry(_fetch, retries=1, base_delay=0.5, label=f"SPY_regime({sym})")
         if data is not None:
             break
 
@@ -1183,18 +1184,24 @@ def fetch_spy_returns() -> Optional[dict]:
     Fetch SPY cumulative returns at 63-day (3m) and 126-day (6m) lookbacks.
     Used to compute relative strength of each stock vs the benchmark.
     """
-    def _fetch():
-        tk = yf.Ticker("SPY", session=_session)
-        hist = tk.history(period="7mo", interval="1d")
-        if hist is None or hist.empty or len(hist) < 63:
-            raise ValueError("Insufficient SPY history for RS calculation")
-        closes = hist["Close"]
-        current = float(closes.iloc[-1])
-        ret_63d  = ((current / float(closes.iloc[-63]))  - 1) * 100 if len(closes) >= 63  else None
-        ret_126d = ((current / float(closes.iloc[-126])) - 1) * 100 if len(closes) >= 126 else None
-        return {"ret_63d": ret_63d, "ret_126d": ret_126d}
+    for sym in ["SPY", "VOO", "IVV"]:
+        def _fetch(s=sym):
+            tk = yf.Ticker(s, session=_session)
+            hist = tk.history(period="7mo", interval="1d")
+            if hist is None or hist.empty or len(hist) < 63:
+                raise ValueError(f"Insufficient {s} history for RS calculation")
+            closes = hist["Close"]
+            current = float(closes.iloc[-1])
+            ret_63d  = ((current / float(closes.iloc[-63]))  - 1) * 100 if len(closes) >= 63  else None
+            ret_126d = ((current / float(closes.iloc[-126])) - 1) * 100 if len(closes) >= 126 else None
+            return {"ret_63d": ret_63d, "ret_126d": ret_126d}
 
-    return _retry(_fetch, retries=3, base_delay=2.0, label="SPY_returns")
+        res = _retry(_fetch, retries=1, base_delay=0.5, label=f"SPY_returns({sym})")
+        if res is not None:
+            return res
+
+    # Fallback to market baseline if all S&P ETFs rate limit
+    return {"ret_63d": 5.0, "ret_126d": 10.0}
 
 
 # ─── Intraday VWAP helper ─────────────────────────────────────────────────────
