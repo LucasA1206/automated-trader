@@ -906,13 +906,17 @@ def fetch_vix() -> Optional[dict]:
         def _fetch(s=sym):
             tk = yf.Ticker(s, session=_session)
             hist = tk.history(period="5d", interval="1d")
-            if hist is None or hist.empty or len(hist) < 2:
+            if hist is None or hist.empty:
                 raise ValueError(f"Insufficient {s} history")
-            closes = hist["Close"]
+            closes = hist["Close"].dropna()
+            if len(closes) < 2:
+                raise ValueError(f"Insufficient valid {s} price history")
             current = float(closes.iloc[-1])
             prev_1d = float(closes.iloc[-2]) if len(closes) >= 2 else current
             prev_3d = float(closes.iloc[-4]) if len(closes) >= 4 else prev_1d
             spike_3d = ((current - prev_3d) / prev_3d * 100) if prev_3d > 0 else 0.0
+            if math.isnan(current) or math.isnan(spike_3d):
+                raise ValueError(f"NaN value detected in {s} VIX data")
             return {
                 "current": round(current, 2),
                 "prev_1d": round(prev_1d, 2),
@@ -969,14 +973,18 @@ def fetch_spy_regime() -> Optional[dict]:
         def _fetch(s=sym):
             tk = yf.Ticker(s, session=_session)
             hist = tk.history(period="1y", interval="1d")
-            if hist is None or hist.empty or len(hist) < 50:
+            if hist is None or hist.empty:
                 raise ValueError(f"Insufficient {s} history")
-            closes = hist["Close"]
+            closes = hist["Close"].dropna()
+            if len(closes) < 50:
+                raise ValueError(f"Insufficient valid {s} history")
             sma_50  = float(closes.rolling(50).mean().iloc[-1])
             sma_200 = float(closes.rolling(200).mean().iloc[-1]) if len(closes) >= 200 else None
             current = float(closes.iloc[-1])
-            prev    = float(closes.iloc[-2])
+            prev    = float(closes.iloc[-2]) if len(closes) >= 2 else current
             day_return_pct = ((current - prev) / prev * 100) if prev > 0 else 0.0
+            if math.isnan(current) or math.isnan(day_return_pct):
+                raise ValueError(f"NaN value detected in {s} price history")
             return {
                 "price": round(current, 2),
                 "sma_50": round(sma_50, 2),
@@ -1188,9 +1196,11 @@ def fetch_spy_returns() -> Optional[dict]:
         def _fetch(s=sym):
             tk = yf.Ticker(s, session=_session)
             hist = tk.history(period="7mo", interval="1d")
-            if hist is None or hist.empty or len(hist) < 63:
+            if hist is None or hist.empty:
                 raise ValueError(f"Insufficient {s} history for RS calculation")
-            closes = hist["Close"]
+            closes = hist["Close"].dropna()
+            if len(closes) < 63:
+                raise ValueError(f"Insufficient valid {s} history for RS calculation")
             current = float(closes.iloc[-1])
             ret_63d  = ((current / float(closes.iloc[-63]))  - 1) * 100 if len(closes) >= 63  else None
             ret_126d = ((current / float(closes.iloc[-126])) - 1) * 100 if len(closes) >= 126 else None
