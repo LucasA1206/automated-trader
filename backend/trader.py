@@ -638,6 +638,8 @@ class IBKRClient:
             logger.info("LIMIT BUY filled: %s x %d @ $%.2f", ticker, shares, fill_price)
             return {
                 "success": True,
+                "filled": True,
+                "status": "Filled",
                 "ticker": ticker,
                 "shares": shares,
                 "price": round(fill_price, 4),
@@ -649,6 +651,145 @@ class IBKRClient:
         except Exception as exc:
             logger.error("place_limit_buy_order failed for %s: %s", ticker, exc)
             return {"success": False, "ticker": ticker, "error": str(exc)}
+
+    def place_limit_buy_with_stop_order(
+        self, ticker: str, shares: int, limit_price: float, stop_price: float
+    ) -> dict:
+        """
+        Places a parent DAY limit buy order with an attached child GTC stop-loss order.
+
+        Using parentId links the stop order to the limit buy order at IBKR:
+        - The stop order remains inactive (PreSubmitted) at IBKR until the limit buy fills.
+        - If the limit buy is cancelled or expires unfilled, IBKR automatically
+          cancels the child stop order.
+        - This guarantees the stop order CAN NEVER execute independently and short
+          the stock if the limit buy never fills.
+        """
+        try:
+            if not self.ib.isConnected():
+                self.connect()
+
+            limit_price = round_to_tick(limit_price)
+            stop_price = round_to_tick(stop_price)
+
+            contract = Stock(ticker, "SMART", "USD")
+            self.ib.qualifyContracts(contract)
+
+            # Track Warning 110 (price variation)
+            warning_110 = [False]
+
+            def _on_error(reqId, errorCode, errorString, contract):
+                if errorCode == 110:
+                    warning_110[0] = True
+
+            self.ib.errorEvent += _on_error
+
+            parent = LimitOrder("BUY", shares, limit_price)
+            parent.tif = "DAY"
+            parent.orderId = self.ib.client.getReqId()
+            parent.transmit = False
+
+            stop_loss = StopOrder("SELL", shares, stop_price)
+            stop_loss.tif = "GTC"
+            stop_loss.orderId = self.ib.client.getReqId()
+            stop_loss.parentId = parent.orderId
+            stop_loss.transmit = True
+
+            logger.info(
+                "Placing parent LIMIT BUY (%s x %d @ $%.2f) + child STOP SELL ($%.2f)",
+                ticker, shares, limit_price, stop_price,
+            )
+
+            parent_trade = self.ib.placeOrder(contract, parent)
+            stop_trade   = self.ib.placeOrder(contract, stop_loss)
+
+            # Wait up to 30 s to catch immediate fill or rejection
+            filled = False
+            terminal_statuses = {"Cancelled", "Inactive"}
+            for _ in range(60):  # 60 × 0.5 s = 30 s
+                self.ib.sleep(0.5)
+                status = parent_trade.orderStatus.status
+                if status == "Filled":
+                    filled = True
+                    break
+                if status in terminal_statuses or warning_110[0]:
+                    break
+
+            self.ib.errorEvent -= _on_error
+
+            if warning_110[0]:
+                try:
+                    self.ib.cancelOrder(parent)
+                    self.ib.sleep(1.0)
+                except Exception:
+                    pass
+                return {
+                    "success": False,
+                    "ticker": ticker,
+                    "error": f"IBKR rejected limit price ${limit_price:.2f} (Warning 110). Order cancelled.",
+                }
+
+            if not filled:
+                if parent_trade.fills:
+                    filled = True
+                else:
+                    status = parent_trade.orderStatus.status
+                    if status in terminal_statuses:
+                        try:
+                            self.ib.cancelOrder(parent)
+                            self.ib.sleep(1.0)
+                        except Exception:
+                            pass
+                        return {
+                            "success": False,
+                            "ticker": ticker,
+                            "error": f"Limit order rejected immediately (status: {status}).",
+                        }
+                    # Still working (Submitted / PreSubmitted)
+                    logger.info(
+                        "LIMIT BUY for %s working after 30 s (status=%s) with child stop order linked.",
+                        ticker, status,
+                    )
+                    return {
+                        "success": True,
+                        "filled": False,
+                        "status": status,
+                        "ticker": ticker,
+                        "shares": shares,
+                        "price": round(limit_price, 2),
+                        "fees": 0.0,
+                        "total_cost": round(limit_price * shares, 2),
+                        "order_id": str(parent_trade.order.orderId),
+                        "stop_order_id": str(stop_trade.order.orderId),
+                    }
+
+            fill_price = limit_price
+            fees = 0.0
+            if parent_trade.fills:
+                fill_price = safe_float(parent_trade.fills[-1].execution.price)
+                fees = sum(
+                    safe_float(f.commissionReport.commission)
+                    for f in parent_trade.fills
+                    if getattr(f, "commissionReport", None) and getattr(f.commissionReport, "commission", None) is not None
+                )
+
+            logger.info("LIMIT BUY filled: %s x %d @ $%.2f", ticker, shares, fill_price)
+            return {
+                "success": True,
+                "filled": True,
+                "status": "Filled",
+                "ticker": ticker,
+                "shares": shares,
+                "price": round(fill_price, 4),
+                "fees": round(fees, 4),
+                "total_cost": round(fill_price * shares, 2),
+                "order_id": str(parent_trade.order.orderId),
+                "stop_order_id": str(stop_trade.order.orderId),
+            }
+        except Exception as exc:
+            logger.error("place_limit_buy_with_stop_order failed for %s: %s", ticker, exc)
+            return {"success": False, "ticker": ticker, "error": str(exc)}
+
 
     def place_stop_order(self, ticker: str, shares: int, stop_price: float) -> dict:
         """
