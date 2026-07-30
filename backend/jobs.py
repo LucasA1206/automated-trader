@@ -169,22 +169,55 @@ def _reconcile_stale_db_trades(db, live_tickers: set[str]) -> None:
 
 def _sync_untracked_ibkr_positions(db, live_positions: list[dict], trading_mode: str) -> None:
     """Ensure every live IBKR position has a matching DB trade record with sector & stop targets."""
-    open_tickers = set(
-        t.ticker for t in db.query(Trade).filter(
-            Trade.status.in_(["open", "sold_half", "closing"]),
-            Trade.mode == trading_mode,
-        ).all()
-    )
+    open_trades = db.query(Trade).filter(
+        Trade.status.in_(["open", "sold_half", "closing", "pending_entry"]),
+        Trade.mode == trading_mode,
+    ).all()
+    open_tickers = {t.ticker for t in open_trades}
+    pending_trades_by_ticker = {t.ticker: t for t in open_trades if t.status == "pending_entry"}
+
     from strategy.data_layer import fetch_fundamentals, resolve_gics_sector
     from strategy.exit_engine import compute_partial_target
 
     for pos in live_positions:
         ticker = pos["ticker"]
-        if ticker in open_tickers:
-            continue
         avg_cost = pos.get("avg_cost") or pos.get("current_price", 0)
         shares = pos.get("shares", 0)
+
+        # Handle pending_entry transition when order fills in IBKR
+        if ticker in pending_trades_by_ticker and shares > 0:
+            pending_trade = pending_trades_by_ticker[ticker]
+            pending_trade.status = "open"
+            pending_trade.shares = shares
+            if avg_cost > 0:
+                pending_trade.buy_price = avg_cost
+            db.commit()
+            log_event(
+                db, "buy",
+                f"✅ Pending limit order for {ticker} filled in IBKR! Position updated to open ({shares} shares @ ${avg_cost:.2f})."
+            )
+            continue
+
+        if ticker in open_tickers:
+            continue
+
         if shares == 0:
+            continue
+
+        # Short position guard: if an untracked position is short (shares < 0), log CRITICAL and auto-cover
+        if shares < 0:
+            log_event(
+                db, "sell",
+                f"⚠️ CRITICAL: Untracked SHORT position detected in IBKR: {ticker} ({shares} shares). "
+                f"Closing short position immediately via buy-to-cover.",
+                "ERROR"
+            )
+            try:
+                from trader import IBKRClient
+                c = IBKRClient(trading_mode=trading_mode)
+                c.place_buy_to_cover_order(ticker, abs(shares))
+            except Exception as e:
+                logger.error("Failed to auto-cover untracked short position %s: %s", ticker, e)
             continue
 
         fund = fetch_fundamentals(ticker) or {}
@@ -781,7 +814,7 @@ def job_entry_monitor():
             # Skip if already have a trade for this ticker today
             existing = db.query(Trade).filter(
                 Trade.ticker == ticker,
-                Trade.status.in_(["open", "sold_half", "closing"]),
+                Trade.status.in_(["open", "sold_half", "closing", "pending_entry"]),
             ).first()
             if existing:
                 continue
@@ -805,12 +838,12 @@ def job_entry_monitor():
             sector      = order_info["sector"]
 
             log_event(db, "buy",
-                      f"🟢 {ticker}: placing limit order — "
+                      f"🟢 {ticker}: placing bracketed limit buy order — "
                       f"{shares} shares @ ${limit_price:.2f} (limit) | "
                       f"stop=${stop_price:.2f} | 1.5R=${partial_target:.4f}")
 
-            # Place limit buy order
-            result = client.place_limit_buy_order(ticker, shares, limit_price)
+            # Place parent limit buy order with attached child stop order
+            result = client.place_limit_buy_with_stop_order(ticker, shares, limit_price, stop_price)
 
             if not result.get("success"):
                 log_event(db, "buy",
@@ -821,16 +854,11 @@ def job_entry_monitor():
                                            if c.get("ticker") != ticker]
                 continue
 
-            fill_price = result.get("price", limit_price)
-            order_id   = result.get("order_id", "")
-
-            # Place native stop order at IBKR
-            stop_result = client.place_stop_order(ticker, shares, stop_price)
-            stop_order_id = stop_result.get("order_id") if stop_result.get("success") else None
-            if not stop_result.get("success"):
-                log_event(db, "buy",
-                          f"⚠️ {ticker}: stop order placement failed — {stop_result.get('error')}. "
-                          f"Software monitor will act as fallback.", "WARNING")
+            fill_price    = result.get("price", limit_price)
+            order_id      = result.get("order_id", "")
+            stop_order_id = result.get("stop_order_id", "")
+            is_filled     = result.get("filled", False)
+            trade_status  = "open" if is_filled else "pending_entry"
 
             # Record trade in DB
             trade = Trade(
@@ -838,7 +866,7 @@ def job_entry_monitor():
                 shares=shares,
                 buy_price=fill_price,
                 buy_time=datetime.now(timezone.utc),
-                status="open",
+                status=trade_status,
                 mode=trading_mode,
                 order_id=str(order_id),
                 ai_reason=candidate.get("entry_notes", ""),
@@ -852,6 +880,15 @@ def job_entry_monitor():
             )
             db.add(trade)
             db.commit()
+
+            if is_filled:
+                log_event(db, "buy",
+                          f"✅ {ticker}: {shares} shares bought @ ${fill_price:.2f} | "
+                          f"stop=${stop_price:.2f} | 1.5R target=${partial_target:.4f}")
+            else:
+                log_event(db, "buy",
+                          f"⏳ {ticker}: limit order working @ ${limit_price:.2f} (stop=${stop_price:.2f} attached) | "
+                          f"order submitted to IBKR, pending fill.")
 
             # Journal the entry event
             from strategy.journal import log_trade_event
@@ -1232,7 +1269,7 @@ def job_manual_entry_monitor(force: bool = False) -> dict:
 
             existing = db.query(Trade).filter(
                 Trade.ticker == ticker,
-                Trade.status.in_(["open", "sold_half", "closing"]),
+                Trade.status.in_(["open", "sold_half", "closing", "pending_entry"]),
             ).first()
             if existing:
                 results.append({
@@ -1267,11 +1304,11 @@ def job_manual_entry_monitor(force: bool = False) -> dict:
             sector      = order_info["sector"]
 
             log_event(db, "buy",
-                      f"🟢 [Manual Entry] {ticker}: placing limit order — "
+                      f"🟢 [Manual Entry] {ticker}: placing bracketed limit buy order — "
                       f"{shares} shares @ ${limit_price:.2f} (limit) | "
                       f"stop=${stop_price:.2f} | 1.5R=${partial_target:.4f}")
 
-            result = client.place_limit_buy_order(ticker, shares, limit_price)
+            result = client.place_limit_buy_with_stop_order(ticker, shares, limit_price, stop_price)
 
             if not result.get("success"):
                 err_msg = result.get("error", "Unknown error")
@@ -1285,18 +1322,18 @@ def job_manual_entry_monitor(force: bool = False) -> dict:
                     _pending_candidates = [c for c in _pending_candidates if c.get("ticker") != ticker]
                 continue
 
-            fill_price = result.get("price", limit_price)
-            order_id   = result.get("order_id", "")
-
-            stop_result = client.place_stop_order(ticker, shares, stop_price)
-            stop_order_id = stop_result.get("order_id") if stop_result.get("success") else None
+            fill_price    = result.get("price", limit_price)
+            order_id      = result.get("order_id", "")
+            stop_order_id = result.get("stop_order_id", "")
+            is_filled     = result.get("filled", False)
+            trade_status  = "open" if is_filled else "pending_entry"
 
             trade = Trade(
                 ticker=ticker,
                 shares=shares,
                 buy_price=fill_price,
                 buy_time=datetime.now(timezone.utc),
-                status="open",
+                status=trade_status,
                 mode=trading_mode,
                 order_id=str(order_id),
                 ai_reason=candidate.get("entry_notes", ""),
@@ -1310,6 +1347,15 @@ def job_manual_entry_monitor(force: bool = False) -> dict:
             )
             db.add(trade)
             db.commit()
+
+            if is_filled:
+                log_event(db, "buy",
+                          f"✅ {ticker}: {shares} shares bought @ ${fill_price:.2f} | "
+                          f"stop=${stop_price:.2f} | 1.5R target=${partial_target:.4f}")
+            else:
+                log_event(db, "buy",
+                          f"⏳ {ticker}: limit order working @ ${limit_price:.2f} (stop=${stop_price:.2f} attached) | "
+                          f"order submitted to IBKR, pending fill.")
 
             from strategy.journal import log_trade_event
             log_trade_event(
