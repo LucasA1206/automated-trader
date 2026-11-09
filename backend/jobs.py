@@ -472,14 +472,14 @@ def job_pre_market_scan():
         log_event(db, "scan",
                   f"📊 Regime: {regime.upper()} | {regime_data['details']}")
 
-        if regime == "risk_off":
+        if regime in ("risk_off", "unavailable", "unknown") or not regime_data.get("is_valid", True):
             log_event(db, "scan",
-                      f"🛑 Market is RISK_OFF — no new entries today. "
+                      f"🛑 Market is {regime.upper()} — no new entries today. "
                       f"({regime_data['details']})")
             from strategy.journal import log_no_trade_day, log_scan_result
-            log_no_trade_day(db, "risk_off", regime_data["details"])
+            log_no_trade_day(db, regime, regime_data["details"])
             log_scan_result(db, scan_date, regime, regime_data["details"], 0, 0, 0,
-                            "regime_off", [], {})
+                            "regime_off" if regime == "risk_off" else "no_trade", [], {})
             return
 
         # ── Step 2: Universe ─────────────────────────────────────────────────
@@ -565,10 +565,54 @@ def job_pre_market_scan():
                             "no_trade", [], dict(list(rejections.items())[:50]))
             return
 
-        # ── Step 4: Score ─────────────────────────────────────────────────────
+        # ── Step 4: Market State, Tiers & Score ──────────────────────────────
+        from strategy.market_state import get_latest_breadth, check_gap_down_veto, classify_market_tier
+        from strategy.config import get_system_config
+        cfg = get_system_config(db)
+
+        # Gap veto check (using SPY open and prior close if available)
+        spy_open = regime_data.get("spy_open") or regime_data.get("spy_price")
+        spy_pc = regime_data.get("spy_prior_close") or (
+            regime_data.get("spy_price") / (1.0 + (regime_data.get("spy_day_return_pct", 0.0) / 100.0))
+            if regime_data.get("spy_price") else None
+        )
+        gap_veto = check_gap_down_veto(
+            spy_open=spy_open,
+            spy_prior_close=spy_pc,
+            threshold_pct=cfg.get("gap_down_threshold_pct", 0.7),
+            mode=cfg.get("gate_gap_down_veto", "shadow")
+        )
+        log_event(db, "scan", f"📉 Gap-down veto: {gap_veto['reason']}")
+
+        # Market exposure tier
+        breadth_data = get_latest_breadth()
+        tier_data = classify_market_tier(
+            regime_data=regime_data,
+            breadth_data=breadth_data,
+            gap_veto_data=gap_veto,
+            config=cfg,
+        )
+        log_event(db, "scan", f"🏛️ Market Exposure: {tier_data['summary']}")
+
+        if tier_data["is_tier_c"] and cfg.get("gate_exposure_tiers") == "enforce":
+            log_event(db, "scan", f"🛑 Tier C (enforce) active — halting all new entries today.")
+            from strategy.journal import log_no_trade_day, log_scan_result
+            log_no_trade_day(db, "tier_c_enforced", tier_data["summary"])
+            log_scan_result(db, scan_date, "tier_c", tier_data["summary"], 0, 0, 0, "tier_c_halt", [], {})
+            return
+
         from strategy.data_layer import fetch_sector_etf_returns
         from strategy.scoring_engine import score_all_candidates, compute_confidence_score, SCORE_HIGH_CONVICTION, SCORE_MARGINAL, WEIGHTS, MAX_POSITIVE_WEIGHT
+        from strategy.market_state import rank_sectors_by_leadership, check_sector_leadership, calculate_beta_scalar
         sector_returns = fetch_sector_etf_returns()
+        sector_leadership = rank_sectors_by_leadership(
+            sector_3m_returns=sector_returns,
+            sector_1m_returns=sector_returns,
+            spy_3m_return=0.0,
+            spy_1m_return=0.0,
+        )
+        log_event(db, "scan", f"🏆 Sector Leaders (top 6): {', '.join(sector_leadership['leaders'])}")
+
         open_positions = _get_open_positions_with_sectors(db)
 
         if _scan_cancel_event.is_set():
@@ -659,6 +703,26 @@ def job_pre_market_scan():
             ticker = verdict["ticker"]
             scored = score_by_ticker.get(ticker, {})
             staged = {**scored, **verdict}  # scored metrics + AI verdict
+            # Attach market tier and sizing multiplier from Phase 2
+            staged["tier"] = tier_data["tier"]
+            staged["size_multiplier"] = tier_data["effective_size_multiplier"]
+            staged["hypothetical_size_multiplier"] = tier_data["hypothetical_size_multiplier"]
+            staged["tier_score_bump"] = tier_data["effective_score_bump"]
+
+            # Sector leadership gate (Phase 3)
+            sec = scored.get("sector", "Unknown")
+            sec_check = check_sector_leadership(sec, sector_leadership, mode=cfg.get("gate_sector_leadership", "shadow"))
+            staged["sector_gate_allowed"] = sec_check["allowed"]
+            staged["sector_rank"] = sec_check.get("rank", 0)
+            staged["sector_is_leader"] = sec_check.get("is_leader", True)
+
+            # Beta sizing scalar (Phase 3)
+            ticker_beta = scored.get("beta")
+            b_scalar = calculate_beta_scalar(ticker_beta, mode=cfg.get("sizing_beta_aware", "shadow"))
+            staged["beta"] = ticker_beta
+            staged["beta_scalar"] = b_scalar["effective_scalar"]
+            staged["hypothetical_beta_scalar"] = b_scalar["hypothetical_scalar"]
+
             # Compute final confidence score
             staged["confidence_score"] = compute_confidence_score(
                 composite_score=scored.get("composite_score", 0),
@@ -668,6 +732,28 @@ def job_pre_market_scan():
                 filter_margin=0.5,
             )
             staged_candidates.append(staged)
+
+        # Earnings Season Density check (Phase 4)
+        from strategy.market_state import compute_earnings_season_density, check_market_linked_exit_trigger
+        earnings_density = compute_earnings_season_density(
+            candidates=staged_candidates,
+            threshold_pct=25.0,
+            factor=0.75,
+            mode=cfg.get("gate_earnings_density", "shadow"),
+        )
+        if earnings_density["caution_active"]:
+            log_event(db, "scan", f"⚠️ Earnings Season Density ({cfg.get('gate_earnings_density', 'shadow')}): {earnings_density['reason']}")
+            # Apply sizing multiplier
+            for sc in staged_candidates:
+                sc["size_multiplier"] = round(sc["size_multiplier"] * earnings_density["effective_size_multiplier"], 2)
+                sc["hypothetical_size_multiplier"] = round(sc["hypothetical_size_multiplier"] * earnings_density["hypothetical_size_multiplier"], 2)
+
+        # Filter candidates if sector gate is enforce
+        if cfg.get("gate_sector_leadership") == "enforce":
+            before_len = len(staged_candidates)
+            staged_candidates = [c for c in staged_candidates if c.get("sector_gate_allowed", True)]
+            if len(staged_candidates) < before_len:
+                log_event(db, "scan", f"⛔ Sector gate (enforce) filtered out {before_len - len(staged_candidates)} laggard candidates.")
 
         # ── Step 7: Persist AIPick records for UI ─────────────────────────────
         for rank, candidate in enumerate(staged_candidates, 1):
@@ -804,7 +890,22 @@ def job_entry_monitor():
 
         from strategy.risk_engine import get_risk_engine
         from strategy.entry_engine import prepare_entry_order
+        from strategy.market_state import check_spy_intraday_confirmation
+        from strategy.config import get_system_config
         risk_engine = get_risk_engine()
+        cfg = get_system_config(db)
+
+        # SPY Intraday Confirmation Gate (Phase 3)
+        spy_confirm = check_spy_intraday_confirmation(
+            ib_client=client,
+            mode=cfg.get("gate_intraday_confirmation", "shadow"),
+        )
+        log_event(db, "scan", f"⚡ SPY Intraday Confirmation: {spy_confirm['details']}")
+
+        if not spy_confirm["confirmed"]:
+            log_event(db, "scan", f"🛑 Intraday confirmation gate active (enforce) — halting entries this cycle.", "WARNING")
+            client.disconnect()
+            return
 
         placed_this_cycle = 0
 
@@ -837,9 +938,11 @@ def job_entry_monitor():
             atr_abs     = order_info["atr_abs"]
             sector      = order_info["sector"]
 
+            tier_tag = candidate.get("tier", "A")
+            mult_val = candidate.get("size_multiplier", 1.0)
             log_event(db, "buy",
                       f"🟢 {ticker}: placing bracketed limit buy order — "
-                      f"{shares} shares @ ${limit_price:.2f} (limit) | "
+                      f"{shares} shares (Tier {tier_tag}, {mult_val:.1f}x) @ ${limit_price:.2f} (limit) | "
                       f"stop=${stop_price:.2f} | 1.5R=${partial_target:.4f}")
 
             # Place parent limit buy order with attached child stop order
@@ -860,7 +963,12 @@ def job_entry_monitor():
             is_filled     = result.get("filled", False)
             trade_status  = "open" if is_filled else "pending_entry"
 
-            # Record trade in DB
+            # Record trade in DB with Phase 5 Alpha & Confirmation tracking
+            from strategy.market_state import get_latest_breadth
+            breadth_info = get_latest_breadth()
+            b_pct = breadth_info.get("breadth_pct") if breadth_info else None
+            spy_px = spy_confirm.get("spy_price")
+
             trade = Trade(
                 ticker=ticker,
                 shares=shares,
@@ -877,6 +985,13 @@ def job_entry_monitor():
                 atr_at_entry=atr_abs,
                 entry_composite_score=candidate.get("composite_score"),
                 sector=sector,
+                # Phase 5 logging fields
+                spy_price_at_entry=spy_px,
+                beta_at_entry=candidate.get("beta"),
+                market_tier_at_entry=candidate.get("tier", "A"),
+                intraday_confirmed_at_entry=spy_confirm.get("would_confirm", True),
+                breadth_at_entry=b_pct,
+                sector_rank_at_entry=candidate.get("sector_rank"),
             )
             db.add(trade)
             db.commit()
@@ -983,6 +1098,17 @@ def job_exit_monitor():
 
         from strategy.exit_engine import check_exit_conditions
         from strategy.journal import log_trade_event
+        from strategy.market_state import check_market_linked_exit_trigger
+        from strategy.config import get_system_config
+        from strategy.data_layer import fetch_ohlcv
+        cfg = get_system_config(db)
+
+        # Market-linked exit condition check (Phase 4)
+        spy_hist = fetch_ohlcv("SPY", period="60d")
+        market_exit_check = check_market_linked_exit_trigger(spy_hist)
+        exit_market_mode = cfg.get("exit_market_linked", "shadow")
+        if market_exit_check["trigger"]:
+            log_event(db, "risk", f"📉 Market-linked exit alert ({exit_market_mode}): {'; '.join(market_exit_check['reasons'])}")
 
         for trade in open_trades:
             ticker = trade.ticker
@@ -1007,6 +1133,24 @@ def job_exit_monitor():
                 live_shares=live_shares,
                 account_equity=account_equity,
             )
+
+            # Market-linked stop tightening (Phase 4):
+            # If SPY broke 50 SMA or 10-day low, tighten stop to min(current_stop, current_price - 1.0 * ATR)
+            # NEVER loosen an existing stop: candidate_tightened = current_price - (1.0 * atr)
+            # new_stop = max(current_stop, candidate_tightened)
+            if market_exit_check["trigger"] and trade.atr_at_entry and trade.atr_at_entry > 0:
+                proposed_stop = current_price - (1.0 * trade.atr_at_entry)
+                current_active_stop = trade.stop_price or 0.0
+                if proposed_stop > current_active_stop:
+                    if exit_market_mode == "enforce":
+                        trade.stop_price = proposed_stop
+                        db.commit()
+                        if trade.stop_order_id:
+                            client.modify_stop_order(ticker, trade.stop_order_id, proposed_stop, live_shares)
+                        log_event(db, "sell", f"🛡️ {ticker}: market-linked stop tightened from ${current_active_stop:.2f} to ${proposed_stop:.2f} [enforce]")
+                        log_trade_event(db, trade.id, "stop_update", f"Market-linked stop tightened to ${proposed_stop:.2f}", stop_price=proposed_stop)
+                    else:
+                        log_event(db, "sell", f"👻 {ticker}: market-linked stop would tighten from ${current_active_stop:.2f} to ${proposed_stop:.2f} [shadow]")
 
             # ── Trail update (no sell, just update stop price) ────────────────
             if signal.action == "hold" and signal.reason == "trail_update" and signal.new_stop_price:
@@ -1088,6 +1232,25 @@ def job_exit_monitor():
                     trade.pnl        = round(total_pnl, 2)
                     trade.pnl_pct    = round(pnl_pct, 2)
                     trade.fees       = round((trade.fees or 0.0) + result.get("fees", 0.0), 4)
+
+                    # Compute SPY return and Alpha (Phase 5)
+                    try:
+                        spy_exit_px = market_exit_check.get("current_close")
+                        if not spy_exit_px and spy_hist is not None and not spy_hist.empty:
+                            spy_exit_px = float(spy_hist["Close"].iloc[-1])
+                        trade.spy_price_at_exit = spy_exit_px
+
+                        if trade.spy_price_at_entry and spy_exit_px and trade.spy_price_at_entry > 0:
+                            s_ret = ((spy_exit_px - trade.spy_price_at_entry) / trade.spy_price_at_entry) * 100.0
+                            trade.spy_return_pct = round(s_ret, 2)
+                            b_val = trade.beta_at_entry if trade.beta_at_entry is not None else 1.0
+                            exp_ret = b_val * s_ret
+                            trade.expected_return_pct = round(exp_ret, 2)
+                            alpha = pnl_pct - exp_ret
+                            trade.alpha_pct = round(alpha, 2)
+                    except Exception as exc:
+                        logger.debug("[ExitMonitor] Could not calculate alpha for %s: %s", ticker, exc)
+
                     db.commit()
 
                     emoji = "🟢" if total_pnl >= 0 else "🔴"
@@ -1260,7 +1423,22 @@ def job_manual_entry_monitor(force: bool = False) -> dict:
 
         from strategy.risk_engine import get_risk_engine
         from strategy.entry_engine import prepare_entry_order
+        from strategy.market_state import check_spy_intraday_confirmation
+        from strategy.config import get_system_config
         risk_engine = get_risk_engine()
+        cfg = get_system_config(db)
+
+        # SPY Intraday Confirmation Gate (Phase 3)
+        spy_confirm = check_spy_intraday_confirmation(
+            ib_client=client,
+            mode=cfg.get("gate_intraday_confirmation", "shadow"),
+        )
+        log_event(db, "scan", f"⚡ SPY Intraday Confirmation: {spy_confirm['details']}")
+
+        if not spy_confirm["confirmed"]:
+            log_event(db, "scan", f"🛑 Intraday confirmation gate active (enforce) — halting entries this cycle.", "WARNING")
+            client.disconnect()
+            return
 
         placed_this_cycle = 0
 

@@ -53,6 +53,19 @@ class Trade(Base):
     # Sector at entry (for risk engine sector-cap gate)
     sector = Column(String(50), nullable=True)
 
+    # ── Phase 5 Alpha & Confirmation Logging ─────────────────────────────────
+    spy_price_at_entry = Column(Float, nullable=True)
+    spy_price_at_exit = Column(Float, nullable=True)
+    beta_at_entry = Column(Float, nullable=True)
+    market_tier_at_entry = Column(String(10), nullable=True)
+    intraday_confirmed_at_entry = Column(Boolean, nullable=True)
+    breadth_at_entry = Column(Float, nullable=True)
+    vix_at_entry = Column(Float, nullable=True)
+    sector_rank_at_entry = Column(Integer, nullable=True)
+    spy_return_pct = Column(Float, nullable=True)
+    expected_return_pct = Column(Float, nullable=True)
+    alpha_pct = Column(Float, nullable=True)
+
     def __repr__(self):
         return f"<Trade id={self.id} ticker={self.ticker} status={self.status}>"
 
@@ -173,3 +186,27 @@ class AccountSnapshot(Base):
 
     def __repr__(self):
         return f"<AccountSnapshot date={self.date} net_liq_usd={self.net_liq_usd}>"
+
+
+class ShadowEvaluation(Base):
+    """
+    Tracks hypothetical trade outcomes for gates operating in shadow mode.
+    Allows comparing what WOULD have happened if gates were enforced vs baseline.
+    """
+    __tablename__ = "shadow_evaluations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    trade_id = Column(Integer, nullable=True, index=True)
+    ticker = Column(String(10), nullable=False, index=True)
+    gate_name = Column(String(50), nullable=False)   # e.g. gap_veto, intraday_confirm, sector_gate, tier_b
+    mode = Column(String(20), default="shadow", nullable=False)
+    would_have_blocked = Column(Boolean, default=False, nullable=False)
+    actual_pnl = Column(Float, nullable=True)
+    actual_pnl_pct = Column(Float, nullable=True)
+    hypothetical_pnl = Column(Float, nullable=True)  # e.g. $0 if blocked
+    hypothetical_pnl_pct = Column(Float, nullable=True)
+    details = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    def __repr__(self):
+        return f"<ShadowEvaluation {self.ticker} gate={self.gate_name} would_block={self.would_have_blocked}>"

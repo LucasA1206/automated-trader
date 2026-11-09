@@ -879,6 +879,44 @@ def is_near_earnings(ticker: str, trading_days_buffer: int = 3) -> bool:
     return 0 <= delta <= calendar_buffer
 
 
+# ─── VIX & SPY Validation Helpers ─────────────────────────────────────────────
+
+def _is_valid_vix_dict(d: Optional[dict]) -> bool:
+    """Validate that VIX data dict contains all required fields with no NaNs."""
+    if not d or not isinstance(d, dict):
+        return False
+    required = ["current", "prev_1d", "prev_3d", "spike_3d_pct"]
+    for k in required:
+        v = d.get(k)
+        if v is None:
+            return False
+        if not isinstance(v, (int, float)) or math.isnan(v):
+            return False
+    if d["current"] <= 0:
+        return False
+    return True
+
+
+def _is_valid_spy_dict(d: Optional[dict]) -> bool:
+    """Validate that SPY regime dict contains all required fields with no NaNs."""
+    if not d or not isinstance(d, dict):
+        return False
+    required = ["price", "sma_50", "above_sma_200", "day_return_pct"]
+    for k in required:
+        v = d.get(k)
+        if v is None:
+            return False
+        if isinstance(v, (int, float)) and math.isnan(v):
+            return False
+    price = d.get("price")
+    if not isinstance(price, (int, float)) or price <= 0:
+        return False
+    sma_200 = d.get("sma_200")
+    if sma_200 is not None and (not isinstance(sma_200, (int, float)) or math.isnan(sma_200) or sma_200 <= 0):
+        return False
+    return True
+
+
 # ─── VIX ──────────────────────────────────────────────────────────────────────
 
 _last_known_spy_data: Optional[dict] = None
@@ -892,14 +930,15 @@ def fetch_vix() -> Optional[dict]:
       1. Primary: yfinance ^VIX
       2. Alternative proxies: VIXY, VXX
       3. Last known cached VIX data
-      4. Safe baseline fallback (VIX=18.0)
+    Returns None if all sources fail or data contains NaN (fail-safe).
     """
     global _last_known_vix_data
 
     with _cache_lock:
         cached = _vix_cache.get("vix")
     if cached and _is_cache_fresh(cached, ttl_minutes=_VIX_TTL_MINUTES):
-        return cached["data"]
+        if _is_valid_vix_dict(cached.get("data")):
+            return cached["data"]
 
     data = None
     for sym in ["^VIX", "VIXY", "VXX"]:
@@ -915,7 +954,7 @@ def fetch_vix() -> Optional[dict]:
             prev_1d = float(closes.iloc[-2]) if len(closes) >= 2 else current
             prev_3d = float(closes.iloc[-4]) if len(closes) >= 4 else prev_1d
             spike_3d = ((current - prev_3d) / prev_3d * 100) if prev_3d > 0 else 0.0
-            if math.isnan(current) or math.isnan(spike_3d):
+            if math.isnan(current) or math.isnan(spike_3d) or math.isnan(prev_1d) or math.isnan(prev_3d):
                 raise ValueError(f"NaN value detected in {s} VIX data")
             return {
                 "current": round(current, 2),
@@ -926,22 +965,24 @@ def fetch_vix() -> Optional[dict]:
             }
 
         data = _retry(_fetch, retries=1, base_delay=0.5, label=f"VIX({sym})")
-        if data is not None:
+        if data is not None and _is_valid_vix_dict(data):
             break
+        data = None
 
     if data is None and _last_known_vix_data is not None:
-        logger.warning("[DataLayer] Live VIX fetch failed — falling back to last known VIX data.")
-        data = dict(_last_known_vix_data)
+        if _is_valid_vix_dict(_last_known_vix_data):
+            logger.warning("[DataLayer] Live VIX fetch failed — falling back to last known VIX data.")
+            data = dict(_last_known_vix_data)
+        else:
+            logger.error("[DataLayer] Cached VIX data is invalid or contains NaN — rejecting cache.")
 
     if data is None:
-        logger.warning("[DataLayer] VIX completely unavailable — using safe baseline VIX=18.0.")
-        data = {
-            "current": 18.0,
-            "prev_1d": 18.0,
-            "prev_3d": 18.0,
-            "spike_3d_pct": 0.0,
-            "source": "baseline_fallback",
-        }
+        logger.error("[DataLayer] VIX data completely unavailable from all sources — fail-safe halt.")
+        return None
+
+    if not _is_valid_vix_dict(data):
+        logger.error("[DataLayer] VIX data validation failed (invalid or NaN) — cannot use data.")
+        return None
 
     _last_known_vix_data = data
     with _cache_lock:
@@ -959,13 +1000,15 @@ def fetch_spy_regime() -> Optional[dict]:
       2. Alternative S&P 500 ETFs: VOO, IVV
       3. Finnhub API real-time quote (symbol=SPY)
       4. Last known cached SPY data
+    Returns None if all sources fail or data contains NaN (fail-safe).
     """
     global _last_known_spy_data
 
     with _cache_lock:
         cached = _regime_cache.get("spy")
     if cached and _is_cache_fresh(cached, ttl_minutes=_REGIME_TTL_MINUTES):
-        return cached["data"]
+        if _is_valid_spy_dict(cached.get("data")):
+            return cached["data"]
 
     data = None
     # Tier 1 & 2: Try yfinance S&P 500 ETFs
@@ -982,11 +1025,19 @@ def fetch_spy_regime() -> Optional[dict]:
             sma_200 = float(closes.rolling(200).mean().iloc[-1]) if len(closes) >= 200 else None
             current = float(closes.iloc[-1])
             prev    = float(closes.iloc[-2]) if len(closes) >= 2 else current
+            opens   = hist["Open"].dropna() if "Open" in hist.columns else pd.Series()
+            open_px = float(opens.iloc[-1]) if len(opens) >= 1 else current
+            if math.isnan(open_px) or open_px <= 0:
+                open_px = current
             day_return_pct = ((current - prev) / prev * 100) if prev > 0 else 0.0
-            if math.isnan(current) or math.isnan(day_return_pct):
+            if math.isnan(current) or math.isnan(day_return_pct) or math.isnan(sma_50):
                 raise ValueError(f"NaN value detected in {s} price history")
+            if sma_200 is not None and math.isnan(sma_200):
+                raise ValueError(f"NaN value detected in {s} 200-day SMA")
             return {
                 "price": round(current, 2),
+                "open": round(open_px, 2),
+                "prior_close": round(prev, 2),
                 "sma_50": round(sma_50, 2),
                 "sma_200": round(sma_200, 2) if sma_200 else None,
                 "above_sma_200": (current > sma_200) if sma_200 else False,
@@ -996,8 +1047,9 @@ def fetch_spy_regime() -> Optional[dict]:
             }
 
         data = _retry(_fetch, retries=1, base_delay=0.5, label=f"SPY_regime({sym})")
-        if data is not None:
+        if data is not None and _is_valid_spy_dict(data):
             break
+        data = None
 
     # Tier 3: Finnhub API quote fallback
     if data is None:
@@ -1006,31 +1058,49 @@ def fetch_spy_regime() -> Optional[dict]:
             r = _session.get(f"https://finnhub.io/api/v1/quote?symbol=SPY&token={api_key}", timeout=10)
             if r.status_code == 200:
                 res = r.json()
-                c = res.get("c", 0)
-                pc = res.get("pc", 0)
-                if c > 0 and pc > 0:
-                    day_return_pct = ((c - pc) / pc * 100)
-                    last_sma_200 = _last_known_spy_data.get("sma_200") if _last_known_spy_data else (c * 0.93)
-                    data = {
-                        "price": round(c, 2),
-                        "sma_50": round(c, 2),
-                        "sma_200": round(last_sma_200, 2) if last_sma_200 else None,
-                        "above_sma_200": (c > last_sma_200) if last_sma_200 else True,
-                        "above_sma_50": True,
-                        "day_return_pct": round(day_return_pct, 2),
-                        "source": "finnhub_quote",
-                    }
-                    logger.info("[DataLayer] SPY yfinance rate limited — successfully retrieved SPY via Finnhub quote ($%.2f, %+.2f%%).", c, day_return_pct)
+                c = res.get("c")
+                pc = res.get("pc")
+                if c is not None and pc is not None:
+                    c = float(c)
+                    pc = float(pc)
+                    if c > 0 and pc > 0 and not math.isnan(c) and not math.isnan(pc):
+                        day_return_pct = ((c - pc) / pc * 100)
+                        if not math.isnan(day_return_pct):
+                            last_sma_200 = None
+                            if _last_known_spy_data and _is_valid_spy_dict(_last_known_spy_data):
+                                last_sma_200 = _last_known_spy_data.get("sma_200")
+                            o = float(res.get("o") or c)
+                            candidate_data = {
+                                "price": round(c, 2),
+                                "open": round(o, 2),
+                                "prior_close": round(pc, 2),
+                                "sma_50": round(c, 2),
+                                "sma_200": round(last_sma_200, 2) if last_sma_200 else None,
+                                "above_sma_200": (c > last_sma_200) if last_sma_200 else False,
+                                "above_sma_50": True,
+                                "day_return_pct": round(day_return_pct, 2),
+                                "source": "finnhub_quote",
+                            }
+                            if _is_valid_spy_dict(candidate_data):
+                                data = candidate_data
+                                logger.info("[DataLayer] SPY yfinance rate limited — successfully retrieved SPY via Finnhub quote ($%.2f, %+.2f%%).", c, day_return_pct)
         except Exception as exc:
             logger.debug("[DataLayer] Finnhub SPY quote fallback failed: %s", exc)
 
     # Tier 4: Last known SPY data fallback
     if data is None and _last_known_spy_data is not None:
-        logger.warning("[DataLayer] Live SPY regime fetch failed — falling back to last known SPY data.")
-        data = dict(_last_known_spy_data)
+        if _is_valid_spy_dict(_last_known_spy_data):
+            logger.warning("[DataLayer] Live SPY regime fetch failed — falling back to last known SPY data.")
+            data = dict(_last_known_spy_data)
+        else:
+            logger.error("[DataLayer] Cached SPY data is invalid or contains NaN — rejecting cache.")
 
     if data is None:
-        logger.error("[DataLayer] SPY data completely unavailable from all sources.")
+        logger.error("[DataLayer] SPY data completely unavailable from all sources — fail-safe halt.")
+        return None
+
+    if not _is_valid_spy_dict(data):
+        logger.error("[DataLayer] SPY data validation failed (invalid or NaN) — cannot use data.")
         return None
 
     _last_known_spy_data = data
@@ -1106,65 +1176,90 @@ def is_economic_blackout_day() -> bool:
 
 # ─── Compute regime status ────────────────────────────────────────────────────
 
-def compute_regime_status() -> Optional[dict]:
+def compute_regime_status(spy: Optional[dict] = None, vix: Optional[dict] = None) -> dict:
     """
     Compute the full market regime status per blueprint Section 6/10.
 
     Regime logic:
-      risk_off  → SPY below 200-day SMA OR VIX > 30 OR VIX spiked > 20% in 3 sessions
-      caution   → SPY near 200-day SMA (within 2%) OR VIX 25-30
-      risk_on   → SPY above 200-day SMA AND VIX < 25 AND no spike
+      risk_off    → SPY below 200-day SMA OR VIX > 30 OR VIX spiked > 20% in 3 sessions OR black swan
+      caution     → SPY near 200-day SMA (within 2%) OR VIX 25-30
+      risk_on     → SPY above 200-day SMA AND VIX < 25 AND no spike
+      unavailable → Any required input is missing, None, or NaN (FAIL SAFE: no new entries)
 
-    Returns None only if all primary, proxy, and fallback sources fail.
+    Returns a dict with regime status and detailed context. If data is invalid/missing,
+    regime is strictly set to 'unavailable' with is_valid=False to guarantee zero new entries.
     """
-    spy = fetch_spy_regime()
-    vix = fetch_vix()
-
-    if spy is None and vix is None:
-        logger.error("[DataLayer] Both SPY and VIX unavailable — regime check failed.")
-        return None
-
     if spy is None:
-        logger.warning("[DataLayer] SPY data unavailable — using neutral SPY status with VIX=%.1f.", vix["current"] if vix else 18.0)
-        spy = {
-            "price": 550.0,
-            "sma_50": 550.0,
-            "sma_200": 510.0,
-            "above_sma_200": True,
-            "above_sma_50": True,
-            "day_return_pct": 0.0,
-            "source": "fallback_neutral",
-        }
-
+        spy = fetch_spy_regime()
     if vix is None:
-        logger.warning("[DataLayer] VIX data unavailable — defaulting VIX=18.0.")
-        vix = {
-            "current": 18.0,
-            "prev_1d": 18.0,
-            "prev_3d": 18.0,
-            "spike_3d_pct": 0.0,
-            "source": "fallback_neutral",
+        vix = fetch_vix()
+
+    # ── Strict validation: fail safe on any missing, None, or NaN input ────────
+    if not _is_valid_spy_dict(spy) or not _is_valid_vix_dict(vix):
+        reasons = []
+        if not _is_valid_spy_dict(spy):
+            reasons.append("SPY data is missing, incomplete, or contains NaN")
+        if not _is_valid_vix_dict(vix):
+            reasons.append("VIX data is missing, incomplete, or contains NaN")
+        err_msg = "; ".join(reasons)
+        logger.error(
+            "[DataLayer] Regime check failed safe: %s. Defaulting to UNAVAILABLE (no new entries).",
+            err_msg
+        )
+        return {
+            "regime": "unavailable",
+            "is_valid": False,
+            "details": f"Regime data unavailable: {err_msg} — all new entries blocked (fail-safe)",
+            "spy_price": spy.get("price") if (spy and isinstance(spy.get("price"), (int, float)) and not math.isnan(spy.get("price"))) else None,
+            "spy_sma_200": spy.get("sma_200") if (spy and isinstance(spy.get("sma_200"), (int, float)) and not math.isnan(spy.get("sma_200"))) else None,
+            "spy_above_200": False,
+            "spy_day_return_pct": None,
+            "vix": vix.get("current") if (vix and isinstance(vix.get("current"), (int, float)) and not math.isnan(vix.get("current"))) else None,
+            "vix_spike_3d_pct": None,
+            "black_swan_day": False,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-    vix_current = vix["current"]
-    vix_spike_3d = vix["spike_3d_pct"]
-    spy_above_200 = spy.get("above_sma_200", False)
-    spy_day_return = spy.get("day_return_pct", 0)
+    vix_current = float(vix["current"])
+    vix_spike_3d = float(vix["spike_3d_pct"])
+    spy_above_200 = bool(spy.get("above_sma_200", False))
+    spy_day_return = float(spy.get("day_return_pct", 0.0))
+    spy_price = float(spy["price"])
+    spy_sma_200 = spy.get("sma_200")
+    if spy_sma_200 is not None:
+        spy_sma_200 = float(spy_sma_200)
+
+    # Double check no NaNs slipped through
+    if any(math.isnan(x) for x in [vix_current, vix_spike_3d, spy_day_return, spy_price] if x is not None):
+        logger.critical("[DataLayer] NaN detected in regime numeric values despite validation. Fail-safe halt.")
+        return {
+            "regime": "unavailable",
+            "is_valid": False,
+            "details": "NaN detected in regime values — all new entries blocked (fail-safe)",
+            "spy_price": None,
+            "spy_sma_200": None,
+            "spy_above_200": False,
+            "spy_day_return_pct": None,
+            "vix": None,
+            "vix_spike_3d_pct": None,
+            "black_swan_day": False,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
 
     # Black swan: S&P 500 (SPY) single-session move > ±3%
     black_swan_day = abs(spy_day_return) > 3.0
 
     # Regime classification
-    if not spy_above_200 or vix_current > 30 or vix_spike_3d > 20 or black_swan_day:
+    if not spy_above_200 or vix_current > 30.0 or vix_spike_3d > 20.0 or black_swan_day:
         regime = "risk_off"
-    elif vix_current >= 25 or (spy.get("sma_200") and spy["price"] < spy["sma_200"] * 1.02):
+    elif vix_current >= 25.0 or (spy_sma_200 and spy_price < spy_sma_200 * 1.02):
         regime = "caution"
     else:
         regime = "risk_on"
 
     details = (
-        f"SPY={'above' if spy_above_200 else 'BELOW'} 200SMA ({spy.get('source', 'yf')}), "
-        f"VIX={vix_current:.1f} ({vix.get('source', 'yf')}), "
+        f"SPY={'above' if spy_above_200 else 'BELOW'} 200SMA ({spy.get('source', 'unknown')}), "
+        f"VIX={vix_current:.1f} ({vix.get('source', 'unknown')}), "
         f"VIX_3d_spike={vix_spike_3d:.1f}%, "
         f"SPY_1d={spy_day_return:+.1f}%"
     )
@@ -1173,10 +1268,15 @@ def compute_regime_status() -> Optional[dict]:
 
     return {
         "regime": regime,
+        "is_valid": True,
         "details": details,
-        "spy_price": spy["price"],
-        "spy_sma_200": spy.get("sma_200"),
+        "spy_price": spy_price,
+        "spy_open": spy.get("open", spy_price),
+        "spy_prior_close": spy.get("prior_close", spy_price),
+        "spy_sma_50": spy.get("sma_50"),
+        "spy_sma_200": spy_sma_200,
         "spy_above_200": spy_above_200,
+        "spy_above_50": spy.get("above_sma_50", True),
         "spy_day_return_pct": spy_day_return,
         "vix": vix_current,
         "vix_spike_3d_pct": vix_spike_3d,

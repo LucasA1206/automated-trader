@@ -220,6 +220,10 @@ def prepare_entry_order(
     partial_target = compute_partial_target(limit_price, stop_price)
 
     # ── Position sizing ───────────────────────────────────────────────────────
+    tier = candidate.get("tier", "A")
+    size_mult = float(candidate.get("size_multiplier", 1.0))
+    beta_scalar = float(candidate.get("beta_scalar", 1.0))
+
     size = risk_engine.compute_position_size(
         account_equity=account_equity,
         entry_price=limit_price,
@@ -227,6 +231,9 @@ def prepare_entry_order(
         risk_pct=DEFAULT_RISK_PER_TRADE_PCT,
         confidence=confidence,
         classification=classification,
+        size_multiplier=size_mult,
+        tier=tier,
+        beta_scalar=beta_scalar,
     )
 
     if size.get("error") or size.get("shares", 0) < 1:
@@ -238,8 +245,13 @@ def prepare_entry_order(
     # ── Risk engine gate ──────────────────────────────────────────────────────
     from strategy.data_layer import compute_regime_status
     regime_data = compute_regime_status()
-    regime = regime_data["regime"] if regime_data else "unknown"
+    regime = regime_data.get("regime", "unknown") if regime_data else "unknown"
     black_swan = regime_data.get("black_swan_day", False) if regime_data else False
+
+    if regime in ("risk_off", "unavailable", "unknown") or not regime_data or not regime_data.get("is_valid", True):
+        logger.warning("[Entry] %s blocked: market regime is '%s' (valid=%s) — no new entries",
+                       ticker, regime, regime_data.get("is_valid") if regime_data else False)
+        return None
 
     # Compute daily/weekly P&L from open positions (simplified: use account equity delta)
     daily_pnl_pct = 0.0
@@ -281,4 +293,8 @@ def prepare_entry_order(
         "sector": sector,
         "entry_reason": reason,
         "regime": regime,
+        "tier": tier,
+        "size_multiplier": size_mult,
+        "beta_scalar": beta_scalar,
+        "beta": candidate.get("beta"),
     }
