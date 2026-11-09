@@ -6,6 +6,7 @@ import asyncio
 import threading
 import logging
 from datetime import datetime, timezone
+from typing import Optional
 from ib_insync import IB, Stock, MarketOrder, LimitOrder, StopOrder, util
 
 logger = logging.getLogger(__name__)
