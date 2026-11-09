@@ -826,6 +826,122 @@ class IBKRClient:
             logger.error("place_stop_order failed for %s: %s", ticker, exc)
             return {"success": False, "ticker": ticker, "error": str(exc)}
 
+
+    def modify_stop_order(self, ticker: str, stop_order_id: str, new_stop_price: float, shares: int) -> dict:
+        """
+        Modifies an existing native stop order at IBKR (e.g. for market-linked tightening or chandelier trail).
+        Submits an updated StopOrder with the same orderId or cancels & replaces if needed.
+        Ensures tick rounding to avoid Warning 110.
+        """
+        try:
+            if not self.ib.isConnected():
+                self.connect()
+
+            contract = Stock(ticker, "SMART", "USD")
+            self.ib.qualifyContracts(contract)
+
+            new_stop_price = round_to_tick(new_stop_price)
+
+            # Locate existing open stop order
+            open_trades = self.ib.openTrades()
+            target_trade = None
+            for ot in open_trades:
+                if str(ot.order.orderId) == str(stop_order_id):
+                    target_trade = ot
+                    break
+
+            if target_trade is not None:
+                order = target_trade.order
+                order.auxPrice = new_stop_price
+                order.totalQuantity = shares
+                logger.info("Modifying existing native stop %s for %s to $%.2f", stop_order_id, ticker, new_stop_price)
+                trade = self.ib.placeOrder(contract, order)
+                self.ib.sleep(0.5)
+                return {
+                    "success": True,
+                    "ticker": ticker,
+                    "order_id": str(order.orderId),
+                    "new_stop_price": new_stop_price,
+                    "modified": True,
+                }
+            else:
+                logger.info("Stop %s not found in open orders; placing new native stop for %s @ $%.2f",
+                            stop_order_id, ticker, new_stop_price)
+                res = self.place_stop_order(ticker, shares, new_stop_price)
+                return res
+
+        except Exception as exc:
+            logger.error("modify_stop_order failed for %s (order_id=%s): %s", ticker, stop_order_id, exc)
+            return {"success": False, "ticker": ticker, "error": str(exc)}
+
+    def get_spy_intraday_data(self) -> Optional[dict]:
+        """
+        Fetch SPY 1-minute intraday bars from IBKR connection to compute current price,
+        prior day close, and intraday volume-weighted average price (VWAP).
+        Zero external API cost; uses live connected IB Gateway.
+        """
+        try:
+            if not self.ib.isConnected():
+                self.connect()
+
+            contract = Stock("SPY", "SMART", "USD")
+            self.ib.qualifyContracts(contract)
+
+            # Request 1-day 1-minute historical bars for SPY
+            bars = self.ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr="1 D",
+                barSizeSetting="1 min",
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+                keepUpToDate=False,
+            )
+
+            if not bars or len(bars) == 0:
+                logger.warning("[Trader] No intraday 1-min bars returned for SPY from IBKR.")
+                return None
+
+            # Calculate intraday VWAP = sum(price * volume) / sum(volume)
+            total_vol = 0.0
+            pv_sum = 0.0
+            for b in bars:
+                vol = float(b.volume) if hasattr(b, "volume") else 0.0
+                typical_price = (float(b.high) + float(b.low) + float(b.close)) / 3.0
+                total_vol += vol
+                pv_sum += typical_price * vol
+
+            vwap = (pv_sum / total_vol) if total_vol > 0 else float(bars[-1].close)
+            current_price = float(bars[-1].close)
+
+            # Prior close from 2-day daily bars or first bar open
+            daily_bars = self.ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr="2 D",
+                barSizeSetting="1 day",
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+            )
+            if daily_bars and len(daily_bars) >= 2:
+                prior_close = float(daily_bars[-2].close)
+            elif daily_bars and len(daily_bars) == 1:
+                prior_close = float(daily_bars[0].open)
+            else:
+                prior_close = float(bars[0].open)
+
+            return {
+                "current_price": round(current_price, 2),
+                "prior_close": round(prior_close, 2),
+                "vwap": round(vwap, 2),
+                "num_bars": len(bars),
+            }
+        except Exception as exc:
+            logger.error("[Trader] Failed to fetch SPY intraday data: %s", exc)
+            return None
+
     def cancel_stop_order(self, order_id: str, ticker: str) -> bool:
         """Cancel a native stop order by IBKR order ID (e.g., after a sell)."""
         try:

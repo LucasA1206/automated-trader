@@ -154,7 +154,17 @@ def stage1_price_volume_filter(
     Returns: (survivors, rejection_reasons)
     """
     logger.info("[Filter] Stage 1: price/volume pre-filter on %d tickers.", len(tickers))
-    batch_data = fetch_ohlcv_batch(tickers, period="22d")  # ~1 month
+    batch_data = fetch_ohlcv_batch(tickers, period="60d")  # ~3 months (supports 50d SMA breadth)
+
+    # ── Compute Market Breadth across universe ───────────────────────────────
+    try:
+        from strategy.market_state import compute_market_breadth
+        from strategy.config import get_system_config
+        cfg = get_system_config()
+        breadth_threshold = float(cfg.get("breadth_threshold_pct", 40.0))
+        compute_market_breadth(batch_data, threshold_pct=breadth_threshold)
+    except Exception as exc:
+        logger.warning("[Filter] Market breadth calculation failed: %s", exc)
 
     survivors: list[str] = []
     rejection_reasons: dict[str, str] = {}

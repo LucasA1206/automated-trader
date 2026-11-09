@@ -105,6 +105,27 @@ def init_db():
     except Exception:
         pass
 
+    # Phase 5 Alpha & Confirmation Logging columns
+    new_cols = [
+        ("spy_price_at_entry", "FLOAT"),
+        ("spy_price_at_exit", "FLOAT"),
+        ("beta_at_entry", "FLOAT"),
+        ("market_tier_at_entry", "VARCHAR(10)"),
+        ("intraday_confirmed_at_entry", "BOOLEAN"),
+        ("breadth_at_entry", "FLOAT"),
+        ("vix_at_entry", "FLOAT"),
+        ("sector_rank_at_entry", "INTEGER"),
+        ("spy_return_pct", "FLOAT"),
+        ("expected_return_pct", "FLOAT"),
+        ("alpha_pct", "FLOAT"),
+    ]
+    for col_name, col_type in new_cols:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(f"ALTER TABLE trades ADD COLUMN {col_name} {col_type}"))
+        except Exception:
+            pass
+
     # ── Default settings seed ──────────────────────────────────────────────────
     db = SessionLocal()
     try:
@@ -124,6 +145,22 @@ def init_db():
             "entry_pullback_max_pct": "5.0",   # Max % price above 20-day SMA
             "entry_vwap_required": "false",    # Require price > VWAP for entry
             "entry_adx_min": "15",             # Minimum ADX threshold
+            # ── Blueprint Market Gates & Risk System (Three-mode: off | shadow | enforce) ──
+            "gate_intraday_confirmation": "shadow",  # SPY > prior close & > VWAP at entry time (>= 10:00 ET)
+            "gate_gap_down_veto":         "shadow",  # Block new entries if SPY opens <= -0.7%
+            "gate_exposure_tiers":        "shadow",  # Graded Tier A (1.0x) / Tier B (0.5x) / Tier C (0.0x)
+            "gate_market_breadth":        "shadow",  # Universe % > 50 SMA caution threshold
+            "gate_sector_leadership":     "shadow",  # Allow only top-half sectors by RS vs SPY
+            "sizing_beta_aware":          "shadow",  # Scale position down for beta > 1.0 (0.5x to 1.0x cap)
+            "exit_market_linked":         "shadow",  # Tighten stops if SPY breaks 50 SMA or 10d swing low
+            "gate_earnings_density":      "shadow",  # Reduce size if high % of candidates report in <= 10d
+            # Numerical thresholds
+            "gap_down_threshold_pct":     "0.7",     # Gap down % threshold to trigger veto (default 0.7%)
+            "breadth_threshold_pct":      "40.0",    # Caution breadth threshold (% above 50 SMA)
+            "tier_b_size_multiplier":     "0.5",     # Size multiplier for Tier B (default 0.5x)
+            "tier_b_score_bump":          "5.0",     # Bump min score for Tier B (e.g. 70 -> 75)
+            "vix_stress_level":           "25.0",    # VIX level separating Tier A and Tier C/stress
+            "vix_spike_threshold_pct":    "20.0",    # VIX 3-session spike threshold (default 20.0%)
         }
         for key, value in defaults.items():
             existing = db.query(Setting).filter(Setting.key == key).first()

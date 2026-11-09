@@ -84,17 +84,22 @@ class RiskEngine:
         risk_pct: float = DEFAULT_RISK_PER_TRADE_PCT,
         confidence: int = 100,
         classification: str = "high_conviction",
+        size_multiplier: float = 1.0,
+        tier: str = "A",
+        beta_scalar: float = 1.0,
     ) -> dict:
         """
         Compute position size per blueprint Section 7:
-          shares = (equity × risk_pct% / (entry - stop))
+          shares = (equity × risk_pct% × size_multiplier × beta_scalar / (entry - stop))
           position_value = shares × entry_price
           capped at 25% of equity
 
         For marginal setups: halve the position size.
         Confidence multiplier: scales size by confidence/100 for weak signals.
+        Tier size multiplier: scales size per market exposure tier (e.g. 0.5x in Tier B).
+        Beta scalar: scales size down for high beta (>1.0), clamped [0.5, 1.0].
 
-        Returns dict with: shares, position_value, risk_dollar, risk_pct, capped
+        Returns dict with: shares, position_value, risk_dollar, risk_pct, capped, tier, size_multiplier, beta_scalar
         """
         if entry_price <= stop_price or stop_price <= 0:
             return {"error": "Invalid entry/stop prices", "shares": 0}
@@ -103,8 +108,17 @@ class RiskEngine:
         if risk_per_share <= 0:
             return {"error": "Zero or negative risk per share", "shares": 0}
 
-        # Base risk allocation
-        base_risk_pct = risk_pct / 100  # e.g. 0.01 for 1%
+        if size_multiplier <= 0.0 or tier == "C":
+            return {
+                "error": f"Tier {tier} or size_multiplier={size_multiplier} — no new entries allowed",
+                "shares": 0,
+                "tier": tier,
+                "size_multiplier": size_multiplier,
+            }
+
+        # Base risk allocation scaled by tier multiplier and beta scalar
+        effective_mult = max(0.0, size_multiplier) * max(0.1, min(1.0, beta_scalar))
+        base_risk_pct = (risk_pct / 100) * effective_mult
         if classification == "marginal":
             base_risk_pct *= 0.5  # Half size for marginal setups
 
@@ -134,6 +148,9 @@ class RiskEngine:
             "risk_dollar": round(actual_risk, 2),
             "risk_pct": round(actual_risk / account_equity * 100, 3) if account_equity > 0 else 0,
             "capped": capped,
+            "tier": tier,
+            "size_multiplier": round(size_multiplier, 2),
+            "beta_scalar": round(beta_scalar, 2),
         }
 
     def check_new_entry(
@@ -162,7 +179,7 @@ class RiskEngine:
             return False, "black_swan_day: SPY moved >3% — all new entries suspended"
 
         # ── Gate 1: Regime check ──────────────────────────────────────────────
-        if regime == "risk_off":
+        if regime in ("risk_off", "unavailable", "unknown") or not regime:
             return False, f"regime_off: market regime is '{regime}' — no new entries"
 
         # ── Gate 2: Max positions ─────────────────────────────────────────────
@@ -295,7 +312,7 @@ class RiskEngine:
             "daily_pnl_pct": round(daily_pnl_pct, 3),
             "weekly_pnl_pct": round(weekly_pnl_pct, 3),
             "regime": regime,
-            "new_entries_allowed": not hard_suspended and drawdown_pct < DRAWDOWN_WARN_PCT,
+            "new_entries_allowed": not hard_suspended and drawdown_pct < DRAWDOWN_WARN_PCT and (regime not in ("risk_off", "unavailable", "unknown") and bool(regime)),
             "hard_suspended": hard_suspended,
             "suspension_reason": suspend_reason if hard_suspended else None,
             "sector_breakdown": sectors,

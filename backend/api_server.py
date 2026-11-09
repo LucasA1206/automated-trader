@@ -348,6 +348,17 @@ def get_trades(
                 "realised_partial_pnl": t.realised_partial_pnl or 0.0,
                 "fees": t.fees or 0.0,
                 "ai_reason": t.ai_reason,
+                # Phase 5 Alpha & Confirmation Logging fields
+                "spy_price_at_entry": t.spy_price_at_entry,
+                "spy_price_at_exit": t.spy_price_at_exit,
+                "beta_at_entry": t.beta_at_entry,
+                "market_tier_at_entry": t.market_tier_at_entry or "A",
+                "intraday_confirmed_at_entry": t.intraday_confirmed_at_entry,
+                "breadth_at_entry": t.breadth_at_entry,
+                "sector_rank_at_entry": t.sector_rank_at_entry,
+                "spy_return_pct": t.spy_return_pct,
+                "expected_return_pct": t.expected_return_pct,
+                "alpha_pct": t.alpha_pct,
             }
             for t in trades
         ],
@@ -1214,6 +1225,154 @@ def reset_pnl_history(db: Session = Depends(get_db), confirm: bool = False):
     except Exception as e:
         logger.error("reset-pnl-history error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Alpha & Shadow Reporting Endpoints (Phase 5) ─────────────────────────
+
+@app.get("/api/performance/alpha-analysis", dependencies=[Depends(require_auth)])
+def get_alpha_analysis(db: Session = Depends(get_db)):
+    """
+    Returns strategy performance compared to broader market (SPY):
+      - Strategy cumulative & average return
+      - SPY benchmark return over the same trade holding periods
+      - Expected return (Beta * SPY return)
+      - Net Alpha (Actual Return - Expected Return)
+      - Breakdown by market tier (Tier A vs Tier B)
+      - Breakdown by sector
+    """
+    closed_trades = db.query(Trade).filter(
+        Trade.status == "closed",
+        Trade.pnl_pct.isnot(None),
+    ).all()
+
+    if not closed_trades:
+        return {
+            "total_trades": 0,
+            "average_return_pct": 0.0,
+            "average_spy_return_pct": 0.0,
+            "average_alpha_pct": 0.0,
+            "win_rate_pct": 0.0,
+            "tier_breakdown": {},
+            "trades": [],
+        }
+
+    trades_data = []
+    total_ret = 0.0
+    total_spy_ret = 0.0
+    total_alpha = 0.0
+    wins = 0
+
+    tier_stats = {}
+
+    for t in closed_trades:
+        p_ret = float(t.pnl_pct or 0.0)
+        s_ret = float(t.spy_return_pct or 0.0)
+        exp_ret = float(t.expected_return_pct or s_ret)
+        alpha = float(t.alpha_pct if t.alpha_pct is not None else (p_ret - exp_ret))
+        tier = t.market_tier_at_entry or "A"
+
+        total_ret += p_ret
+        total_spy_ret += s_ret
+        total_alpha += alpha
+        if p_ret > 0:
+            wins += 1
+
+        if tier not in tier_stats:
+            tier_stats[tier] = {"count": 0, "wins": 0, "total_return": 0.0, "total_alpha": 0.0}
+        tier_stats[tier]["count"] += 1
+        if p_ret > 0:
+            tier_stats[tier]["wins"] += 1
+        tier_stats[tier]["total_return"] += p_ret
+        tier_stats[tier]["total_alpha"] += alpha
+
+        trades_data.append({
+            "id": t.id,
+            "ticker": t.ticker,
+            "tier": tier,
+            "buy_time": t.buy_time.isoformat() if t.buy_time else None,
+            "sell_time": t.sell_time.isoformat() if t.sell_time else None,
+            "return_pct": round(p_ret, 2),
+            "spy_return_pct": round(s_ret, 2),
+            "expected_return_pct": round(exp_ret, 2),
+            "alpha_pct": round(alpha, 2),
+            "beta": t.beta_at_entry,
+            "pnl": t.pnl,
+        })
+
+    n = len(closed_trades)
+    tier_summary = {}
+    for tier, s in tier_stats.items():
+        cnt = s["count"]
+        tier_summary[tier] = {
+            "count": cnt,
+            "win_rate_pct": round((s["wins"] / cnt * 100.0), 1) if cnt > 0 else 0.0,
+            "average_return_pct": round(s["total_return"] / cnt, 2) if cnt > 0 else 0.0,
+            "average_alpha_pct": round(s["total_alpha"] / cnt, 2) if cnt > 0 else 0.0,
+        }
+
+    return {
+        "total_trades": n,
+        "average_return_pct": round(total_ret / n, 2),
+        "average_spy_return_pct": round(total_spy_ret / n, 2),
+        "average_alpha_pct": round(total_alpha / n, 2),
+        "win_rate_pct": round(wins / n * 100.0, 1),
+        "tier_breakdown": tier_summary,
+        "trades": trades_data[-50:],  # return most recent 50 trades
+    }
+
+
+@app.get("/api/performance/shadow-report", dependencies=[Depends(require_auth)])
+def get_shadow_report(db: Session = Depends(get_db)):
+    """
+    Returns comparative evaluation of shadow-mode gates:
+      - How many trades would have been blocked under enforcement
+      - P&L of trades that passed vs would-be-blocked trades
+      - Effectiveness recommendations
+    """
+    from strategy.config import get_system_config
+    cfg = get_system_config(db)
+
+    # All closed trades with confirmation/tier info
+    closed_trades = db.query(Trade).filter(Trade.status == "closed").all()
+
+    # Intraday confirmation analysis
+    unconfirmed_trades = [t for t in closed_trades if t.intraday_confirmed_at_entry is False]
+    confirmed_trades = [t for t in closed_trades if t.intraday_confirmed_at_entry is not False]
+
+    def _calc_stats(subset):
+        if not subset:
+            return {"count": 0, "win_rate_pct": 0.0, "total_pnl": 0.0, "avg_pnl_pct": 0.0}
+        n = len(subset)
+        wins = sum(1 for t in subset if (t.pnl or 0) > 0)
+        pnl = sum((t.pnl or 0) for t in subset)
+        avg_ret = sum((t.pnl_pct or 0) for t in subset) / n
+        return {
+            "count": n,
+            "win_rate_pct": round(wins / n * 100.0, 1),
+            "total_pnl": round(pnl, 2),
+            "avg_pnl_pct": round(avg_ret, 2),
+        }
+
+    return {
+        "active_modes": {
+            "intraday_confirmation": cfg.get("gate_intraday_confirmation", "shadow"),
+            "gap_down_veto": cfg.get("gate_gap_down_veto", "shadow"),
+            "exposure_tiers": cfg.get("gate_exposure_tiers", "shadow"),
+            "sector_leadership": cfg.get("gate_sector_leadership", "shadow"),
+            "beta_aware_sizing": cfg.get("sizing_beta_aware", "shadow"),
+            "market_linked_exits": cfg.get("exit_market_linked", "shadow"),
+            "earnings_density": cfg.get("gate_earnings_density", "shadow"),
+        },
+        "intraday_gate_impact": {
+            "unconfirmed_trades_taken_in_shadow": _calc_stats(unconfirmed_trades),
+            "confirmed_trades": _calc_stats(confirmed_trades),
+            "net_pnl_prevented_if_enforced": round(-sum((t.pnl or 0) for t in unconfirmed_trades), 2),
+        },
+        "tier_impact": {
+            "tier_a": _calc_stats([t for t in closed_trades if (t.market_tier_at_entry or "A") == "A"]),
+            "tier_b": _calc_stats([t for t in closed_trades if (t.market_tier_at_entry or "A") == "B"]),
+        },
+    }
 
 
 # ─── Entrypoint ───────────────────────────────────────────────────────────

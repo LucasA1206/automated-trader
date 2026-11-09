@@ -16,6 +16,12 @@ interface Trade {
   realised_partial_pnl: number;
   fees: number;
   ai_reason: string | null;
+  market_tier_at_entry?: string | null;
+  beta_at_entry?: number | null;
+  spy_return_pct?: number | null;
+  expected_return_pct?: number | null;
+  alpha_pct?: number | null;
+  intraday_confirmed_at_entry?: boolean | null;
 }
 
 function fmt(val: number): string {
@@ -176,6 +182,7 @@ export default function TradeHistoryTab({ authFetch }: { authFetch: AuthFetch })
                 <th>Sell Time</th>
                 <th>Partial Gain</th>
                 <th>Final P&amp;L</th>
+                <th>Alpha (vs SPY)</th>
               </tr>
             </thead>
             <tbody>
@@ -236,12 +243,21 @@ export default function TradeHistoryTab({ authFetch }: { authFetch: AuthFetch })
                           <span style={{ color: 'var(--text-muted)' }}>—</span>
                         )}
                       </td>
+                      <td className="mono">
+                        {trade.status === 'closed' && trade.alpha_pct !== undefined && trade.alpha_pct !== null ? (
+                          <span className={trade.alpha_pct >= 0 ? 'positive' : 'negative'}>
+                            {trade.alpha_pct >= 0 ? '+' : ''}{trade.alpha_pct.toFixed(2)}%
+                          </span>
+                        ) : (
+                          <span style={{ color: 'var(--text-muted)' }}>—</span>
+                        )}
+                      </td>
                     </tr>
 
                     {/* Expanded detail row */}
                     {isExpanded && (
                       <tr key={`${trade.id}-detail`} style={{ background: 'rgba(59,130,246,0.04)' }}>
-                        <td colSpan={9} style={{ padding: '12px 20px' }}>
+                        <td colSpan={10} style={{ padding: '12px 20px' }}>
                           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                             {trade.ai_reason && (
                               <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
@@ -262,6 +278,16 @@ export default function TradeHistoryTab({ authFetch }: { authFetch: AuthFetch })
                                 {fmt(trade.fees)}
                               </div>
                             )}
+                            <div style={{ display: 'flex', gap: 16, fontSize: 12, color: 'var(--text-secondary)' }}>
+                              <span><strong>Tier:</strong> {trade.market_tier_at_entry || 'A'}</span>
+                              <span><strong>Beta:</strong> {trade.beta_at_entry ? trade.beta_at_entry.toFixed(2) : '1.00'}</span>
+                              {trade.spy_return_pct !== null && trade.spy_return_pct !== undefined && (
+                                <span><strong>SPY Return:</strong> {trade.spy_return_pct >= 0 ? '+' : ''}{trade.spy_return_pct.toFixed(2)}%</span>
+                              )}
+                              {trade.intraday_confirmed_at_entry !== undefined && (
+                                <span><strong>Intraday Confirmed:</strong> {trade.intraday_confirmed_at_entry ? '✅ Yes' : '⚠️ No (Shadow)'}</span>
+                              )}
+                            </div>
                           </div>
                         </td>
                       </tr>
