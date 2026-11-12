@@ -21,12 +21,13 @@ interface TradeItem {
   market_value_aud?: number;
   unrealised_pnl?: number;
   ai_reason?: string | null;
+  alpha_pct?: number | null;
 }
 
 type AuthFetch = (url: string, init?: RequestInit) => Promise<Response>;
 
 function fmt(val: number | null | undefined): string {
-  if (val == null) return '—';
+  if (val == null || isNaN(val)) return '—';
   return `$${Math.abs(val).toLocaleString('en-US', {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
@@ -34,153 +35,13 @@ function fmt(val: number | null | undefined): string {
 }
 
 function fmtSigned(val: number | null | undefined): string {
-  if (val == null) return '—';
+  if (val == null || isNaN(val)) return '—';
   const sign = val >= 0 ? '+' : '-';
   return `${sign}$${Math.abs(val).toLocaleString('en-US', {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   })}`;
 }
-
-// Sample baseline trades matching Page 3 & Page 12
-const SAMPLE_TRADES: TradeItem[] = [
-  {
-    id: 1,
-    ticker: 'NVDA',
-    status: 'open',
-    shares: 120,
-    buy_price: 127.01,
-    sell_price: null,
-    current_price: 137.50,
-    market_value_aud: 25080.00,
-    unrealised_pnl: 1912.80,
-    realised_partial_pnl: 0,
-    buy_time: '2026-11-12T01:35:00',
-    sell_time: null,
-    pnl: 1912.80,
-    pnl_pct: 8.26,
-    fees: 1.00,
-  },
-  {
-    id: 2,
-    ticker: 'AAPL',
-    status: 'open',
-    shares: 60,
-    buy_price: 220.00,
-    sell_price: null,
-    current_price: 225.00,
-    market_value_aud: 20520.00,
-    unrealised_pnl: 456.00,
-    realised_partial_pnl: 0,
-    buy_time: '2026-11-11T01:42:00',
-    sell_time: null,
-    pnl: 456.00,
-    pnl_pct: 2.27,
-    fees: 1.00,
-  },
-  {
-    id: 3,
-    ticker: 'AMZN',
-    status: 'sold_half',
-    shares: 25,
-    buy_price: 205.00,
-    sell_price: 213.21,
-    current_price: 200.00,
-    market_value_aud: 7600.00,
-    unrealised_pnl: -190.00,
-    realised_partial_pnl: 312.00,
-    buy_time: '2026-11-10T02:15:00',
-    sell_time: '2026-11-11T03:10:00',
-    pnl: -190.00,
-    pnl_pct: -2.44,
-    fees: 2.00,
-  },
-  {
-    id: 4,
-    ticker: 'TSLA',
-    status: 'closed',
-    shares: 40,
-    buy_price: 248.50,
-    sell_price: 256.80,
-    current_price: 256.80,
-    market_value_aud: 0,
-    unrealised_pnl: 0,
-    realised_partial_pnl: 0,
-    buy_time: '2026-11-09T01:36:00',
-    sell_time: '2026-11-10T04:20:00',
-    pnl: 504.64,
-    pnl_pct: 3.34,
-    fees: 2.00,
-  },
-  {
-    id: 5,
-    ticker: 'META',
-    status: 'closed',
-    shares: 15,
-    buy_price: 572.20,
-    sell_price: 586.40,
-    current_price: 586.40,
-    market_value_aud: 0,
-    unrealised_pnl: 0,
-    realised_partial_pnl: 0,
-    buy_time: '2026-11-08T02:10:00',
-    sell_time: '2026-11-09T03:42:00',
-    pnl: 323.76,
-    pnl_pct: 2.48,
-    fees: 2.00,
-  },
-  {
-    id: 6,
-    ticker: 'AMD',
-    status: 'closed',
-    shares: 80,
-    buy_price: 152.40,
-    sell_price: 149.80,
-    current_price: 149.80,
-    market_value_aud: 0,
-    unrealised_pnl: 0,
-    realised_partial_pnl: 0,
-    buy_time: '2026-11-07T01:45:00',
-    sell_time: '2026-11-08T05:15:00',
-    pnl: -316.16,
-    pnl_pct: -1.71,
-    fees: 2.00,
-  },
-  {
-    id: 7,
-    ticker: 'MSFT',
-    status: 'open',
-    shares: 20,
-    buy_price: 410.00,
-    sell_price: null,
-    current_price: 420.00,
-    market_value_aud: 12768.00,
-    unrealised_pnl: 304.00,
-    realised_partial_pnl: 0,
-    buy_time: '2026-11-06T01:38:00',
-    sell_time: null,
-    pnl: 304.00,
-    pnl_pct: 2.44,
-    fees: 1.00,
-  },
-  {
-    id: 8,
-    ticker: 'GOOGL',
-    status: 'sold_half',
-    shares: 10,
-    buy_price: 150.00,
-    sell_price: 164.37,
-    current_price: 161.32,
-    market_value_aud: 2452.00,
-    unrealised_pnl: 172.00,
-    realised_partial_pnl: 218.40,
-    buy_time: '2026-11-05T02:00:00',
-    sell_time: '2026-11-06T03:15:00',
-    pnl: 172.00,
-    pnl_pct: 7.55,
-    fees: 2.00,
-  },
-];
 
 export default function TradeHistoryTab({
   authFetch,
@@ -190,58 +51,81 @@ export default function TradeHistoryTab({
   tradingMode?: 'paper' | 'live';
 }) {
   const [trades, setTrades] = useState<TradeItem[]>([]);
-  const [total, setTotal] = useState(48);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(true);
   const [searchTicker, setSearchTicker] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'all' | 'open' | 'sold_half' | 'closed'>('all');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'open' | 'sold_half' | 'closed' | 'error'>('all');
   const [selectedTrade, setSelectedTrade] = useState<TradeItem | null>(null);
 
-  const syncDateString = '12 NOV 2026 · LAST SYNC 09:42:08 AEDT';
+  const syncDateString = useMemo(() => {
+    const now = new Date();
+    return `${now.toLocaleDateString('en-AU', { day: '2-digit', month: 'short', year: 'numeric' }).toUpperCase()} · LAST SYNC ${now.toLocaleTimeString('en-AU')} AEDT`;
+  }, []);
 
   const fetchTrades = useCallback(async () => {
     try {
-      const res = await authFetch('/api/trades?limit=100');
-      const json = await res.json();
-      if (json.trades && json.trades.length > 0) {
-        setTrades(json.trades);
-        setTotal(json.total || json.trades.length);
-      } else {
-        setTrades(SAMPLE_TRADES);
+      const params = statusFilter !== 'all' ? `&status=${statusFilter}` : '';
+      const res = await authFetch(`/api/trades?limit=200${params}`);
+      if (res.ok) {
+        const json = await res.json();
+        setTrades(json.trades || []);
+        setTotal(json.total || (json.trades ? json.trades.length : 0));
       }
     } catch {
-      setTrades(SAMPLE_TRADES);
+      // Fail silently
+    } finally {
+      setLoading(false);
     }
-  }, [authFetch]);
+  }, [authFetch, statusFilter]);
 
   useEffect(() => {
     fetchTrades();
   }, [fetchTrades]);
 
-  // Filtered trades
+  // Summary calculations from real live trades
+  const closedTrades = useMemo(() => trades.filter((t) => t.status === 'closed'), [trades]);
+  const openTrades = useMemo(() => trades.filter((t) => t.status === 'open'), [trades]);
+  const soldHalfTrades = useMemo(() => trades.filter((t) => t.status === 'sold_half'), [trades]);
+
+  const totalRealisedPnl = useMemo(() => {
+    return closedTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
+  }, [closedTrades]);
+
+  const totalFees = useMemo(() => {
+    return trades.reduce((sum, t) => sum + (t.fees || 0), 0);
+  }, [trades]);
+
+  const winningTradesCount = useMemo(() => {
+    return closedTrades.filter((t) => (t.pnl || 0) >= 0).length;
+  }, [closedTrades]);
+
+  const winRateFormatted = useMemo(() => {
+    if (closedTrades.length === 0) return '0.0%';
+    return `${((winningTradesCount / closedTrades.length) * 100).toFixed(1)}%`;
+  }, [closedTrades.length, winningTradesCount]);
+
+  // Filtered trades by search ticker
   const filteredTrades = useMemo(() => {
     return trades.filter((t) => {
       const matchSearch = !searchTicker || t.ticker.toLowerCase().includes(searchTicker.toLowerCase());
-      const matchStatus = statusFilter === 'all' || t.status === statusFilter;
-      return matchSearch && matchStatus;
+      return matchSearch;
     });
-  }, [trades, searchTicker, statusFilter]);
+  }, [trades, searchTicker]);
 
   // Export CSV
   const handleExportCSV = () => {
-    const headers = ['Ticker', 'Status', 'Shares', 'Avg Cost', 'Current Price', 'Market Value AUD', 'Unrealised PnL', 'Partial Gain', 'Buy Price', 'Sell Price', 'Buy Time', 'Sell Time', 'Final PnL'];
+    const headers = ['Ticker', 'Status', 'Shares', 'Buy Price', 'Sell Price', 'Buy Time', 'Sell Time', 'Partial Gain', 'Final PnL', 'Fees'];
     const rows = filteredTrades.map((t) => [
       t.ticker,
       t.status,
       t.shares,
       t.buy_price ?? '',
-      t.current_price ?? '',
-      t.market_value_aud ?? '',
-      t.unrealised_pnl ?? '',
-      t.realised_partial_pnl ?? '',
-      t.buy_price ?? '',
       t.sell_price ?? '',
       t.buy_time ?? '',
       t.sell_time ?? '',
+      t.realised_partial_pnl ?? '',
       t.pnl ?? '',
+      t.fees ?? '',
     ]);
     const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map((e) => e.join(','))].join('\n');
     const encodedUri = encodeURI(csvContent);
@@ -268,38 +152,45 @@ export default function TradeHistoryTab({
           <div style={{ fontSize: 11, fontWeight: 700, color: '#64748b', letterSpacing: '0.8px', textTransform: 'uppercase' }}>
             REALISED P&amp;L
           </div>
-          <div style={{ fontSize: 34, fontWeight: 800, color: '#059669', marginTop: 4, letterSpacing: '-0.8px' }}>
-            +$10,045.20
+          <div style={{
+            fontSize: 34,
+            fontWeight: 800,
+            color: totalRealisedPnl >= 0 ? '#059669' : '#dc2626',
+            marginTop: 4,
+            letterSpacing: '-0.8px',
+          }}>
+            {loading ? '—' : fmtSigned(totalRealisedPnl)}
           </div>
         </div>
       </div>
 
       {/* ── Stat Cards ─────────────────────────────────────────── */}
-      {/* Desktop 5 cards / Mobile 2x2 grid */}
       <div className="trade-history-stat-grid">
         <div className="stat-metric-card desktop-only-card">
           <div className="stat-metric-label">Total Trades</div>
-          <div className="stat-metric-val">{total}</div>
+          <div className="stat-metric-val">{loading ? '—' : total}</div>
         </div>
         <div className="stat-metric-card desktop-only-card">
           <div className="stat-metric-label">Realised P&amp;L</div>
-          <div className="stat-metric-val" style={{ color: '#059669' }}>+$10,045.20</div>
+          <div className="stat-metric-val" style={{ color: totalRealisedPnl >= 0 ? '#059669' : '#dc2626' }}>
+            {loading ? '—' : fmtSigned(totalRealisedPnl)}
+          </div>
         </div>
         <div className="stat-metric-card">
           <div className="stat-metric-label">Win Rate</div>
-          <div className="stat-metric-val">72.1%</div>
+          <div className="stat-metric-val">{loading ? '—' : winRateFormatted}</div>
         </div>
         <div className="stat-metric-card">
           <div className="stat-metric-label">Open / ½ Sold</div>
-          <div className="stat-metric-val">5 / 2</div>
+          <div className="stat-metric-val">{loading ? '—' : `${openTrades.length} / ${soldHalfTrades.length}`}</div>
         </div>
         <div className="stat-metric-card">
           <div className="stat-metric-label">Total Fees</div>
-          <div className="stat-metric-val">$241.40</div>
+          <div className="stat-metric-val">{loading ? '—' : fmt(totalFees)}</div>
         </div>
         <div className="stat-metric-card mobile-only-card">
           <div className="stat-metric-label">Total Trades</div>
-          <div className="stat-metric-val">{total}</div>
+          <div className="stat-metric-val">{loading ? '—' : total}</div>
         </div>
       </div>
 
@@ -354,6 +245,7 @@ export default function TradeHistoryTab({
             <option value="open">Open</option>
             <option value="sold_half">½ Sold</option>
             <option value="closed">Closed</option>
+            <option value="error">Error</option>
           </select>
         </div>
 
@@ -375,72 +267,85 @@ export default function TradeHistoryTab({
         <div className="table-header-flex">
           <h3 className="table-title-bold">All trades</h3>
           <span style={{ fontSize: 12, color: '#94a3b8' }}>
-            {total} total · Scroll right for execution details →
+            {filteredTrades.length} total · Scroll right for execution details →
           </span>
         </div>
 
         <div className="scrollable-table-wrapper">
-          <table className="custom-data-table" style={{ minWidth: 1080 }}>
-            <thead>
-              <tr>
-                <th>Ticker</th>
-                <th>Status</th>
-                <th>Shares</th>
-                <th>Avg Cost</th>
-                <th>Current Price</th>
-                <th>Market Value (AUD)</th>
-                <th>Unrealised P&amp;L</th>
-                <th>Partial Gain</th>
-                <th>Actions</th>
-                <th>Buy Price</th>
-                <th>Sell Price</th>
-                <th>Buy Time (AEDT)</th>
-                <th>Sell Time (AEDT)</th>
-                <th>Final P&amp;L (AUD)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filteredTrades.map((t) => {
-                const isClosed = t.status === 'closed';
-                const isPartial = t.status === 'sold_half';
-                return (
-                  <tr key={t.id}>
-                    <td style={{ fontWeight: 700, color: '#0f172a' }}>{t.ticker}</td>
-                    <td>
-                      <span className={isClosed ? 'badge-status-closed' : isPartial ? 'badge-status-partial' : 'badge-status-open'}>
-                        {isClosed ? 'Closed' : isPartial ? '½ Sold' : 'Open'}
-                      </span>
-                    </td>
-                    <td>{t.shares}</td>
-                    <td>{fmt(t.buy_price)}</td>
-                    <td>{fmt(t.current_price)}</td>
-                    <td>{t.market_value_aud ? fmt(t.market_value_aud) : '—'}</td>
-                    <td style={{ color: (t.unrealised_pnl || 0) >= 0 ? '#059669' : '#dc2626', fontWeight: 600 }}>
-                      {t.unrealised_pnl ? fmtSigned(t.unrealised_pnl) : '—'}
-                    </td>
-                    <td style={{ color: (t.realised_partial_pnl || 0) > 0 ? '#059669' : '#94a3b8', fontWeight: 600 }}>
-                      {t.realised_partial_pnl ? fmtSigned(t.realised_partial_pnl) : '—'}
-                    </td>
-                    <td>
-                      <button
-                        className="btn-manage-link"
-                        onClick={() => setSelectedTrade(t)}
-                      >
-                        {isClosed ? 'View' : 'Manage'} ↗
-                      </button>
-                    </td>
-                    <td>{fmt(t.buy_price)}</td>
-                    <td>{fmt(t.sell_price)}</td>
-                    <td>{t.buy_time ? new Date(t.buy_time).toLocaleDateString('en-AU', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—'}</td>
-                    <td>{t.sell_time ? new Date(t.sell_time).toLocaleDateString('en-AU', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—'}</td>
-                    <td style={{ color: (t.pnl || 0) >= 0 ? '#059669' : '#dc2626', fontWeight: 700 }}>
-                      {isClosed ? fmtSigned(t.pnl) : '—'}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+          {filteredTrades.length === 0 ? (
+            <div style={{
+              padding: '36px 20px',
+              textAlign: 'center',
+              color: '#94a3b8',
+              fontSize: 13,
+            }}>
+              <span style={{ fontSize: 26, display: 'block', marginBottom: 6 }}>📋</span>
+              <p style={{ fontWeight: 600, color: '#475569', marginBottom: 4 }}>No trades found</p>
+              <p style={{ fontSize: 12 }}>Trades will appear here as the bot executes buy and sell orders.</p>
+            </div>
+          ) : (
+            <table className="custom-data-table" style={{ minWidth: 1080 }}>
+              <thead>
+                <tr>
+                  <th>Ticker</th>
+                  <th>Status</th>
+                  <th>Shares</th>
+                  <th>Avg Cost</th>
+                  <th>Current Price</th>
+                  <th>Market Value (AUD)</th>
+                  <th>Unrealised P&amp;L</th>
+                  <th>Partial Gain</th>
+                  <th>Actions</th>
+                  <th>Buy Price</th>
+                  <th>Sell Price</th>
+                  <th>Buy Time (AEDT)</th>
+                  <th>Sell Time (AEDT)</th>
+                  <th>Final P&amp;L (AUD)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredTrades.map((t) => {
+                  const isClosed = t.status === 'closed';
+                  const isPartial = t.status === 'sold_half';
+                  return (
+                    <tr key={t.id}>
+                      <td style={{ fontWeight: 700, color: '#0f172a' }}>{t.ticker}</td>
+                      <td>
+                        <span className={isClosed ? 'badge-status-closed' : isPartial ? 'badge-status-partial' : 'badge-status-open'}>
+                          {isClosed ? 'Closed' : isPartial ? '½ Sold' : 'Open'}
+                        </span>
+                      </td>
+                      <td>{t.shares}</td>
+                      <td>{fmt(t.buy_price)}</td>
+                      <td>{fmt(t.current_price ?? t.buy_price)}</td>
+                      <td>{t.market_value_aud ? fmt(t.market_value_aud) : '—'}</td>
+                      <td style={{ color: (t.unrealised_pnl || 0) >= 0 ? '#059669' : '#dc2626', fontWeight: 600 }}>
+                        {t.unrealised_pnl ? fmtSigned(t.unrealised_pnl) : '—'}
+                      </td>
+                      <td style={{ color: (t.realised_partial_pnl || 0) > 0 ? '#059669' : '#94a3b8', fontWeight: 600 }}>
+                        {t.realised_partial_pnl ? fmtSigned(t.realised_partial_pnl) : '—'}
+                      </td>
+                      <td>
+                        <button
+                          className="btn-manage-link"
+                          onClick={() => setSelectedTrade(t)}
+                        >
+                          {isClosed ? 'View' : 'Manage'} ↗
+                        </button>
+                      </td>
+                      <td>{fmt(t.buy_price)}</td>
+                      <td>{fmt(t.sell_price)}</td>
+                      <td>{t.buy_time ? new Date(t.buy_time).toLocaleDateString('en-AU', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—'}</td>
+                      <td>{t.sell_time ? new Date(t.sell_time).toLocaleDateString('en-AU', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—'}</td>
+                      <td style={{ color: (t.pnl || 0) >= 0 ? '#059669' : '#dc2626', fontWeight: 700 }}>
+                        {isClosed ? fmtSigned(t.pnl) : '—'}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
         </div>
 
         {/* Pagination Bar */}
@@ -458,10 +363,6 @@ export default function TradeHistoryTab({
           <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
             <button className="btn-outline-subtle" style={{ padding: '4px 8px', fontSize: 11 }}>← Previous</button>
             <span style={{ fontWeight: 600, padding: '0 6px', color: '#0f172a' }}>1</span>
-            <span style={{ padding: '0 4px' }}>2</span>
-            <span style={{ padding: '0 4px' }}>3</span>
-            <span style={{ padding: '0 4px' }}>…</span>
-            <span style={{ padding: '0 4px' }}>6</span>
             <button className="btn-outline-subtle" style={{ padding: '4px 8px', fontSize: 11 }}>Next →</button>
           </div>
         </div>
@@ -473,92 +374,100 @@ export default function TradeHistoryTab({
           All trades · {filteredTrades.length} &nbsp;&nbsp; Prices USD · Returns AUD
         </div>
 
-        {filteredTrades.map((t) => {
-          const isClosed = t.status === 'closed';
-          const isPartial = t.status === 'sold_half';
-          const pnlPos = (t.pnl || 0) >= 0;
+        {filteredTrades.length === 0 ? (
+          <div className="theme-card" style={{ padding: '32px 20px', textAlign: 'center', color: '#94a3b8' }}>
+            <span style={{ fontSize: 26, display: 'block', marginBottom: 6 }}>📋</span>
+            <p style={{ fontWeight: 600, color: '#475569', marginBottom: 4 }}>No trades found</p>
+            <p style={{ fontSize: 12 }}>Trades will appear here as the bot executes buy and sell orders.</p>
+          </div>
+        ) : (
+          filteredTrades.map((t) => {
+            const isClosed = t.status === 'closed';
+            const isPartial = t.status === 'sold_half';
+            const pnlPos = (t.pnl || 0) >= 0;
 
-          return (
-            <div
-              key={t.id}
-              className="theme-card"
-              style={{ marginBottom: 14, padding: '18px 20px' }}
-            >
-              {/* Card Header */}
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-                <span style={{ fontSize: 20, fontWeight: 800, color: '#0f172a' }}>
-                  {t.ticker}
-                </span>
-                <span className={isClosed ? 'badge-status-closed' : isPartial ? 'badge-status-partial' : 'badge-status-open'}>
-                  {isClosed ? 'Closed' : isPartial ? '½ Sold' : 'Open'}
-                </span>
+            return (
+              <div
+                key={t.id}
+                className="theme-card"
+                style={{ marginBottom: 14, padding: '18px 20px' }}
+              >
+                {/* Card Header */}
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+                  <span style={{ fontSize: 20, fontWeight: 800, color: '#0f172a' }}>
+                    {t.ticker}
+                  </span>
+                  <span className={isClosed ? 'badge-status-closed' : isPartial ? 'badge-status-partial' : 'badge-status-open'}>
+                    {isClosed ? 'Closed' : isPartial ? '½ Sold' : 'Open'}
+                  </span>
+                </div>
+
+                {/* Metric Rows */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, fontSize: 13 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+                    <span style={{ color: '#64748b' }}>{isClosed ? 'Final P&L' : 'Unrealised P&L'}</span>
+                    <span style={{ fontSize: 20, fontWeight: 800, color: pnlPos ? '#059669' : '#dc2626' }}>
+                      {fmtSigned(t.pnl || t.unrealised_pnl)}
+                    </span>
+                  </div>
+
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: '#64748b' }}>Shares / Avg Cost</span>
+                    <span style={{ color: '#0f172a', fontWeight: 500 }}>
+                      {t.shares} / {fmt(t.buy_price)}
+                    </span>
+                  </div>
+
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: '#64748b' }}>Current / Market Value</span>
+                    <span style={{ color: '#0f172a', fontWeight: 500 }}>
+                      {fmt(t.current_price ?? t.buy_price)} / {t.market_value_aud ? fmt(t.market_value_aud) : '—'}
+                    </span>
+                  </div>
+
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: '#64748b' }}>Buy / Sell Price</span>
+                    <span style={{ color: '#0f172a', fontWeight: 500 }}>
+                      {fmt(t.buy_price)} / {t.sell_price ? fmt(t.sell_price) : '—'}
+                    </span>
+                  </div>
+
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: '#64748b' }}>Buy Time</span>
+                    <span style={{ color: '#0f172a', fontWeight: 500 }}>
+                      {t.buy_time ? new Date(t.buy_time).toLocaleDateString('en-AU', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) + ' AEDT' : '—'}
+                    </span>
+                  </div>
+
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: '#64748b' }}>Sell Time</span>
+                    <span style={{ color: '#0f172a', fontWeight: 500 }}>
+                      {t.sell_time ? new Date(t.sell_time).toLocaleDateString('en-AU', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) + ' AEDT' : '—'}
+                    </span>
+                  </div>
+
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: '#64748b' }}>Partial Gain</span>
+                    <span style={{ color: (t.realised_partial_pnl || 0) > 0 ? '#059669' : '#94a3b8', fontWeight: 600 }}>
+                      {t.realised_partial_pnl ? fmtSigned(t.realised_partial_pnl) : '—'}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Action Link at Bottom */}
+                <div style={{ marginTop: 14, paddingTop: 10, borderTop: '1px solid var(--border-subtle)' }}>
+                  <button
+                    className="btn-manage-link"
+                    onClick={() => setSelectedTrade(t)}
+                    style={{ fontSize: 13, padding: 0 }}
+                  >
+                    {isClosed ? 'View ↗' : 'Manage ↗'}
+                  </button>
+                </div>
               </div>
-
-              {/* Metric Rows */}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, fontSize: 13 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
-                  <span style={{ color: '#64748b' }}>{isClosed ? 'Final P&L' : 'Unrealised P&L'}</span>
-                  <span style={{ fontSize: 20, fontWeight: 800, color: pnlPos ? '#059669' : '#dc2626' }}>
-                    {fmtSigned(t.pnl || t.unrealised_pnl)}
-                  </span>
-                </div>
-
-                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                  <span style={{ color: '#64748b' }}>Shares / Avg Cost</span>
-                  <span style={{ color: '#0f172a', fontWeight: 500 }}>
-                    {t.shares} / {fmt(t.buy_price)}
-                  </span>
-                </div>
-
-                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                  <span style={{ color: '#64748b' }}>Current / Market Value</span>
-                  <span style={{ color: '#0f172a', fontWeight: 500 }}>
-                    {fmt(t.current_price)} / {t.market_value_aud ? fmt(t.market_value_aud) : '—'}
-                  </span>
-                </div>
-
-                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                  <span style={{ color: '#64748b' }}>Buy / Sell Price</span>
-                  <span style={{ color: '#0f172a', fontWeight: 500 }}>
-                    {fmt(t.buy_price)} / {t.sell_price ? fmt(t.sell_price) : '—'}
-                  </span>
-                </div>
-
-                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                  <span style={{ color: '#64748b' }}>Buy Time</span>
-                  <span style={{ color: '#0f172a', fontWeight: 500 }}>
-                    {t.buy_time ? new Date(t.buy_time).toLocaleDateString('en-AU', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) + ' AEDT' : '—'}
-                  </span>
-                </div>
-
-                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                  <span style={{ color: '#64748b' }}>Sell Time</span>
-                  <span style={{ color: '#0f172a', fontWeight: 500 }}>
-                    {t.sell_time ? new Date(t.sell_time).toLocaleDateString('en-AU', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) + ' AEDT' : '—'}
-                  </span>
-                </div>
-
-                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                  <span style={{ color: '#64748b' }}>Partial Gain</span>
-                  <span style={{ color: (t.realised_partial_pnl || 0) > 0 ? '#059669' : '#94a3b8', fontWeight: 600 }}>
-                    {t.realised_partial_pnl ? fmtSigned(t.realised_partial_pnl) : '—'}
-                  </span>
-                </div>
-              </div>
-
-              {/* Action Link at Bottom */}
-              <div style={{ marginTop: 14, paddingTop: 10, borderTop: '1px solid var(--border-subtle)' }}>
-                <button
-                  className="btn-manage-link"
-                  onClick={() => setSelectedTrade(t)}
-                  style={{ fontSize: 13, padding: 0 }}
-                >
-                  {isClosed ? 'View ↗' : 'Manage ↗'}
-                </button>
-              </div>
-            </div>
-          );
-        })}
+            );
+          })
+        )}
       </div>
 
       {/* ── Trade Detail Modal ─────────────────────────────────── */}

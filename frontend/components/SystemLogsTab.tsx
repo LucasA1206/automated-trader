@@ -8,27 +8,12 @@ interface LogItem {
   id: number;
   timestamp: string;
   timeFormatted: string;
-  level: 'INFO' | 'WARN' | 'ERROR';
+  level: 'INFO' | 'WARN' | 'ERROR' | 'WARNING';
   category: string;
   message: string;
 }
 
 type AuthFetch = (url: string, init?: RequestInit) => Promise<Response>;
-
-const SAMPLE_LOGS: LogItem[] = [
-  { id: 1, timestamp: '2026-11-12T09:42:08', timeFormatted: '12 Nov 09:42:08', level: 'INFO', category: 'Broker', message: 'IBKR heartbeat received. Connection healthy.' },
-  { id: 2, timestamp: '2026-11-12T09:42:01', timeFormatted: '12 Nov 09:42:01', level: 'INFO', category: 'Portfolio', message: 'Portfolio sync complete. 5 open positions.' },
-  { id: 3, timestamp: '2026-11-12T09:41:56', timeFormatted: '12 Nov 09:41:56', level: 'INFO', category: 'Pricing', message: 'Market prices refreshed for 5 symbols.' },
-  { id: 4, timestamp: '2026-11-12T09:40:00', timeFormatted: '12 Nov 09:40:00', level: 'INFO', category: 'Scheduler', message: 'Intraday confirmation job started.' },
-  { id: 5, timestamp: '2026-11-12T09:40:00', timeFormatted: '12 Nov 09:40:00', level: 'WARN', category: 'Entry filter', message: 'AMZN entry skipped: relative volume below 1.5×.' },
-  { id: 6, timestamp: '2026-11-12T09:39:58', timeFormatted: '12 Nov 09:39:58', level: 'INFO', category: 'Strategy', message: 'NVDA passed VWAP and momentum checks.' },
-  { id: 7, timestamp: '2026-11-12T09:38:12', timeFormatted: '12 Nov 09:38:12', level: 'INFO', category: 'Orders', message: 'Paper order acknowledged: BUY 120 NVDA.' },
-  { id: 8, timestamp: '2026-11-12T09:38:11', timeFormatted: '12 Nov 09:38:11', level: 'INFO', category: 'Risk', message: 'Position sizing approved. Exposure within limit.' },
-  { id: 9, timestamp: '2026-11-12T09:35:09', timeFormatted: '12 Nov 09:35:09', level: 'INFO', category: 'Market data', message: 'AAPL quote recovered on retry 1 of 3.' },
-  { id: 10, timestamp: '2026-11-12T09:35:04', timeFormatted: '12 Nov 09:35:04', level: 'ERROR', category: 'Market data', message: 'AAPL quote timeout. Retry scheduled in 5 seconds.' },
-  { id: 11, timestamp: '2026-11-12T08:30:14', timeFormatted: '12 Nov 08:30:14', level: 'INFO', category: 'AI analysis', message: 'Daily analysis complete. 142 screened; 4 candidates.' },
-  { id: 12, timestamp: '2026-11-12T08:30:00', timeFormatted: '12 Nov 08:30:00', level: 'INFO', category: 'Scheduler', message: 'Daily AI stock analysis job started.' },
-];
 
 export default function SystemLogsTab({
   authFetch,
@@ -37,41 +22,61 @@ export default function SystemLogsTab({
   authFetch: AuthFetch;
   tradingMode?: 'paper' | 'live';
 }) {
-  const [logs, setLogs] = useState<LogItem[]>(SAMPLE_LOGS);
+  const [logs, setLogs] = useState<LogItem[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [levelFilter, setLevelFilter] = useState<string>('all');
   const [categoryFilter, setCategoryFilter] = useState<string>('all');
-  const [dateFilter, setDateFilter] = useState<string>('today');
+  const [autoRefresh, setAutoRefresh] = useState(true);
 
-  const syncDateString = '12 NOV 2026 · LAST SYNC 09:42:08 AEDT';
+  const syncDateString = useMemo(() => {
+    const now = new Date();
+    return `${now.toLocaleDateString('en-AU', { day: '2-digit', month: 'short', year: 'numeric' }).toUpperCase()} · LAST SYNC ${now.toLocaleTimeString('en-AU')} AEDT`;
+  }, []);
 
   const fetchLogs = useCallback(async () => {
     try {
-      const res = await authFetch('/api/logs?limit=200');
-      const json = await res.json();
-      if (json.logs && json.logs.length > 0) {
-        const mapped: LogItem[] = json.logs.map((l: any, i: number) => ({
+      const params = new URLSearchParams({ limit: '200' });
+      if (categoryFilter !== 'all') params.set('category', categoryFilter);
+      const res = await authFetch(`/api/logs?${params}`);
+      if (res.ok) {
+        const json = await res.json();
+        const rawLogs: any[] = json.logs || [];
+        const mapped: LogItem[] = rawLogs.map((l: any, i: number) => ({
           id: l.id || i,
           timestamp: l.timestamp,
-          timeFormatted: new Date(l.timestamp).toLocaleDateString('en-AU', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-          level: (l.level === 'WARNING' ? 'WARN' : l.level) as any,
+          timeFormatted: new Date(l.timestamp).toLocaleDateString('en-AU', {
+            day: '2-digit',
+            month: 'short',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+          }),
+          level: l.level === 'WARNING' ? 'WARN' : l.level,
           category: l.category || 'System',
           message: l.message,
         }));
         setLogs(mapped);
-      } else {
-        setLogs(SAMPLE_LOGS);
+        setTotal(json.total || mapped.length);
       }
     } catch {
-      setLogs(SAMPLE_LOGS);
+      // Fail silently
+    } finally {
+      setLoading(false);
     }
-  }, [authFetch]);
+  }, [authFetch, categoryFilter]);
 
   useEffect(() => {
     fetchLogs();
-    const interval = setInterval(fetchLogs, 15_000);
-    return () => clearInterval(interval);
   }, [fetchLogs]);
+
+  // Auto-refresh interval
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const interval = setInterval(fetchLogs, 10_000);
+    return () => clearInterval(interval);
+  }, [fetchLogs, autoRefresh]);
 
   const filteredLogs = useMemo(() => {
     return logs.filter((log) => {
@@ -80,10 +85,9 @@ export default function SystemLogsTab({
         log.message.toLowerCase().includes(search.toLowerCase()) ||
         log.category.toLowerCase().includes(search.toLowerCase());
       const matchLevel = levelFilter === 'all' || log.level === levelFilter;
-      const matchCat = categoryFilter === 'all' || log.category.toLowerCase() === categoryFilter.toLowerCase();
-      return matchSearch && matchLevel && matchCat;
+      return matchSearch && matchLevel;
     });
-  }, [logs, search, levelFilter, categoryFilter]);
+  }, [logs, search, levelFilter]);
 
   const handleExportLogs = () => {
     const textContent = filteredLogs.map((l) => `[${l.timestamp}] [${l.level}] [${l.category}] ${l.message}`).join('\n');
@@ -127,18 +131,28 @@ export default function SystemLogsTab({
             <span>All systems operational</span>
           </div>
           <div style={{ fontSize: 12.5, color: '#475569', marginTop: 4 }}>
-            Broker connected · Scheduler active · Last sync 09:42 AEDT
+            Broker connected · Scheduler active · Live monitoring
           </div>
         </div>
-        <div style={{ fontSize: 12.5, color: '#047857', fontWeight: 600 }}>
-          Uptime 99.98% · Last 30 days
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#047857', cursor: 'pointer', fontWeight: 600 }}>
+            <input
+              type="checkbox"
+              checked={autoRefresh}
+              onChange={(e) => setAutoRefresh(e.target.checked)}
+            />
+            Auto-refresh (10s)
+          </label>
+          <div style={{ fontSize: 12.5, color: '#047857', fontWeight: 600 }}>
+            Uptime 99.98%
+          </div>
         </div>
       </div>
 
       {/* ── Search & Filter Controls ───────────────────────────── */}
       <div style={{
         display: 'grid',
-        gridTemplateColumns: 'minmax(240px, 2fr) 1fr 1fr 1fr',
+        gridTemplateColumns: 'minmax(240px, 2fr) 1fr 1fr',
         gap: 12,
         marginBottom: 20,
       }} className="logs-filter-grid">
@@ -196,25 +210,6 @@ export default function SystemLogsTab({
             <option key={c} value={c}>{c === 'all' ? 'All categories ▾' : c}</option>
           ))}
         </select>
-
-        <select
-          value={dateFilter}
-          onChange={(e) => setDateFilter(e.target.value)}
-          style={{
-            background: '#ffffff',
-            border: '1px solid var(--border)',
-            borderRadius: 8,
-            padding: '9px 12px',
-            fontSize: 13,
-            color: '#334155',
-            outline: 'none',
-            cursor: 'pointer',
-          }}
-        >
-          <option value="today">12 Nov 2026 ▾</option>
-          <option value="yesterday">11 Nov 2026</option>
-          <option value="older">Older</option>
-        </select>
       </div>
 
       {/* ── Event Stream Container ──────────────────────────────── */}
@@ -230,43 +225,51 @@ export default function SystemLogsTab({
         {/* Desktop Table View (Page 5) */}
         <div className="desktop-logs-table-view">
           <div className="scrollable-table-wrapper">
-            <table className="custom-data-table" style={{ minWidth: 780 }}>
-              <thead>
-                <tr>
-                  <th style={{ width: 170 }}>Timestamp (AEDT)</th>
-                  <th style={{ width: 85 }}>Level</th>
-                  <th style={{ width: 120 }}>Category</th>
-                  <th>Message</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredLogs.map((log) => {
-                  const isWarn = log.level === 'WARN';
-                  const isError = log.level === 'ERROR';
-                  return (
-                    <tr key={log.id}>
-                      <td style={{ color: '#64748b', fontSize: 12.5 }}>{log.timeFormatted}</td>
-                      <td>
-                        <span style={{
-                          display: 'inline-block',
-                          fontSize: 11,
-                          fontWeight: 700,
-                          padding: '2px 8px',
-                          borderRadius: 4,
-                          background: isError ? '#fef2f2' : isWarn ? '#fffbeb' : '#ecfdf5',
-                          color: isError ? '#dc2626' : isWarn ? '#d97706' : '#059669',
-                          border: `1px solid ${isError ? '#fecaca' : isWarn ? '#fde68a' : '#a7f3d0'}`,
-                        }}>
-                          {log.level}
-                        </span>
-                      </td>
-                      <td style={{ color: '#334155', fontWeight: 500 }}>{log.category}</td>
-                      <td style={{ color: '#0f172a' }}>{log.message}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+            {filteredLogs.length === 0 ? (
+              <div style={{ padding: '36px 20px', textAlign: 'center', color: '#94a3b8', fontSize: 13 }}>
+                <span style={{ fontSize: 26, display: 'block', marginBottom: 6 }}>📑</span>
+                <p style={{ fontWeight: 600, color: '#475569', marginBottom: 4 }}>No log events found</p>
+                <p style={{ fontSize: 12 }}>System and trading events will appear here automatically.</p>
+              </div>
+            ) : (
+              <table className="custom-data-table" style={{ minWidth: 780 }}>
+                <thead>
+                  <tr>
+                    <th style={{ width: 170 }}>Timestamp (AEDT)</th>
+                    <th style={{ width: 85 }}>Level</th>
+                    <th style={{ width: 120 }}>Category</th>
+                    <th>Message</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredLogs.map((log) => {
+                    const isWarn = log.level === 'WARN';
+                    const isError = log.level === 'ERROR';
+                    return (
+                      <tr key={log.id}>
+                        <td style={{ color: '#64748b', fontSize: 12.5 }}>{log.timeFormatted}</td>
+                        <td>
+                          <span style={{
+                            display: 'inline-block',
+                            fontSize: 11,
+                            fontWeight: 700,
+                            padding: '2px 8px',
+                            borderRadius: 4,
+                            background: isError ? '#fef2f2' : isWarn ? '#fffbeb' : '#ecfdf5',
+                            color: isError ? '#dc2626' : isWarn ? '#d97706' : '#059669',
+                            border: `1px solid ${isError ? '#fecaca' : isWarn ? '#fde68a' : '#a7f3d0'}`,
+                          }}>
+                            {log.level}
+                          </span>
+                        </td>
+                        <td style={{ color: '#334155', fontWeight: 500 }}>{log.category}</td>
+                        <td style={{ color: '#0f172a' }}>{log.message}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
           </div>
         </div>
 
@@ -275,36 +278,42 @@ export default function SystemLogsTab({
           <div style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', letterSpacing: '0.8px', paddingBottom: 8, borderBottom: '1px solid var(--border)' }}>
             TIMESTAMP / LEVEL / CATEGORY / MESSAGE
           </div>
-          {filteredLogs.map((log) => {
-            const isWarn = log.level === 'WARN';
-            const isError = log.level === 'ERROR';
-            const timeOnly = log.timestamp.split('T')[1] || log.timeFormatted;
-            return (
-              <div
-                key={log.id}
-                style={{
-                  padding: '12px 0',
-                  borderBottom: '1px solid var(--border-subtle)',
-                }}
-              >
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-                  <span style={{ fontSize: 12, color: '#64748b' }}>
-                    {timeOnly.substring(0, 8)} AEDT
-                  </span>
-                  <span style={{
-                    fontSize: 12,
-                    fontWeight: 700,
-                    color: isError ? '#dc2626' : isWarn ? '#d97706' : '#059669',
-                  }}>
-                    {log.level} · {log.category}
-                  </span>
+          {filteredLogs.length === 0 ? (
+            <div style={{ padding: '32px 16px', textAlign: 'center', color: '#94a3b8' }}>
+              No log events recorded.
+            </div>
+          ) : (
+            filteredLogs.map((log) => {
+              const isWarn = log.level === 'WARN';
+              const isError = log.level === 'ERROR';
+              const timeOnly = log.timestamp.split('T')[1] || log.timeFormatted;
+              return (
+                <div
+                  key={log.id}
+                  style={{
+                    padding: '12px 0',
+                    borderBottom: '1px solid var(--border-subtle)',
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                    <span style={{ fontSize: 12, color: '#64748b' }}>
+                      {timeOnly.substring(0, 8)} AEDT
+                    </span>
+                    <span style={{
+                      fontSize: 12,
+                      fontWeight: 700,
+                      color: isError ? '#dc2626' : isWarn ? '#d97706' : '#059669',
+                    }}>
+                      {log.level} · {log.category}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 13, color: '#0f172a', lineHeight: 1.4 }}>
+                    {log.message}
+                  </div>
                 </div>
-                <div style={{ fontSize: 13, color: '#0f172a', lineHeight: 1.4 }}>
-                  {log.message}
-                </div>
-              </div>
-            );
-          })}
+              );
+            })
+          )}
         </div>
 
         {/* Footer */}

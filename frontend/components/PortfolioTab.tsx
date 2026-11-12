@@ -41,8 +41,15 @@ interface Account {
 interface PortfolioData {
   connected: boolean;
   mode: string;
+  account_type?: string;
+  paper_strategy?: string;
   positions: Position[];
   account: Account;
+  strategy_alert?: {
+    type: string;
+    threshold?: number;
+    message: string;
+  } | null;
   error?: string;
 }
 
@@ -51,6 +58,10 @@ interface DailyPnlPoint {
   daily_pnl: number;
   cumulative_pnl: number;
   net_liq_usd?: number | null;
+  daily_pct?: number;
+  cumulative_pct?: number;
+  daily_fees?: number;
+  cumulative_fees?: number;
 }
 
 interface PnlHistory {
@@ -73,99 +84,22 @@ type AuthFetch = (url: string, init?: RequestInit) => Promise<Response>;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function fmt(val: number, prefix = '$'): string {
+function fmt(val: number | null | undefined, prefix = '$'): string {
+  if (val == null || isNaN(val)) return '—';
   return `${prefix}${Math.abs(val).toLocaleString('en-US', {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   })}`;
 }
 
-function fmtSigned(val: number): string {
+function fmtSigned(val: number | null | undefined, prefix = '$'): string {
+  if (val == null || isNaN(val)) return '—';
   const sign = val >= 0 ? '+' : '-';
-  return `${sign}$${Math.abs(val).toLocaleString('en-US', {
+  return `${sign}${prefix}${Math.abs(val).toLocaleString('en-US', {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   })}`;
 }
-
-// Fallback baseline positions from the design reference screens (Page 2 / Page 11)
-const DEFAULT_POSITIONS: Position[] = [
-  {
-    ticker: 'NVDA',
-    shares: 120,
-    avg_cost: 127.01,
-    current_price: 137.50,
-    market_value: 16500.00,
-    pnl: 1258.42,
-    pnl_pct: 8.26,
-    realised_partial_pnl: 0,
-    trade_status: 'open',
-  },
-  {
-    ticker: 'AAPL',
-    shares: 60,
-    avg_cost: 220.00,
-    current_price: 225.00,
-    market_value: 13500.00,
-    pnl: 300.00,
-    pnl_pct: 2.27,
-    realised_partial_pnl: 0,
-    trade_status: 'open',
-  },
-  {
-    ticker: 'MSFT',
-    shares: 20,
-    avg_cost: 410.00,
-    current_price: 420.00,
-    market_value: 8400.00,
-    pnl: 200.00,
-    pnl_pct: 2.44,
-    realised_partial_pnl: 0,
-    trade_status: 'open',
-  },
-  {
-    ticker: 'AMZN',
-    shares: 25,
-    avg_cost: 205.00,
-    current_price: 200.00,
-    market_value: 5000.00,
-    pnl: -125.00,
-    pnl_pct: -2.44,
-    realised_partial_pnl: 205.26,
-    trade_status: 'sold_half',
-  },
-  {
-    ticker: 'GOOGL',
-    shares: 10,
-    avg_cost: 150.00,
-    current_price: 161.32,
-    market_value: 1613.20,
-    pnl: 113.16,
-    pnl_pct: 7.55,
-    realised_partial_pnl: 143.68,
-    trade_status: 'sold_half',
-  },
-];
-
-// Baseline sample chart data matching the design curve (Page 2 / Page 11)
-const SAMPLE_CHART_DATA: DailyPnlPoint[] = [
-  { date: '2026-08-01', daily_pnl: 120, cumulative_pnl: 1200 },
-  { date: '2026-08-08', daily_pnl: 350, cumulative_pnl: 1550 },
-  { date: '2026-08-15', daily_pnl: -200, cumulative_pnl: 1350 },
-  { date: '2026-08-22', daily_pnl: 650, cumulative_pnl: 2400 },
-  { date: '2026-08-29', daily_pnl: 400, cumulative_pnl: 2800 },
-  { date: '2026-09-05', daily_pnl: -150, cumulative_pnl: 2650 },
-  { date: '2026-09-12', daily_pnl: 900, cumulative_pnl: 3550 },
-  { date: '2026-09-19', daily_pnl: 500, cumulative_pnl: 4050 },
-  { date: '2026-09-26', daily_pnl: 300, cumulative_pnl: 4350 },
-  { date: '2026-10-03', daily_pnl: 1200, cumulative_pnl: 5550 },
-  { date: '2026-10-10', daily_pnl: -250, cumulative_pnl: 5300 },
-  { date: '2026-10-17', daily_pnl: 1400, cumulative_pnl: 6700 },
-  { date: '2026-10-24', daily_pnl: -100, cumulative_pnl: 6600 },
-  { date: '2026-10-31', daily_pnl: 800, cumulative_pnl: 7400 },
-  { date: '2026-11-05', daily_pnl: 400, cumulative_pnl: 7800 },
-  { date: '2026-11-12', daily_pnl: 396, cumulative_pnl: 8196 },
-];
 
 export default function PortfolioTab({
   authFetch,
@@ -178,47 +112,53 @@ export default function PortfolioTab({
   const [pnlHistory, setPnlHistory] = useState<PnlHistory | null>(null);
   const [fxData, setFxData] = useState<ExchangeRateData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [timeframe, setTimeframe] = useState<'1W' | '1M' | '3M' | '1Y' | 'All time'>('All time');
-  
-  // Manage modal & action states
+
+  // Manage modal states
   const [managedPosition, setManagedPosition] = useState<Position | null>(null);
   const [actionInProgress, setActionInProgress] = useState(false);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
 
-  // Sync date string
-  const syncDateString = useMemo(() => {
-    return '12 NOV 2026 · LAST SYNC 09:42:08 AEDT';
-  }, []);
-
+  // Fetch live portfolio from IBKR
   const fetchPortfolio = useCallback(async () => {
     try {
       const res = await authFetch('/api/portfolio');
-      const json: PortfolioData = await res.json();
-      setData(json);
+      if (res.ok) {
+        const json: PortfolioData = await res.json();
+        setData(json);
+        setLastUpdated(new Date());
+      }
     } catch {
-      // Graceful fallback
+      // Failed to reach API
     } finally {
       setLoading(false);
     }
   }, [authFetch]);
 
+  // Fetch real P&L history
   const fetchPnlHistory = useCallback(async () => {
     try {
       const res = await authFetch('/api/pnl-history');
-      const json: PnlHistory = await res.json();
-      setPnlHistory(json);
+      if (res.ok) {
+        const json: PnlHistory = await res.json();
+        setPnlHistory(json);
+      }
     } catch {
-      // Graceful fallback
+      // Fail silently
     }
   }, [authFetch]);
 
+  // Fetch real FX rate
   const fetchFxRate = useCallback(async () => {
     try {
       const res = await authFetch('/api/exchange-rate');
-      const json: ExchangeRateData = await res.json();
-      setFxData(json);
+      if (res.ok) {
+        const json: ExchangeRateData = await res.json();
+        setFxData(json);
+      }
     } catch {
-      // Graceful fallback
+      // Fail silently
     }
   }, [authFetch]);
 
@@ -228,7 +168,11 @@ export default function PortfolioTab({
     fetchFxRate();
 
     const interval = setInterval(fetchPortfolio, 30_000);
-    return () => clearInterval(interval);
+    const pnlInterval = setInterval(fetchPnlHistory, 60_000);
+    return () => {
+      clearInterval(interval);
+      clearInterval(pnlInterval);
+    };
   }, [fetchPortfolio, fetchPnlHistory, fetchFxRate]);
 
   // Execute sell via manage modal
@@ -248,6 +192,7 @@ export default function PortfolioTab({
           setManagedPosition(null);
           setActionMessage(null);
           fetchPortfolio();
+          fetchPnlHistory();
         }, 1800);
       } else {
         setActionMessage(`Failed: ${json.detail || json.result?.error || 'Execution error'}`);
@@ -259,29 +204,68 @@ export default function PortfolioTab({
     }
   };
 
-  // Positions to display (use live API data if available with items, otherwise design defaults)
-  const positions: Position[] =
-    data?.positions && data.positions.length > 0 ? data.positions : DEFAULT_POSITIONS;
+  // Live account values from IBKR
+  const account = data?.account ?? {};
+  const positions = data?.positions ?? [];
 
-  // USD to AUD rate
-  const usdToAud = fxData?.rate || data?.account?.ExchangeRate_USD || 1.52;
+  // Live FX rate
+  const usdToAud = fxData?.rate ?? account.ExchangeRate_USD ?? 1.55;
+  const audToUsd = 1 / usdToAud;
 
-  // Chart data
-  const rawChartData =
-    pnlHistory?.chart_data && pnlHistory.chart_data.length > 2
-      ? pnlHistory.chart_data
-      : SAMPLE_CHART_DATA;
+  // Real position metrics
+  const unrealisedPnl = positions.reduce((sum, p) => sum + (p.pnl || 0), 0);
+  const openPartialPnl = positions.reduce((sum, p) => sum + (p.realised_partial_pnl || 0), 0);
+  const totalPosValueUsd = positions.reduce((sum, p) => sum + (p.market_value || 0), 0);
+  const totalPosValueAud = totalPosValueUsd * usdToAud;
 
-  // Calculations
-  const allTimeAud = 12458.60;
-  const allTimeUsd = 8196.45;
-  const netLiqAud = 112458.60;
-  const openPnlAud = 2654.80;
-  const realisedAud = 10045.20;
-  const feesPaid = 241.40;
-  const winsCount = 31;
-  const lossCount = 12;
-  const winRatePct = '72.1%';
+  const realizedPnlUsd = pnlHistory?.all_time_realized_pnl ?? 0;
+  const realizedPnlAud = realizedPnlUsd * usdToAud;
+  const allTimeFeesUsd = pnlHistory?.all_time_fees ?? 0;
+  const allTimeFeesAud = allTimeFeesUsd * usdToAud;
+
+  // Open P&L = unrealised P&L + banked partials
+  const openPnlUsd = unrealisedPnl + openPartialPnl;
+  const openPnlAud = openPnlUsd * usdToAud;
+
+  // Net Liquidation
+  const netLiqUsd = account.NetLiquidation ?? 0;
+  const netLiqAud = account.NetLiquidation_AUD ?? (netLiqUsd * usdToAud);
+  const availableCashUsd = account.AvailableFunds ?? account.TotalCashValue ?? 0;
+  const availableCashAud = account.AvailableFunds_AUD ?? (availableCashUsd * usdToAud);
+
+  // All-time P&L calculation based on Net Liquidation vs starting capital
+  const STARTING_CAPITAL_AUD = 7900;
+  const allTimePnlAud = netLiqAud > 0 ? netLiqAud - STARTING_CAPITAL_AUD : (realizedPnlAud + openPnlAud);
+  const allTimePnlUsd = allTimePnlAud * audToUsd;
+  const allTimePnlPositive = allTimePnlAud >= 0;
+
+  // All-time return percentage
+  const allTimeReturnPct = STARTING_CAPITAL_AUD > 0 && netLiqAud > 0
+    ? ((allTimePnlAud / STARTING_CAPITAL_AUD) * 100)
+    : 0;
+
+  // Win/Loss metrics
+  const winningTrades = pnlHistory?.winning_trades ?? 0;
+  const losingTrades = pnlHistory?.losing_trades ?? 0;
+  const totalTrades = pnlHistory?.total_closed_trades ?? 0;
+  const winRateStr = totalTrades > 0 ? `${((winningTrades / totalTrades) * 100).toFixed(1)}%` : '—';
+
+  // Buying power percentage
+  const buyingPowerPct = netLiqAud > 0 ? ((availableCashAud / netLiqAud) * 100).toFixed(1) : '0.0';
+
+  // Unrealised P&L on open cost percentage
+  const openCostAud = totalPosValueAud - (unrealisedPnl * usdToAud);
+  const unrealisedPctOnCost = openCostAud > 0 ? ((unrealisedPnl * usdToAud / openCostAud) * 100).toFixed(2) : '0.00';
+
+  // Sync date string
+  const syncDateString = useMemo(() => {
+    if (!lastUpdated) return 'CONNECTING TO IBKR…';
+    const dateFormatted = lastUpdated.toLocaleDateString('en-AU', { day: '2-digit', month: 'short', year: 'numeric' }).toUpperCase();
+    const timeFormatted = lastUpdated.toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    return `${dateFormatted} · LAST SYNC ${timeFormatted} AEDT`;
+  }, [lastUpdated]);
+
+  const chartData = pnlHistory?.chart_data ?? [];
 
   return (
     <div>
@@ -298,29 +282,40 @@ export default function PortfolioTab({
           <div>
             <div className="hero-pnl-label">ALL TIME P&amp;L</div>
             <div className="hero-pnl-amounts">
-              <span className="hero-pnl-main">+$12,458.60</span>
-              <span className="hero-pnl-usd">+$8,196.45 USD</span>
+              <span className="hero-pnl-main" style={{ color: allTimePnlPositive ? '#ffffff' : '#f87171' }}>
+                {loading ? '—' : fmtSigned(allTimePnlAud)}
+              </span>
+              <span className="hero-pnl-usd" style={{ color: allTimePnlPositive ? '#34d399' : '#f87171' }}>
+                {loading ? '—' : `${fmtSigned(allTimePnlUsd)} USD`}
+              </span>
             </div>
           </div>
           <div className="hero-stats-right-col">
-            <span className="hero-badge-trend">
+            <span
+              className="hero-badge-trend"
+              style={{
+                color: allTimeReturnPct >= 0 ? '#34d399' : '#f87171',
+                background: allTimeReturnPct >= 0 ? 'rgba(52, 211, 153, 0.12)' : 'rgba(239, 68, 68, 0.12)',
+                borderColor: allTimeReturnPct >= 0 ? 'rgba(52, 211, 153, 0.25)' : 'rgba(239, 68, 68, 0.25)',
+              }}
+            >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                <line x1="7" y1="17" x2="17" y2="7" />
-                <polyline points="7 7 17 7 17 17" />
+                <line x1="7" y1={allTimeReturnPct >= 0 ? "17" : "7"} x2="17" y2={allTimeReturnPct >= 0 ? "7" : "17"} />
+                <polyline points={allTimeReturnPct >= 0 ? "7 7 17 7 17 17" : "7 17 17 17 17 7"} />
               </svg>
-              +12.46%
+              {allTimeReturnPct >= 0 ? `+${allTimeReturnPct.toFixed(2)}%` : `${allTimeReturnPct.toFixed(2)}%`}
             </span>
             <div className="hero-win-loss-grid">
               <div className="hero-win-loss-item">
-                <span className="hero-win-loss-num">{winsCount}</span>
+                <span className="hero-win-loss-num">{winningTrades}</span>
                 <span className="hero-win-loss-lbl">Wins</span>
               </div>
               <div className="hero-win-loss-item">
-                <span className="hero-win-loss-num">{lossCount}</span>
+                <span className="hero-win-loss-num">{losingTrades}</span>
                 <span className="hero-win-loss-lbl">Losses</span>
               </div>
               <div className="hero-win-loss-item">
-                <span className="hero-win-loss-num">{winRatePct}</span>
+                <span className="hero-win-loss-num">{winRateStr}</span>
                 <span className="hero-win-loss-lbl">Win rate</span>
               </div>
             </div>
@@ -330,19 +325,23 @@ export default function PortfolioTab({
         <div className="hero-pnl-metrics-row">
           <div className="hero-metric-item">
             <div className="label">Net Liq</div>
-            <div className="value">$112,458.60</div>
+            <div className="value">{loading ? '—' : fmt(netLiqAud)}</div>
           </div>
           <div className="hero-metric-item">
             <div className="label">Open P&amp;L</div>
-            <div className="value" style={{ color: '#34d399' }}>+$2,654.80</div>
+            <div className="value" style={{ color: openPnlAud >= 0 ? '#34d399' : '#f87171' }}>
+              {loading ? '—' : fmtSigned(openPnlAud)}
+            </div>
           </div>
           <div className="hero-metric-item">
             <div className="label">All Time Realised</div>
-            <div className="value" style={{ color: '#34d399' }}>+$10,045.20</div>
+            <div className="value" style={{ color: realizedPnlAud >= 0 ? '#34d399' : '#f87171' }}>
+              {loading ? '—' : fmtSigned(realizedPnlAud)}
+            </div>
           </div>
           <div className="hero-metric-item">
             <div className="label">Fees Paid</div>
-            <div className="value">$241.40</div>
+            <div className="value">{loading ? '—' : fmt(allTimeFeesAud)}</div>
           </div>
         </div>
       </div>
@@ -353,7 +352,7 @@ export default function PortfolioTab({
           <div>
             <h3 className="table-title-bold">P&amp;L Over Time</h3>
             <div style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>
-              +$12,458.60 · since 01 Aug
+              {allTimePnlPositive ? `+${fmt(allTimePnlAud)}` : `-${fmt(allTimePnlAud)}`} · live portfolio tracking
             </div>
           </div>
           {/* Timeframe selector (Desktop) */}
@@ -383,66 +382,83 @@ export default function PortfolioTab({
 
         {/* Recharts Area Curve */}
         <div style={{ height: 260, width: '100%', marginTop: 12 }}>
-          <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={rawChartData} margin={{ top: 10, right: 10, left: -10, bottom: 0 }}>
-              <defs>
-                <linearGradient id="chartGradient" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#059669" stopOpacity={0.2} />
-                  <stop offset="100%" stopColor="#059669" stopOpacity={0.0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f3" vertical={false} />
-              <XAxis
-                dataKey="date"
-                tickFormatter={(d: string) => {
-                  try {
-                    const dateObj = new Date(d);
-                    return dateObj.toLocaleDateString('en-US', { day: '2-digit', month: 'short' });
-                  } catch {
-                    return d;
-                  }
-                }}
-                tick={{ fill: '#94a3b8', fontSize: 11 }}
-                axisLine={false}
-                tickLine={false}
-              />
-              <YAxis
-                tickFormatter={(val: number) => `$${Math.round(val / 1000)}k`}
-                tick={{ fill: '#94a3b8', fontSize: 11 }}
-                axisLine={false}
-                tickLine={false}
-                domain={[0, 14000]}
-              />
-              <Tooltip
-                content={({ active, payload }) => {
-                  if (!active || !payload || !payload.length) return null;
-                  const item = payload[0].payload as DailyPnlPoint;
-                  return (
-                    <div style={{
-                      background: '#ffffff',
-                      border: '1px solid #e2e8e5',
-                      borderRadius: 8,
-                      padding: '8px 12px',
-                      boxShadow: '0 4px 12px rgba(0,0,0,0.08)',
-                      fontSize: 12,
-                    }}>
-                      <div style={{ color: '#64748b', fontSize: 11 }}>{item.date}</div>
-                      <div style={{ color: '#059669', fontWeight: 700, marginTop: 2 }}>
-                        {fmtSigned(item.cumulative_pnl || 0)}
+          {chartData.length === 0 ? (
+            <div style={{
+              height: '100%',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: '#94a3b8',
+              fontSize: 13,
+            }}>
+              <span style={{ fontSize: 24, marginBottom: 6 }}>📈</span>
+              <p>No P&amp;L chart history yet</p>
+              <span style={{ fontSize: 11.5, color: '#94a3b8', marginTop: 4 }}>
+                Daily snapshots record after US market close to plot the performance curve.
+              </span>
+            </div>
+          ) : (
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={chartData} margin={{ top: 10, right: 10, left: -10, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="chartGradient" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#059669" stopOpacity={0.2} />
+                    <stop offset="100%" stopColor="#059669" stopOpacity={0.0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f3" vertical={false} />
+                <XAxis
+                  dataKey="date"
+                  tickFormatter={(d: string) => {
+                    try {
+                      const dateObj = new Date(d);
+                      return dateObj.toLocaleDateString('en-US', { day: '2-digit', month: 'short' });
+                    } catch {
+                      return d;
+                    }
+                  }}
+                  tick={{ fill: '#94a3b8', fontSize: 11 }}
+                  axisLine={false}
+                  tickLine={false}
+                />
+                <YAxis
+                  tickFormatter={(val: number) => `$${Math.round(val / 1000)}k`}
+                  tick={{ fill: '#94a3b8', fontSize: 11 }}
+                  axisLine={false}
+                  tickLine={false}
+                />
+                <Tooltip
+                  content={({ active, payload }) => {
+                    if (!active || !payload || !payload.length) return null;
+                    const item = payload[0].payload as DailyPnlPoint;
+                    return (
+                      <div style={{
+                        background: '#ffffff',
+                        border: '1px solid #e2e8e5',
+                        borderRadius: 8,
+                        padding: '8px 12px',
+                        boxShadow: '0 4px 12px rgba(0,0,0,0.08)',
+                        fontSize: 12,
+                      }}>
+                        <div style={{ color: '#64748b', fontSize: 11 }}>{item.date}</div>
+                        <div style={{ color: '#059669', fontWeight: 700, marginTop: 2 }}>
+                          {fmtSigned(item.cumulative_pnl || 0)}
+                        </div>
                       </div>
-                    </div>
-                  );
-                }}
-              />
-              <Area
-                type="monotone"
-                dataKey="cumulative_pnl"
-                stroke="#059669"
-                strokeWidth={2.5}
-                fill="url(#chartGradient)"
-              />
-            </AreaChart>
-          </ResponsiveContainer>
+                    );
+                  }}
+                />
+                <Area
+                  type="monotone"
+                  dataKey="cumulative_pnl"
+                  stroke="#059669"
+                  strokeWidth={2.5}
+                  fill="url(#chartGradient)"
+                />
+              </AreaChart>
+            </ResponsiveContainer>
+          )}
         </div>
       </div>
 
@@ -450,23 +466,27 @@ export default function PortfolioTab({
       <div className="stats-cards-grid">
         <div className="stat-metric-card">
           <div className="stat-metric-label">Net Liq</div>
-          <div className="stat-metric-val">$112,458.60</div>
+          <div className="stat-metric-val">{loading ? '—' : fmt(netLiqAud)}</div>
           <div className="stat-metric-subtext">Total account equity</div>
         </div>
         <div className="stat-metric-card">
           <div className="stat-metric-label">Available Cash</div>
-          <div className="stat-metric-val">$44,038.60</div>
-          <div className="stat-metric-subtext">39.2% buying power</div>
+          <div className="stat-metric-val">{loading ? '—' : fmt(availableCashAud)}</div>
+          <div className="stat-metric-subtext">{buyingPowerPct}% buying power</div>
         </div>
         <div className="stat-metric-card">
           <div className="stat-metric-label">Open Pos Value</div>
-          <div className="stat-metric-val">$68,420.00</div>
+          <div className="stat-metric-val">{loading ? '—' : fmt(totalPosValueAud)}</div>
           <div className="stat-metric-subtext">{positions.length} active positions</div>
         </div>
         <div className="stat-metric-card">
           <div className="stat-metric-label">Unrealised P&amp;L</div>
-          <div className="stat-metric-val" style={{ color: '#059669' }}>+$2,654.80</div>
-          <div className="stat-metric-subtext">+4.04% on open cost</div>
+          <div className="stat-metric-val" style={{ color: unrealisedPnl >= 0 ? '#059669' : '#dc2626' }}>
+            {loading ? '—' : fmtSigned(unrealisedPnl * usdToAud)}
+          </div>
+          <div className="stat-metric-subtext">
+            {unrealisedPnl >= 0 ? `+${unrealisedPctOnCost}%` : `${unrealisedPctOnCost}%`} on open cost
+          </div>
         </div>
       </div>
 
@@ -484,71 +504,83 @@ export default function PortfolioTab({
 
         {/* Scrollable table container */}
         <div className="scrollable-table-wrapper" id="open-positions-scroll-container">
-          <table className="custom-data-table" id="table-open-positions">
-            <thead>
-              <tr>
-                <th>Ticker</th>
-                <th>Status</th>
-                <th>Shares</th>
-                <th>Avg Cost</th>
-                <th>Current Price</th>
-                <th>Market Value (AUD)</th>
-                <th>Unrealised P&amp;L</th>
-                <th>Partial Gain</th>
-                <th style={{ textAlign: 'right' }}>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {positions.map((pos) => {
-                const isPartial = pos.trade_status === 'sold_half';
-                const pnlPos = pos.pnl >= 0;
-                // AUD market value calculation
-                const marketValAud = pos.market_value * usdToAud;
-                const pnlAud = pos.pnl * usdToAud;
-                const partialAud = (pos.realised_partial_pnl || 0) * usdToAud;
+          {positions.length === 0 ? (
+            <div style={{
+              padding: '36px 20px',
+              textAlign: 'center',
+              color: '#94a3b8',
+              fontSize: 13,
+            }}>
+              <span style={{ fontSize: 26, display: 'block', marginBottom: 6 }}>📭</span>
+              <p style={{ fontWeight: 600, color: '#475569', marginBottom: 4 }}>No open positions</p>
+              <p style={{ fontSize: 12 }}>Positions will appear here when the bot buys stocks during US market hours.</p>
+            </div>
+          ) : (
+            <table className="custom-data-table" id="table-open-positions">
+              <thead>
+                <tr>
+                  <th>Ticker</th>
+                  <th>Status</th>
+                  <th>Shares</th>
+                  <th>Avg Cost</th>
+                  <th>Current Price</th>
+                  <th>Market Value (AUD)</th>
+                  <th>Unrealised P&amp;L</th>
+                  <th>Partial Gain</th>
+                  <th style={{ textAlign: 'right' }}>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {positions.map((pos) => {
+                  const isPartial = pos.trade_status === 'sold_half';
+                  const pnlPos = pos.pnl >= 0;
+                  const marketValAud = pos.market_value * usdToAud;
+                  const pnlAud = pos.pnl * usdToAud;
+                  const partialAud = (pos.realised_partial_pnl || 0) * usdToAud;
 
-                return (
-                  <tr key={pos.ticker}>
-                    <td style={{ fontWeight: 700, color: '#0f172a' }}>{pos.ticker}</td>
-                    <td>
-                      <span className={isPartial ? 'badge-status-partial' : 'badge-status-open'}>
-                        {isPartial ? '½ Sold' : 'Open'}
-                      </span>
-                    </td>
-                    <td>{pos.shares.toLocaleString()}</td>
-                    <td>{fmt(pos.avg_cost)}</td>
-                    <td>{fmt(pos.current_price)}</td>
-                    <td>{fmt(marketValAud)}</td>
-                    <td style={{ color: pnlPos ? '#059669' : '#dc2626', fontWeight: 600 }}>
-                      {fmtSigned(pnlAud)}
-                    </td>
-                    <td>
-                      {partialAud > 0 ? (
-                        <span style={{ color: '#059669', fontWeight: 600 }}>
-                          {fmtSigned(partialAud)}
+                  return (
+                    <tr key={pos.ticker}>
+                      <td style={{ fontWeight: 700, color: '#0f172a' }}>{pos.ticker}</td>
+                      <td>
+                        <span className={isPartial ? 'badge-status-partial' : 'badge-status-open'}>
+                          {isPartial ? '½ Sold' : 'Open'}
                         </span>
-                      ) : (
-                        <span style={{ color: '#94a3b8' }}>—</span>
-                      )}
-                    </td>
-                    <td style={{ textAlign: 'right' }}>
-                      <button
-                        className="btn-manage-link"
-                        onClick={() => setManagedPosition(pos)}
-                        id={`btn-manage-${pos.ticker}`}
-                      >
-                        Manage
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
-                          <line x1="7" y1="17" x2="17" y2="7" />
-                          <polyline points="7 7 17 7 17 17" />
-                        </svg>
-                      </button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+                      </td>
+                      <td>{pos.shares.toLocaleString()}</td>
+                      <td>{fmt(pos.avg_cost)}</td>
+                      <td>{fmt(pos.current_price)}</td>
+                      <td>{fmt(marketValAud)}</td>
+                      <td style={{ color: pnlPos ? '#059669' : '#dc2626', fontWeight: 600 }}>
+                        {fmtSigned(pnlAud)}
+                      </td>
+                      <td>
+                        {partialAud > 0 ? (
+                          <span style={{ color: '#059669', fontWeight: 600 }}>
+                            {fmtSigned(partialAud)}
+                          </span>
+                        ) : (
+                          <span style={{ color: '#94a3b8' }}>—</span>
+                        )}
+                      </td>
+                      <td style={{ textAlign: 'right' }}>
+                        <button
+                          className="btn-manage-link"
+                          onClick={() => setManagedPosition(pos)}
+                          id={`btn-manage-${pos.ticker}`}
+                        >
+                          Manage
+                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+                            <line x1="7" y1="17" x2="17" y2="7" />
+                            <polyline points="7 7 17 7 17 17" />
+                          </svg>
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
         </div>
 
         {/* Footer Subtext */}

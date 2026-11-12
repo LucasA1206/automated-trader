@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 
 type AuthFetch = (url: string, init?: RequestInit) => Promise<Response>;
 
@@ -10,14 +10,14 @@ interface Props {
 }
 
 export default function SettingsTab({ onModeChange, authFetch }: Props) {
-  // Master Controls
+  // Master Controls & Automation
   const [automatedTrading, setAutomatedTrading] = useState(true);
   const [dailyAiAnalysis, setDailyAiAnalysis] = useState(true);
   const [newEntries, setNewEntries] = useState(true);
   const [exitManagement, setExitManagement] = useState(true);
 
   // Entry Confirmation Rules
-  const [vwapConfirmation, setVwapConfirmation] = useState(true);
+  const [vwapConfirmation, setVwapConfirmation] = useState(false);
   const [volumeConfirmation, setVolumeConfirmation] = useState(true);
   const [minRelVol, setMinRelVol] = useState('1.5×');
   const [maxRsi, setMaxRsi] = useState('70');
@@ -26,14 +26,12 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
   // Paper Simulation Strategy
   const [startingCapital, setStartingCapital] = useState('$100,000');
   const [maxPosSize, setMaxPosSize] = useState('5%');
-  const [maxOpenPositions, setMaxOpenPositions] = useState('10');
+  const [maxOpenPositions, setMaxOpenPositions] = useState('8');
   const [stopLoss, setStopLoss] = useState('3%');
   const [takeProfit, setTakeProfit] = useState('6% / 50%');
 
-  // IBKR Account Type
+  // IBKR Account Type & Mode
   const [accountType, setAccountType] = useState<'paper' | 'live'>('paper');
-
-  // Trading Mode
   const [tradingModeSelect, setTradingModeSelect] = useState('Automated paper trading');
 
   // Scheduled Jobs
@@ -47,9 +45,12 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
   const [showLiveConfirm, setShowLiveConfirm] = useState(false);
   const [dangerConfirmAction, setDangerConfirmAction] = useState<string | null>(null);
 
-  const syncDateString = '12 NOV 2026 · LAST SYNC 09:42:08 AEDT';
+  const syncDateString = useMemo(() => {
+    const now = new Date();
+    return `${now.toLocaleDateString('en-AU', { day: '2-digit', month: 'short', year: 'numeric' }).toUpperCase()} · LAST SYNC ${now.toLocaleTimeString('en-AU')} AEDT`;
+  }, []);
 
-  // Load existing settings from API if available
+  // Load existing settings from API
   const fetchSettings = useCallback(async () => {
     try {
       const res = await authFetch('/api/settings');
@@ -64,9 +65,21 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
         if (data.scan_enabled !== undefined) {
           setDailyAiAnalysis(data.scan_enabled === 'true');
         }
+        if (data.max_positions) {
+          setMaxOpenPositions(data.max_positions);
+        }
+        if (data.entry_vwap_required !== undefined) {
+          setVwapConfirmation(data.entry_vwap_required === 'true');
+        }
+        if (data.entry_min_rel_vol) {
+          setMinRelVol(`${data.entry_min_rel_vol}×`);
+        }
+        if (data.entry_rsi_max) {
+          setMaxRsi(data.entry_rsi_max);
+        }
       }
     } catch {
-      // Fallback
+      // Fail silently
     }
   }, [authFetch]);
 
@@ -78,20 +91,31 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
     setSaving(true);
     setSaveStatus(null);
     try {
-      await authFetch('/api/settings', {
+      const cleanRelVol = minRelVol.replace('×', '').trim();
+      const cleanMaxPos = maxOpenPositions.trim();
+      const cleanRsi = maxRsi.trim();
+
+      const res = await authFetch('/api/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           trading_mode: accountType,
           trader_enabled: automatedTrading ? 'true' : 'false',
           scan_enabled: dailyAiAnalysis ? 'true' : 'false',
-          max_positions: maxOpenPositions,
+          max_positions: cleanMaxPos,
+          entry_vwap_required: vwapConfirmation ? 'true' : 'false',
+          entry_min_rel_vol: cleanRelVol,
+          entry_rsi_max: cleanRsi,
         }),
       });
-      setSaveStatus('Changes saved successfully');
-      onModeChange(accountType);
+      if (res.ok) {
+        setSaveStatus('Changes saved successfully');
+        onModeChange(accountType);
+      } else {
+        setSaveStatus('Save failed');
+      }
     } catch {
-      setSaveStatus('Saved locally');
+      setSaveStatus('Network error while saving');
     } finally {
       setSaving(false);
       setTimeout(() => setSaveStatus(null), 3500);
@@ -112,6 +136,36 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
     setShowLiveConfirm(false);
     onModeChange('live');
     handleSave();
+  };
+
+  // Danger zone executions
+  const handleDangerExecution = async (action: string) => {
+    setDangerConfirmAction(null);
+    setSaving(true);
+    setSaveStatus(null);
+    try {
+      if (action === 'Pause all automation') {
+        await authFetch('/api/settings', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ trader_enabled: 'false' }),
+        });
+        setAutomatedTrading(false);
+        setSaveStatus('Automation paused');
+      } else if (action === 'Close all paper positions') {
+        const res = await authFetch('/api/sell-all-ibkr', { method: 'POST' });
+        const json = await res.json();
+        setSaveStatus(json.message || 'Orders submitted to close all positions');
+      } else if (action === 'Reset paper account') {
+        await authFetch('/api/reset-pnl-history', { method: 'POST' });
+        setSaveStatus('Paper account and history reset');
+      }
+    } catch {
+      setSaveStatus('Action failed to execute');
+    } finally {
+      setSaving(false);
+      setTimeout(() => setSaveStatus(null), 4000);
+    }
   };
 
   return (
@@ -135,7 +189,9 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
           A safe space to refine your strategy.
         </div>
         <div style={{ fontSize: 13, color: '#475569' }}>
-          Paper trading is active. Your live IBKR account is not being used.
+          {accountType === 'live'
+            ? 'Live trading is active. Real orders are placed on your IBKR account.'
+            : 'Paper trading is active. Your live IBKR account is not being used.'}
         </div>
       </div>
 
@@ -153,7 +209,7 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
             <div className="setting-toggle-row">
               <div>
                 <div className="setting-row-title">Automated trading</div>
-                <div className="setting-row-desc">Allow strategy-generated paper orders.</div>
+                <div className="setting-row-desc">Allow strategy-generated orders.</div>
               </div>
               <label className="toggle-switch">
                 <input
@@ -613,11 +669,7 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
               <button
                 className="btn-primary-dark"
                 style={{ background: '#dc2626' }}
-                onClick={() => {
-                  setDangerConfirmAction(null);
-                  setSaveStatus(`Executed: ${dangerConfirmAction}`);
-                  setTimeout(() => setSaveStatus(null), 3500);
-                }}
+                onClick={() => handleDangerExecution(dangerConfirmAction)}
               >
                 Confirm
               </button>
