@@ -696,7 +696,7 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
           display: none;
         }
 
-        @media (max-width: 900px) {
+        @media (max-width: 992px) {
           .settings-columns-grid {
             grid-template-columns: 1fr;
             gap: 20px;
@@ -705,9 +705,6 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
             grid-template-columns: 1fr;
             gap: 12px;
           }
-        }
-
-        @media (max-width: 768px) {
           .desktop-save-text {
             display: none;
           }

@@ -55,27 +55,6 @@ export default function Home() {
 
   return (
     <div className="app-container">
-      {/* Mobile Top Header (Phones) */}
-      <header className="mobile-app-header">
-        <button
-          className="mobile-hamburger-btn"
-          onClick={() => setIsMobileMenuOpen(true)}
-          aria-label="Open menu"
-          id="btn-open-mobile-menu"
-        >
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-            <line x1="3" y1="12" x2="21" y2="12" />
-            <line x1="3" y1="6" x2="21" y2="6" />
-            <line x1="3" y1="18" x2="21" y2="18" />
-          </svg>
-        </button>
-        <span className="mobile-app-title">Automated Trader</span>
-        <div className={tradingMode === 'live' ? 'badge-live' : 'badge-paper'}>
-          <span className="status-dot-green" style={{ background: tradingMode === 'live' ? '#ef4444' : '#10b981' }} />
-          <span>{tradingMode === 'live' ? 'Live' : 'Paper'}</span>
-        </div>
-      </header>
-
       {/* Sidebar (Desktop collapsible & Mobile drawer) */}
       <Sidebar
         activeTab={activeTab}
@@ -90,7 +69,28 @@ export default function Home() {
       />
 
       {/* Main Content Area */}
-      <main className="main-viewport">
+      <div className="main-viewport">
+        {/* Mobile Top Header (Phones / Webapp) */}
+        <header className="mobile-app-header">
+          <button
+            className="mobile-hamburger-btn"
+            onClick={() => setIsMobileMenuOpen(true)}
+            aria-label="Open menu"
+            id="btn-open-mobile-menu"
+          >
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="3" y1="12" x2="21" y2="12" />
+              <line x1="3" y1="6" x2="21" y2="6" />
+              <line x1="3" y1="18" x2="21" y2="18" />
+            </svg>
+          </button>
+          <span className="mobile-app-title">Automated Trader</span>
+          <div className={tradingMode === 'live' ? 'badge-live' : 'badge-paper'}>
+            <span className="status-dot-green" style={{ background: tradingMode === 'live' ? '#ef4444' : '#10b981' }} />
+            <span>{tradingMode === 'live' ? 'Live' : 'Paper'}</span>
+          </div>
+        </header>
+
         <div className="page-content-wrapper">
           {/* Desktop Top Breadcrumbs Bar */}
           <div className="desktop-top-bar">
@@ -130,7 +130,7 @@ export default function Home() {
             />
           )}
         </div>
-      </main>
+      </div>
     </div>
   );
 }

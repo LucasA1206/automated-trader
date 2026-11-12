@@ -505,7 +505,7 @@ export default function AIAnalysisTab({
           padding: 0 20px;
         }
 
-        @media (max-width: 768px) {
+        @media (max-width: 992px) {
           .candidate-details-grid {
             grid-template-columns: 1fr;
             gap: 16px;

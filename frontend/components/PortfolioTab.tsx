@@ -57,11 +57,15 @@ interface DailyPnlPoint {
   date: string;
   daily_pnl: number;
   cumulative_pnl: number;
+  daily_pnl_aud?: number;
+  cumulative_pnl_aud?: number;
   net_liq_usd?: number | null;
   daily_pct?: number;
   cumulative_pct?: number;
   daily_fees?: number;
+  daily_fees_aud?: number;
   cumulative_fees?: number;
+  source?: string;
 }
 
 interface PnlHistory {
@@ -100,6 +104,8 @@ function fmtSigned(val: number | null | undefined, prefix = '$'): string {
     maximumFractionDigits: 2,
   })}`;
 }
+
+const STARTING_CAPITAL_AUD = 7900;
 
 export default function PortfolioTab({
   authFetch,
@@ -218,8 +224,6 @@ export default function PortfolioTab({
   const totalPosValueUsd = positions.reduce((sum, p) => sum + (p.market_value || 0), 0);
   const totalPosValueAud = totalPosValueUsd * usdToAud;
 
-  const realizedPnlUsd = pnlHistory?.all_time_realized_pnl ?? 0;
-  const realizedPnlAud = realizedPnlUsd * usdToAud;
   const allTimeFeesUsd = pnlHistory?.all_time_fees ?? 0;
   const allTimeFeesAud = allTimeFeesUsd * usdToAud;
 
@@ -227,15 +231,29 @@ export default function PortfolioTab({
   const openPnlUsd = unrealisedPnl + openPartialPnl;
   const openPnlAud = openPnlUsd * usdToAud;
 
-  // Net Liquidation
-  const netLiqUsd = account.NetLiquidation ?? 0;
-  const netLiqAud = account.NetLiquidation_AUD ?? (netLiqUsd * usdToAud);
-  const availableCashUsd = account.AvailableFunds ?? account.TotalCashValue ?? 0;
-  const availableCashAud = account.AvailableFunds_AUD ?? (availableCashUsd * usdToAud);
+  // Net Liquidation & Available Cash from IBKR
+  // Handle per-currency balances safely, falling back to USD * FX if AUD is 0 or absent
+  const netLiqRawAud = Number(account.NetLiquidation_AUD || 0);
+  const netLiqRawUsd = Number(account.NetLiquidation || 0);
+  const netLiqAud = netLiqRawAud > 0
+    ? netLiqRawAud
+    : (netLiqRawUsd > 0 ? netLiqRawUsd * usdToAud : 0);
+  const netLiqUsd = netLiqRawUsd > 0
+    ? netLiqRawUsd
+    : (netLiqRawAud > 0 ? netLiqRawAud * audToUsd : 0);
 
-  // All-time P&L calculation based on Net Liquidation vs starting capital
-  const STARTING_CAPITAL_AUD = 7900;
-  const allTimePnlAud = netLiqAud > 0 ? netLiqAud - STARTING_CAPITAL_AUD : (realizedPnlAud + openPnlAud);
+  const availRawAud = Number(account.AvailableFunds_AUD || account.TotalCashValue_AUD || 0);
+  const availRawUsd = Number(account.AvailableFunds || account.TotalCashValue || 0);
+  const availableCashAud = availRawAud > 0
+    ? availRawAud
+    : (availRawUsd > 0 ? availRawUsd * usdToAud : 0);
+  const availableCashUsd = availRawUsd > 0
+    ? availRawUsd
+    : (availRawAud > 0 ? availRawAud * audToUsd : 0);
+
+  // All-time Realised / All-Time P&L: calculated directly from $7,900 starting capital vs current Net Liq in AUD
+  // If netLiqAud is $7,500, user is down $400 (-A$400.00). If $8,100, user is up $200 (+A$200.00).
+  const allTimePnlAud = netLiqAud > 0 ? (netLiqAud - STARTING_CAPITAL_AUD) : 0;
   const allTimePnlUsd = allTimePnlAud * audToUsd;
   const allTimePnlPositive = allTimePnlAud >= 0;
 
@@ -265,7 +283,114 @@ export default function PortfolioTab({
     return `${dateFormatted} · LAST SYNC ${timeFormatted} AEDT`;
   }, [lastUpdated]);
 
-  const chartData = pnlHistory?.chart_data ?? [];
+  // Construct chart dataset enriched with AUD values and today's live point
+  const rawChartData = useMemo(() => {
+    const list = pnlHistory?.chart_data ?? [];
+    const todayStr = new Date().toISOString().split('T')[0];
+
+    const liveCumulativeAud = netLiqAud > 0 ? (netLiqAud - STARTING_CAPITAL_AUD) : openPnlAud;
+    const liveCumulativeUsd = liveCumulativeAud * audToUsd;
+    const liveDailyAud = openPnlAud;
+    const liveDailyUsd = openPnlUsd;
+
+    const livePoint: DailyPnlPoint = {
+      date: todayStr,
+      daily_pnl: liveDailyUsd,
+      cumulative_pnl: liveCumulativeUsd,
+      daily_pnl_aud: liveDailyAud,
+      cumulative_pnl_aud: liveCumulativeAud,
+      daily_fees: 0,
+      daily_fees_aud: 0,
+      net_liq_usd: netLiqUsd,
+    };
+
+    if (list.length === 0) {
+      if (netLiqAud > 0) {
+        // If no snapshots captured yet, create baseline starting capital (7 days ago) + today's live point
+        const dBaseline = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
+        return [
+          {
+            date: dBaseline,
+            daily_pnl: 0,
+            cumulative_pnl: 0,
+            daily_pnl_aud: 0,
+            cumulative_pnl_aud: 0,
+            daily_fees: 0,
+            daily_fees_aud: 0,
+            net_liq_usd: STARTING_CAPITAL_AUD * audToUsd,
+          },
+          livePoint,
+        ];
+      }
+      return [];
+    }
+
+    const enriched: DailyPnlPoint[] = list.map((item) => ({
+      ...item,
+      daily_pnl_aud: (item.daily_pnl || 0) * usdToAud,
+      cumulative_pnl_aud: (item.cumulative_pnl || 0) * usdToAud,
+      daily_fees_aud: (item.daily_fees || 0) * usdToAud,
+    }));
+
+    const last = enriched[enriched.length - 1];
+    if (last.date === todayStr) {
+      return [...enriched.slice(0, -1), { ...last, ...livePoint }];
+    }
+    return [...enriched, livePoint];
+  }, [pnlHistory?.chart_data, netLiqAud, netLiqUsd, openPnlAud, openPnlUsd, usdToAud, audToUsd]);
+
+  // Filter chart data by timeframe
+  const filteredChartData = useMemo(() => {
+    if (rawChartData.length === 0) return [];
+    if (timeframe === 'All time') return rawChartData;
+
+    const daysMap: Record<'1W' | '1M' | '3M' | '1Y', number> = {
+      '1W': 7,
+      '1M': 30,
+      '3M': 90,
+      '1Y': 365,
+    };
+    const days = daysMap[timeframe] || 7;
+    const now = Date.now();
+    const cutoff = now - days * 86400000;
+
+    const subset = rawChartData.filter((pt) => {
+      const t = new Date(pt.date).getTime();
+      return !isNaN(t) && t >= cutoff;
+    });
+
+    // Ensure at least 2 points render if available in the dataset
+    if (subset.length < 2 && rawChartData.length >= 2) {
+      const count = timeframe === '1W' ? 7 : timeframe === '1M' ? 30 : timeframe === '3M' ? 90 : 365;
+      return rawChartData.slice(-Math.min(count, rawChartData.length));
+    }
+
+    return subset.length > 0 ? subset : rawChartData;
+  }, [rawChartData, timeframe]);
+
+  // Calculate P&L over the selected timeframe for the banner and color
+  const { periodPnlAud, periodPnlIsPositive } = useMemo(() => {
+    if (timeframe === 'All time') {
+      const pnl = netLiqAud > 0 ? (netLiqAud - STARTING_CAPITAL_AUD) : allTimePnlAud;
+      return { periodPnlAud: pnl, periodPnlIsPositive: pnl >= 0 };
+    }
+
+    if (filteredChartData.length >= 2) {
+      const first = filteredChartData[0];
+      const last = filteredChartData[filteredChartData.length - 1];
+      const delta = (last.cumulative_pnl_aud ?? 0) - (first.cumulative_pnl_aud ?? 0);
+      return { periodPnlAud: delta, periodPnlIsPositive: delta >= 0 };
+    } else if (filteredChartData.length === 1) {
+      const dayPnl = filteredChartData[0].daily_pnl_aud ?? 0;
+      return { periodPnlAud: dayPnl, periodPnlIsPositive: dayPnl >= 0 };
+    }
+
+    return { periodPnlAud: 0, periodPnlIsPositive: true };
+  }, [timeframe, netLiqAud, allTimePnlAud, filteredChartData]);
+
+  // Dynamic chart colors: emerald green if positive, vibrant red if negative
+  const chartStrokeColor = periodPnlIsPositive ? '#059669' : '#ef4444';
+  const chartGradientId = periodPnlIsPositive ? 'chartGradGreen' : 'chartGradRed';
 
   return (
     <div>
@@ -283,10 +408,14 @@ export default function PortfolioTab({
             <div className="hero-pnl-label">ALL TIME P&amp;L</div>
             <div className="hero-pnl-amounts">
               <span className="hero-pnl-main" style={{ color: allTimePnlPositive ? '#ffffff' : '#f87171' }}>
-                {loading ? '—' : fmtSigned(allTimePnlAud)}
+                {loading ? '—' : (
+                  allTimePnlPositive
+                    ? `+${fmt(allTimePnlAud, 'A$')}`
+                    : `-${fmt(Math.abs(allTimePnlAud), 'A$')}`
+                )}
               </span>
               <span className="hero-pnl-usd" style={{ color: allTimePnlPositive ? '#34d399' : '#f87171' }}>
-                {loading ? '—' : `${fmtSigned(allTimePnlUsd)} USD`}
+                {loading ? '—' : `${fmtSigned(allTimePnlUsd, '$')} USD`}
               </span>
             </div>
           </div>
@@ -325,23 +454,27 @@ export default function PortfolioTab({
         <div className="hero-pnl-metrics-row">
           <div className="hero-metric-item">
             <div className="label">Net Liq</div>
-            <div className="value">{loading ? '—' : fmt(netLiqAud)}</div>
+            <div className="value">{loading ? '—' : fmt(netLiqAud, 'A$')}</div>
           </div>
           <div className="hero-metric-item">
             <div className="label">Open P&amp;L</div>
             <div className="value" style={{ color: openPnlAud >= 0 ? '#34d399' : '#f87171' }}>
-              {loading ? '—' : fmtSigned(openPnlAud)}
+              {loading ? '—' : fmtSigned(openPnlAud, 'A$')}
             </div>
           </div>
           <div className="hero-metric-item">
             <div className="label">All Time Realised</div>
-            <div className="value" style={{ color: realizedPnlAud >= 0 ? '#34d399' : '#f87171' }}>
-              {loading ? '—' : fmtSigned(realizedPnlAud)}
+            <div className="value" style={{ color: allTimePnlPositive ? '#34d399' : '#f87171' }}>
+              {loading ? '—' : (
+                allTimePnlPositive
+                  ? `+${fmt(allTimePnlAud, 'A$')}`
+                  : `-${fmt(Math.abs(allTimePnlAud), 'A$')}`
+              )}
             </div>
           </div>
           <div className="hero-metric-item">
             <div className="label">Fees Paid</div>
-            <div className="value">{loading ? '—' : fmt(allTimeFeesAud)}</div>
+            <div className="value">{loading ? '—' : fmt(allTimeFeesAud, 'A$')}</div>
           </div>
         </div>
       </div>
@@ -351,12 +484,28 @@ export default function PortfolioTab({
         <div className="table-header-flex">
           <div>
             <h3 className="table-title-bold">P&amp;L Over Time</h3>
-            <div style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>
-              {allTimePnlPositive ? `+${fmt(allTimePnlAud)}` : `-${fmt(allTimePnlAud)}`} · live portfolio tracking
+            {/* Banner above graph: updates dynamically with timeframe P&L and status */}
+            <div style={{
+              fontSize: 13,
+              fontWeight: 700,
+              color: periodPnlIsPositive ? '#059669' : '#ef4444',
+              marginTop: 2,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+            }}>
+              <span>
+                {periodPnlIsPositive
+                  ? `+${fmt(periodPnlAud, 'A$')}`
+                  : `-${fmt(Math.abs(periodPnlAud), 'A$')}`}
+              </span>
+              <span style={{ color: '#64748b', fontWeight: 500, fontSize: 12 }}>
+                · {timeframe === 'All time' ? 'all time' : `past ${timeframe}`}
+              </span>
             </div>
           </div>
-          {/* Timeframe selector (Desktop) */}
-          <div style={{ display: 'flex', gap: 6 }}>
+          {/* Timeframe selector */}
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
             {(['1W', '1M', '3M', '1Y', 'All time'] as const).map((tf) => (
               <button
                 key={tf}
@@ -382,7 +531,7 @@ export default function PortfolioTab({
 
         {/* Recharts Area Curve */}
         <div style={{ height: 260, width: '100%', marginTop: 12 }}>
-          {chartData.length === 0 ? (
+          {filteredChartData.length === 0 ? (
             <div style={{
               height: '100%',
               display: 'flex',
@@ -400,11 +549,15 @@ export default function PortfolioTab({
             </div>
           ) : (
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={chartData} margin={{ top: 10, right: 10, left: -10, bottom: 0 }}>
+              <AreaChart data={filteredChartData} margin={{ top: 10, right: 10, left: -10, bottom: 0 }}>
                 <defs>
-                  <linearGradient id="chartGradient" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#059669" stopOpacity={0.2} />
+                  <linearGradient id="chartGradGreen" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#059669" stopOpacity={0.25} />
                     <stop offset="100%" stopColor="#059669" stopOpacity={0.0} />
+                  </linearGradient>
+                  <linearGradient id="chartGradRed" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#ef4444" stopOpacity={0.25} />
+                    <stop offset="100%" stopColor="#ef4444" stopOpacity={0.0} />
                   </linearGradient>
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f3" vertical={false} />
@@ -412,6 +565,11 @@ export default function PortfolioTab({
                   dataKey="date"
                   tickFormatter={(d: string) => {
                     try {
+                      const parts = d.split('-');
+                      if (parts.length === 3) {
+                        const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+                        return `${parseInt(parts[2], 10)} ${months[parseInt(parts[1], 10) - 1]}`;
+                      }
                       const dateObj = new Date(d);
                       return dateObj.toLocaleDateString('en-US', { day: '2-digit', month: 'short' });
                     } catch {
@@ -423,7 +581,12 @@ export default function PortfolioTab({
                   tickLine={false}
                 />
                 <YAxis
-                  tickFormatter={(val: number) => `$${Math.round(val / 1000)}k`}
+                  tickFormatter={(val: number) => {
+                    if (Math.abs(val) >= 1000) {
+                      return `${val >= 0 ? '' : '-'}$${(Math.abs(val) / 1000).toFixed(1)}k`;
+                    }
+                    return `${val >= 0 ? '' : '-'}$${Math.abs(Math.round(val))}`;
+                  }}
                   tick={{ fill: '#94a3b8', fontSize: 11 }}
                   axisLine={false}
                   tickLine={false}
@@ -431,19 +594,70 @@ export default function PortfolioTab({
                 <Tooltip
                   content={({ active, payload }) => {
                     if (!active || !payload || !payload.length) return null;
-                    const item = payload[0].payload as DailyPnlPoint;
+                    const pt = payload[0].payload as DailyPnlPoint;
+                    const dayMade = Number(pt.daily_pnl_aud ?? ((pt.daily_pnl || 0) * usdToAud));
+                    const allTimeOnDay = Number(pt.cumulative_pnl_aud ?? ((pt.cumulative_pnl || 0) * usdToAud));
+                    const feesPaid = Number(pt.daily_fees_aud ?? ((pt.daily_fees || 0) * usdToAud));
+
+                    let formattedDate = pt.date;
+                    try {
+                      const d = new Date(pt.date);
+                      if (!isNaN(d.getTime())) {
+                        formattedDate = d.toLocaleDateString('en-AU', {
+                          day: '2-digit',
+                          month: 'short',
+                          year: 'numeric',
+                        });
+                      }
+                    } catch {}
+
+                    const isDownAllTime = allTimeOnDay < 0;
+
                     return (
                       <div style={{
                         background: '#ffffff',
                         border: '1px solid #e2e8e5',
                         borderRadius: 8,
-                        padding: '8px 12px',
-                        boxShadow: '0 4px 12px rgba(0,0,0,0.08)',
+                        padding: '10px 14px',
+                        boxShadow: '0 6px 20px rgba(0,0,0,0.12)',
                         fontSize: 12,
+                        minWidth: 200,
                       }}>
-                        <div style={{ color: '#64748b', fontSize: 11 }}>{item.date}</div>
-                        <div style={{ color: '#059669', fontWeight: 700, marginTop: 2 }}>
-                          {fmtSigned(item.cumulative_pnl || 0)}
+                        <div style={{
+                          fontWeight: 700,
+                          color: '#0f172a',
+                          marginBottom: 8,
+                          borderBottom: '1px solid #f1f5f3',
+                          paddingBottom: 4,
+                          fontSize: 12,
+                        }}>
+                          {formattedDate}
+                        </div>
+
+                        {/* 1. How much made that day */}
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 5 }}>
+                          <span style={{ color: '#64748b' }}>Made that day:</span>
+                          <span style={{ fontWeight: 700, color: dayMade >= 0 ? '#059669' : '#ef4444' }}>
+                            {dayMade >= 0 ? `+${fmt(dayMade, 'A$')}` : `-${fmt(Math.abs(dayMade), 'A$')}`}
+                          </span>
+                        </div>
+
+                        {/* 2. How much down all time on that day */}
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 5 }}>
+                          <span style={{ color: '#64748b' }}>
+                            {isDownAllTime ? 'Down all time:' : 'Up all time:'}
+                          </span>
+                          <span style={{ fontWeight: 700, color: isDownAllTime ? '#ef4444' : '#059669' }}>
+                            {isDownAllTime ? `-${fmt(Math.abs(allTimeOnDay), 'A$')}` : `+${fmt(allTimeOnDay, 'A$')}`}
+                          </span>
+                        </div>
+
+                        {/* 3. Fees paid that day */}
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <span style={{ color: '#64748b' }}>Fees paid that day:</span>
+                          <span style={{ fontWeight: 600, color: '#0f172a' }}>
+                            {fmt(feesPaid, 'A$')}
+                          </span>
                         </div>
                       </div>
                     );
@@ -451,10 +665,10 @@ export default function PortfolioTab({
                 />
                 <Area
                   type="monotone"
-                  dataKey="cumulative_pnl"
-                  stroke="#059669"
+                  dataKey="cumulative_pnl_aud"
+                  stroke={chartStrokeColor}
                   strokeWidth={2.5}
-                  fill="url(#chartGradient)"
+                  fill={`url(#${chartGradientId})`}
                 />
               </AreaChart>
             </ResponsiveContainer>
@@ -466,23 +680,23 @@ export default function PortfolioTab({
       <div className="stats-cards-grid">
         <div className="stat-metric-card">
           <div className="stat-metric-label">Net Liq</div>
-          <div className="stat-metric-val">{loading ? '—' : fmt(netLiqAud)}</div>
+          <div className="stat-metric-val">{loading ? '—' : fmt(netLiqAud, 'A$')}</div>
           <div className="stat-metric-subtext">Total account equity</div>
         </div>
         <div className="stat-metric-card">
           <div className="stat-metric-label">Available Cash</div>
-          <div className="stat-metric-val">{loading ? '—' : fmt(availableCashAud)}</div>
+          <div className="stat-metric-val">{loading ? '—' : fmt(availableCashAud, 'A$')}</div>
           <div className="stat-metric-subtext">{buyingPowerPct}% buying power</div>
         </div>
         <div className="stat-metric-card">
           <div className="stat-metric-label">Open Pos Value</div>
-          <div className="stat-metric-val">{loading ? '—' : fmt(totalPosValueAud)}</div>
+          <div className="stat-metric-val">{loading ? '—' : fmt(totalPosValueAud, 'A$')}</div>
           <div className="stat-metric-subtext">{positions.length} active positions</div>
         </div>
         <div className="stat-metric-card">
           <div className="stat-metric-label">Unrealised P&amp;L</div>
           <div className="stat-metric-val" style={{ color: unrealisedPnl >= 0 ? '#059669' : '#dc2626' }}>
-            {loading ? '—' : fmtSigned(unrealisedPnl * usdToAud)}
+            {loading ? '—' : fmtSigned(unrealisedPnl * usdToAud, 'A$')}
           </div>
           <div className="stat-metric-subtext">
             {unrealisedPnl >= 0 ? `+${unrealisedPctOnCost}%` : `${unrealisedPctOnCost}%`} on open cost
@@ -549,14 +763,14 @@ export default function PortfolioTab({
                       <td>{pos.shares.toLocaleString()}</td>
                       <td>{fmt(pos.avg_cost)}</td>
                       <td>{fmt(pos.current_price)}</td>
-                      <td>{fmt(marketValAud)}</td>
+                      <td>{fmt(marketValAud, 'A$')}</td>
                       <td style={{ color: pnlPos ? '#059669' : '#dc2626', fontWeight: 600 }}>
-                        {fmtSigned(pnlAud)}
+                        {fmtSigned(pnlAud, 'A$')}
                       </td>
                       <td>
                         {partialAud > 0 ? (
                           <span style={{ color: '#059669', fontWeight: 600 }}>
-                            {fmtSigned(partialAud)}
+                            {fmtSigned(partialAud, 'A$')}
                           </span>
                         ) : (
                           <span style={{ color: '#94a3b8' }}>—</span>
@@ -601,7 +815,7 @@ export default function PortfolioTab({
 
       {/* Bottom disclaimer */}
       <div style={{ textAlign: 'center', fontSize: 12, color: '#94a3b8', marginTop: 24 }}>
-        Paper trading · Simulated funds. No real orders are placed.
+        {tradingMode === 'live' ? 'Live trading mode · Real orders are active.' : 'Paper trading · Simulated funds. No real orders are placed.'}
       </div>
 
       {/* ── Manage Position Modal ───────────────────────────────── */}
@@ -656,13 +870,13 @@ export default function PortfolioTab({
               <div>
                 <span style={{ color: '#64748b' }}>Market Value (AUD):</span>
                 <div style={{ fontWeight: 600, color: '#0f172a' }}>
-                  {fmt(managedPosition.market_value * usdToAud)}
+                  {fmt(managedPosition.market_value * usdToAud, 'A$')}
                 </div>
               </div>
               <div>
                 <span style={{ color: '#64748b' }}>Unrealised P&amp;L:</span>
                 <div style={{ fontWeight: 600, color: managedPosition.pnl >= 0 ? '#059669' : '#dc2626' }}>
-                  {fmtSigned(managedPosition.pnl * usdToAud)}
+                  {fmtSigned(managedPosition.pnl * usdToAud, 'A$')}
                 </div>
               </div>
               <div>

@@ -527,13 +527,7 @@ export default function TradeHistoryTab({
           display: none;
         }
 
-        @media (max-width: 900px) {
-          .trade-history-stat-grid {
-            grid-template-columns: repeat(3, 1fr);
-          }
-        }
-
-        @media (max-width: 768px) {
+        @media (max-width: 992px) {
           .trade-history-stat-grid {
             grid-template-columns: repeat(2, 1fr);
             gap: 10px;
