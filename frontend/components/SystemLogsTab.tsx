@@ -359,7 +359,7 @@ export default function SystemLogsTab({
           display: none;
         }
 
-        @media (max-width: 768px) {
+        @media (max-width: 992px) {
           .logs-filter-grid {
             grid-template-columns: 1fr 1fr;
             gap: 8px;
