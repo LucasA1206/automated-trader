@@ -364,6 +364,75 @@ def _sanity_check_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return df
 
 
+def _fetch_ohlcv_ibkr(ticker: str, period: str = "1y") -> Optional[pd.DataFrame]:
+    """
+    Direct institutional data fallback via Interactive Brokers Gateway.
+    Called when yfinance fails, rate limits, or returns empty data.
+    Fetches clean OHLCV bars directly from IBKR reqHistoricalData.
+    """
+    try:
+        from trader import IBKRClient
+        from ib_insync import Stock, util
+
+        p_lower = str(period).lower()
+        if p_lower in ("1y", "1year", "252d"):
+            duration_str = "1 Y"
+        elif p_lower in ("60d", "2mo", "3mo"):
+            duration_str = "3 M"
+        elif p_lower in ("22d", "1mo"):
+            duration_str = "1 M"
+        elif p_lower in ("10d", "5d"):
+            duration_str = "10 D"
+        else:
+            duration_str = "1 Y"
+
+        client = IBKRClient()
+        if not client.connect(retries=1, delay=1):
+            return None
+
+        contract = Stock(ticker, "SMART", "USD")
+        client.ib.qualifyContracts(contract)
+
+        bars = client.ib.reqHistoricalData(
+            contract,
+            endDateTime="",
+            durationStr=duration_str,
+            barSizeSetting="1 day",
+            whatToShow="TRADES",
+            useRTH=True,
+            formatDate=1,
+        )
+        client.disconnect()
+
+        if not bars:
+            return None
+
+        df = util.df(bars)
+        if df is None or df.empty or len(df) < 5:
+            return None
+
+        rename_map = {
+            "date": "Date",
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }
+        df.rename(columns=rename_map, inplace=True)
+        if "Date" in df.columns:
+            df["Date"] = pd.to_datetime(df["Date"])
+            df.set_index("Date", inplace=True)
+
+        cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+        df = df[cols].astype(float)
+        logger.info("[DataLayer] Successfully fetched %d bars for %s directly via IBKR historical fallback.", len(df), ticker)
+        return df
+    except Exception as exc:
+        logger.debug("[DataLayer] IBKR historical data fallback failed for %s: %s", ticker, exc)
+        return None
+
+
 # ─── OHLCV History ────────────────────────────────────────────────────────────
 
 def fetch_ohlcv(ticker: str, period: str = "1y") -> Optional[pd.DataFrame]:
@@ -376,7 +445,12 @@ def fetch_ohlcv(ticker: str, period: str = "1y") -> Optional[pd.DataFrame]:
     """
     global _yfinance_blocked
     if _yfinance_blocked:
-        logger.debug("[DataLayer] yfinance is marked as blocked. Skipping fetch for %s", ticker)
+        logger.debug("[DataLayer] yfinance is marked as blocked. Attempting IBKR fallback for %s", ticker)
+        ib_df = _fetch_ohlcv_ibkr(ticker, period=period)
+        if ib_df is not None:
+            with _cache_lock:
+                _ohlcv_cache[ticker] = {"data": ib_df, "fetched": datetime.now(timezone.utc)}
+            return ib_df
         return None
 
     with _cache_lock:
@@ -400,7 +474,11 @@ def fetch_ohlcv(ticker: str, period: str = "1y") -> Optional[pd.DataFrame]:
         df.index = pd.to_datetime(df.index)
         return df
 
-    df = _retry(_fetch, retries=3, base_delay=1.0, label=f"OHLCV({ticker})")
+    df = _retry(_fetch, retries=2, base_delay=1.0, label=f"OHLCV({ticker})")
+    if df is None:
+        logger.info("[DataLayer] %s: yfinance fetch failed or rate limited. Attempting direct IBKR historical fallback...", ticker)
+        df = _fetch_ohlcv_ibkr(ticker, period=period)
+
     if df is None:
         return None
 

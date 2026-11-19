@@ -89,18 +89,18 @@ def create_scheduler() -> BackgroundScheduler:
         max_instances=1,
     )
 
-    # 15:45 ET Mon-Fri — EOD NetLiquidation snapshot
-    # Runs after market close — 15 min after the last exit monitor tick.
+    # 16:15 ET Mon-Fri — EOD NetLiquidation snapshot
+    # Runs after market close (15 min after the 16:00 ET closing bell).
     scheduler.add_job(
         func=job_eod_snapshot,
         trigger=CronTrigger(
             day_of_week="mon-fri",
-            hour=15,
-            minute=45,
+            hour=16,
+            minute=15,
             timezone=ET,
         ),
         id="eod_snapshot",
-        name="EOD NetLiq Snapshot (15:45 ET)",
+        name="EOD NetLiq Snapshot (16:15 ET)",
         replace_existing=True,
         misfire_grace_time=300,
     )

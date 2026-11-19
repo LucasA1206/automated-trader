@@ -23,6 +23,8 @@ interface Position {
   pnl_pct: number;
   realised_partial_pnl: number;
   trade_status: 'open' | 'sold_half' | 'closed';
+  strategy_engine?: string;
+  breakeven_moved?: boolean;
 }
 
 interface Account {
@@ -747,6 +749,8 @@ export default function PortfolioTab({
               <tbody>
                 {positions.map((pos) => {
                   const isPartial = pos.trade_status === 'sold_half';
+                  const isMeanRev = pos.strategy_engine === 'mean_reversion';
+                  const isBeLocked = pos.breakeven_moved;
                   const pnlPos = pos.pnl >= 0;
                   const marketValAud = pos.market_value * usdToAud;
                   const pnlAud = pos.pnl * usdToAud;
@@ -754,11 +758,43 @@ export default function PortfolioTab({
 
                   return (
                     <tr key={pos.ticker}>
-                      <td style={{ fontWeight: 700, color: '#0f172a' }}>{pos.ticker}</td>
                       <td>
-                        <span className={isPartial ? 'badge-status-partial' : 'badge-status-open'}>
-                          {isPartial ? '½ Sold' : 'Open'}
-                        </span>
+                        <div style={{ fontWeight: 700, color: '#0f172a' }}>{pos.ticker}</div>
+                        {isMeanRev && (
+                          <span style={{
+                            display: 'inline-block',
+                            fontSize: 10,
+                            fontWeight: 600,
+                            color: '#6366f1',
+                            background: '#e0e7ff',
+                            padding: '1px 6px',
+                            borderRadius: 4,
+                            marginTop: 2,
+                          }}>
+                            Mean Rev
+                          </span>
+                        )}
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                          <span className={isPartial ? 'badge-status-partial' : 'badge-status-open'}>
+                            {isPartial ? '½ Sold' : 'Open'}
+                          </span>
+                          {isBeLocked && (
+                            <span style={{
+                              fontSize: 10,
+                              fontWeight: 600,
+                              color: '#059669',
+                              background: '#ecfdf5',
+                              border: '1px solid #a7f3d0',
+                              padding: '1px 6px',
+                              borderRadius: 4,
+                              width: 'fit-content',
+                            }}>
+                              🔒 BE Locked
+                            </span>
+                          )}
+                        </div>
                       </td>
                       <td>{pos.shares.toLocaleString()}</td>
                       <td>{fmt(pos.avg_cost)}</td>

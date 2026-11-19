@@ -71,17 +71,17 @@ class TestPhase2MarketState(unittest.TestCase):
 
     # ── 1. Config System Tests ────────────────────────────────────────────────
 
-    def test_default_config_flags_default_to_shadow(self):
-        """All new market gates must default to 'shadow'."""
+    def test_default_config_flags_default_to_enforce(self):
+        """All new market gates must default to 'enforce' for active risk protection."""
         cfg = get_system_config()
-        self.assertEqual(cfg["gate_intraday_confirmation"], "shadow")
-        self.assertEqual(cfg["gate_gap_down_veto"], "shadow")
-        self.assertEqual(cfg["gate_exposure_tiers"], "shadow")
-        self.assertEqual(cfg["gate_market_breadth"], "shadow")
-        self.assertEqual(cfg["gate_sector_leadership"], "shadow")
-        self.assertEqual(cfg["sizing_beta_aware"], "shadow")
-        self.assertEqual(cfg["exit_market_linked"], "shadow")
-        self.assertEqual(cfg["gate_earnings_density"], "shadow")
+        self.assertEqual(cfg["gate_intraday_confirmation"], "enforce")
+        self.assertEqual(cfg["gate_gap_down_veto"], "enforce")
+        self.assertEqual(cfg["gate_exposure_tiers"], "enforce")
+        self.assertEqual(cfg["gate_market_breadth"], "enforce")
+        self.assertEqual(cfg["gate_sector_leadership"], "enforce")
+        self.assertEqual(cfg["sizing_beta_aware"], "enforce")
+        self.assertEqual(cfg["exit_market_linked"], "enforce")
+        self.assertEqual(cfg["gate_earnings_density"], "enforce")
 
     def test_config_overrides(self):
         """Overrides must be respected cleanly."""

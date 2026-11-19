@@ -755,6 +755,15 @@ def job_pre_market_scan():
             if len(staged_candidates) < before_len:
                 log_event(db, "scan", f"⛔ Sector gate (enforce) filtered out {before_len - len(staged_candidates)} laggard candidates.")
 
+        # ── Step 6b: Dual-Engine Mean Reversion Sleeve Scan ───────────────────
+        mr_enabled = get_setting(db, "enable_mean_reversion", "true").lower() == "true"
+        if mr_enabled:
+            from strategy.mean_reversion_engine import scan_mean_reversion_candidates
+            mr_candidates = scan_mean_reversion_candidates(open_positions, max_candidates=2)
+            if mr_candidates:
+                log_event(db, "scan", f"🔄 Dual-Engine: Staging {len(mr_candidates)} mean-reversion candidate(s): {', '.join(c['ticker'] for c in mr_candidates)}")
+                staged_candidates.extend(mr_candidates)
+
         # ── Step 7: Persist AIPick records for UI ─────────────────────────────
         for rank, candidate in enumerate(staged_candidates, 1):
             pick = AIPick(
@@ -985,6 +994,7 @@ def job_entry_monitor():
                 atr_at_entry=atr_abs,
                 entry_composite_score=candidate.get("composite_score"),
                 sector=sector,
+                strategy_engine=candidate.get("strategy_engine", "momentum"),
                 # Phase 5 logging fields
                 spy_price_at_entry=spy_px,
                 beta_at_entry=candidate.get("beta"),
@@ -1127,12 +1137,20 @@ def job_exit_monitor():
             if trade.status not in ("open", "sold_half"):
                 continue
 
-            signal = check_exit_conditions(
-                trade=trade,
-                current_price=current_price,
-                live_shares=live_shares,
-                account_equity=account_equity,
-            )
+            if getattr(trade, "strategy_engine", "momentum") == "mean_reversion":
+                from strategy.mean_reversion_engine import check_mean_reversion_exit
+                signal = check_mean_reversion_exit(
+                    trade=trade,
+                    current_price=current_price,
+                    live_shares=live_shares,
+                )
+            else:
+                signal = check_exit_conditions(
+                    trade=trade,
+                    current_price=current_price,
+                    live_shares=live_shares,
+                    account_equity=account_equity,
+                )
 
             # Market-linked stop tightening (Phase 4):
             # If SPY broke 50 SMA or 10-day low, tighten stop to min(current_stop, current_price - 1.0 * ATR)
@@ -1152,14 +1170,22 @@ def job_exit_monitor():
                     else:
                         log_event(db, "sell", f"👻 {ticker}: market-linked stop would tighten from ${current_active_stop:.2f} to ${proposed_stop:.2f} [shadow]")
 
-            # ── Trail update (no sell, just update stop price) ────────────────
-            if signal.action == "hold" and signal.reason == "trail_update" and signal.new_stop_price:
-                trade.trailing_stop_price = signal.new_stop_price
+            # ── Trail update or Progressive Breakeven update ────────────────
+            if signal.action == "hold" and signal.reason in ("trail_update", "breakeven_update") and signal.new_stop_price:
+                trade.stop_price = signal.new_stop_price
+                if signal.reason == "trail_update":
+                    trade.trailing_stop_price = signal.new_stop_price
+                elif signal.reason == "breakeven_update":
+                    trade.breakeven_moved = True
+
                 db.commit()
-                logger.info("[ExitMonitor] %s: trailing stop updated to $%.4f",
-                            ticker, signal.new_stop_price)
-                log_trade_event(db, trade.id, "trail_update", signal.details,
-                                trailing_stop_price=signal.new_stop_price)
+                if trade.stop_order_id:
+                    client.modify_stop_order(ticker, trade.stop_order_id, signal.new_stop_price, live_shares)
+
+                logger.info("[ExitMonitor] %s: %s to $%.4f", ticker, signal.reason, signal.new_stop_price)
+                log_event(db, "sell", f"🛡️ {ticker}: {signal.details}")
+                log_trade_event(db, trade.id, signal.reason, signal.details,
+                                stop_price=signal.new_stop_price)
                 continue
 
             # ── Soft warning (log only, no action) ───────────────────────────
@@ -1191,6 +1217,15 @@ def job_exit_monitor():
                     if signal.new_stop_price:
                         trade.stop_price = signal.new_stop_price
                     db.commit()
+
+                    remaining_shares = live_shares - shares_to_sell
+                    if trade.stop_order_id and remaining_shares > 0:
+                        client.modify_stop_order(
+                            ticker,
+                            trade.stop_order_id,
+                            signal.new_stop_price or trade.stop_price,
+                            remaining_shares,
+                        )
 
                     log_event(db, "sell",
                               f"💰 {ticker}: partial exit filled @ ${sell_price:.4f} | "
@@ -1252,6 +1287,10 @@ def job_exit_monitor():
                         logger.debug("[ExitMonitor] Could not calculate alpha for %s: %s", ticker, exc)
 
                     db.commit()
+
+                    # Cancel the native IBKR stop order so it doesn't leave an orphaned short order
+                    if trade.stop_order_id:
+                        client.cancel_stop_order(trade.stop_order_id, ticker)
 
                     emoji = "🟢" if total_pnl >= 0 else "🔴"
                     log_event(db, "sell",
@@ -1363,6 +1402,81 @@ def job_manual_scan_with_deferred_buy():
     job_manual_scan()
     if is_market_open():
         job_entry_monitor()
+
+
+def job_deferred_sell_single(ticker: str, trading_mode: str = "paper") -> None:
+    """
+    Background worker that waits until NYSE market open, then executes
+    a market sell order for the specified ticker.
+    """
+    secs = seconds_until_market_open()
+    if secs > 0:
+        logger.info(f"[DeferredSell] Market closed. Sleeping {secs:.0f}s until open to sell {ticker}...")
+        time.sleep(secs)
+        # Give gateway 10 seconds after open bell to stabilize
+        time.sleep(10)
+
+    db = SessionLocal()
+    try:
+        client = IBKRClient(trading_mode=trading_mode)
+        if not client.connect(retries=3, delay=5):
+            log_event(db, "sell", f"❌ Deferred sell failed for {ticker}: could not connect to IB Gateway", "ERROR")
+            return
+
+        positions = client.get_positions()
+        target_pos = next((p for p in positions if p.get("ticker") == ticker), None)
+        if not target_pos or target_pos.get("shares", 0) <= 0:
+            log_event(db, "sell", f"⚠️ Deferred sell for {ticker}: no open position found on IBKR at market open.", "WARNING")
+            client.disconnect()
+            return
+
+        live_shares = target_pos["shares"]
+        result = client.place_sell_order(ticker, live_shares)
+        if result.get("success"):
+            sell_price = result["price"]
+            sell_fees = result.get("fees", 0.0)
+            trade = (
+                db.query(Trade)
+                .filter(
+                    Trade.ticker == ticker,
+                    Trade.status.in_(["open", "sold_half"]),
+                    Trade.mode == trading_mode,
+                )
+                .order_by(Trade.buy_time.desc())
+                .first()
+            )
+            if trade:
+                buy_price = trade.buy_price or 0.0
+                partial_already = trade.realised_partial_pnl or 0.0
+                remaining_pnl = (sell_price - buy_price) * live_shares
+                total_pnl = remaining_pnl + partial_already
+                original_cost = buy_price * trade.shares if trade.shares else 1
+                pnl_pct = (total_pnl / original_cost * 100) if original_cost else 0.0
+
+                trade.sell_price = sell_price
+                trade.sell_time = datetime.now(timezone.utc)
+                trade.status = "closed"
+                trade.pnl = round(total_pnl, 2)
+                trade.pnl_pct = round(pnl_pct, 2)
+                trade.fees = round((trade.fees or 0.0) + sell_fees, 4)
+                db.commit()
+
+                if trade.stop_order_id:
+                    client.cancel_stop_order(trade.stop_order_id, ticker)
+
+            log_event(db, "sell", f"✅ Deferred sell executed: sold {live_shares} shares of {ticker} @ ${sell_price:.2f}")
+        else:
+            log_event(db, "sell", f"❌ Deferred sell failed for {ticker}: {result.get('error')}", "ERROR")
+
+        client.disconnect()
+    except Exception as exc:
+        logger.exception(f"[DeferredSell] Unexpected error selling {ticker}: {exc}")
+        try:
+            log_event(db, "sell", f"❌ Deferred sell crashed for {ticker}: {exc}", "ERROR")
+        except Exception:
+            pass
+    finally:
+        db.close()
 
 
 def job_manual_entry_monitor(force: bool = False) -> dict:
@@ -1522,6 +1636,7 @@ def job_manual_entry_monitor(force: bool = False) -> dict:
                 atr_at_entry=atr_abs,
                 entry_composite_score=candidate.get("composite_score"),
                 sector=sector,
+                strategy_engine=candidate.get("strategy_engine", "momentum"),
             )
             db.add(trade)
             db.commit()

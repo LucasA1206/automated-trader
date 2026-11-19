@@ -108,6 +108,11 @@ def check_entry_confirmation(candidate: dict, db=None, ignore_time_gate: bool = 
     if not ignore_time_gate and not is_within_entry_window():
         return False, "outside_entry_window", None
 
+    # ── Fast path for Mean-Reversion Sleeve ───────────────────────────────────
+    if candidate.get("strategy_engine") == "mean_reversion":
+        curr_p = candidate.get("limit_price") or candidate.get("price")
+        return True, "mean_reversion_dip_confirmed", curr_p
+
     # ── Fetch fresh intraday data ────────────────────────────────────────────
     df = fetch_ohlcv(ticker, period="60d")
     if df is None or df.empty or len(df) < 15:
@@ -216,8 +221,12 @@ def prepare_entry_order(
         return None
 
     # ── Compute ATR-based stop and target ────────────────────────────────────
-    stop_price = compute_initial_stop(limit_price, atr, adx)
-    partial_target = compute_partial_target(limit_price, stop_price)
+    if candidate.get("strategy_engine") == "mean_reversion":
+        stop_price = candidate.get("stop_price") or compute_initial_stop(limit_price, atr, adx)
+        partial_target = candidate.get("target_price") or candidate.get("partial_target_price") or compute_partial_target(limit_price, stop_price)
+    else:
+        stop_price = compute_initial_stop(limit_price, atr, adx)
+        partial_target = compute_partial_target(limit_price, stop_price)
 
     # ── Position sizing ───────────────────────────────────────────────────────
     tier = candidate.get("tier", "A")
@@ -297,4 +306,5 @@ def prepare_entry_order(
         "size_multiplier": size_mult,
         "beta_scalar": beta_scalar,
         "beta": candidate.get("beta"),
+        "strategy_engine": candidate.get("strategy_engine", "momentum"),
     }

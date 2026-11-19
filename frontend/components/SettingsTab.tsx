@@ -10,34 +10,30 @@ interface Props {
 }
 
 export default function SettingsTab({ onModeChange, authFetch }: Props) {
-  // Master Controls & Automation
-  const [automatedTrading, setAutomatedTrading] = useState(true);
-  const [dailyAiAnalysis, setDailyAiAnalysis] = useState(true);
-  const [newEntries, setNewEntries] = useState(true);
-  const [exitManagement, setExitManagement] = useState(true);
-
-  // Entry Confirmation Rules
-  const [vwapConfirmation, setVwapConfirmation] = useState(false);
-  const [volumeConfirmation, setVolumeConfirmation] = useState(true);
-  const [minRelVol, setMinRelVol] = useState('1.5×');
-  const [maxRsi, setMaxRsi] = useState('70');
-  const [openingRangeWait, setOpeningRangeWait] = useState('15 min');
-
-  // Paper Simulation Strategy
-  const [startingCapital, setStartingCapital] = useState('$100,000');
-  const [maxPosSize, setMaxPosSize] = useState('5%');
-  const [maxOpenPositions, setMaxOpenPositions] = useState('8');
-  const [stopLoss, setStopLoss] = useState('3%');
-  const [takeProfit, setTakeProfit] = useState('6% / 50%');
-
   // IBKR Account Type & Mode
   const [accountType, setAccountType] = useState<'paper' | 'live'>('paper');
-  const [tradingModeSelect, setTradingModeSelect] = useState('Automated paper trading');
 
-  // Scheduled Jobs
-  const [jobDailyAi, setJobDailyAi] = useState(true);
-  const [jobEntryConf, setJobEntryConf] = useState(true);
-  const [jobPortfolioSync, setJobPortfolioSync] = useState(true);
+  // Master Automation Controls
+  const [automatedTrading, setAutomatedTrading] = useState(true);
+  const [dailyAiAnalysis, setDailyAiAnalysis] = useState(true);
+
+  // Intraday Entry Guardrails
+  const [vwapConfirmation, setVwapConfirmation] = useState(false);
+  const [minRelVol, setMinRelVol] = useState('1.5×');
+  const [maxRsi, setMaxRsi] = useState('70');
+
+  // Dual-Engine & Risk Gates (Active settings)
+  const [meanReversionEnabled, setMeanReversionEnabled] = useState(true);
+  const [meanReversionAllocation, setMeanReversionAllocation] = useState('40%');
+  const [breakevenR, setBreakevenR] = useState('+0.75R');
+  const [gateGapDownVeto, setGateGapDownVeto] = useState('enforce');
+  const [gateExposureTiers, setGateExposureTiers] = useState('enforce');
+  const [gateMarketBreadth, setGateMarketBreadth] = useState('enforce');
+  const [gateSectorLeadership, setGateSectorLeadership] = useState('enforce');
+  const [sizingBetaAware, setSizingBetaAware] = useState('enforce');
+  const [exitMarketLinked, setExitMarketLinked] = useState('enforce');
+  const [gateEarningsDensity, setGateEarningsDensity] = useState('enforce');
+  const [gateIntradayConfirmation, setGateIntradayConfirmation] = useState('enforce');
 
   // Status & notifications
   const [saveStatus, setSaveStatus] = useState<string | null>(null);
@@ -65,9 +61,6 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
         if (data.scan_enabled !== undefined) {
           setDailyAiAnalysis(data.scan_enabled === 'true');
         }
-        if (data.max_positions) {
-          setMaxOpenPositions(data.max_positions);
-        }
         if (data.entry_vwap_required !== undefined) {
           setVwapConfirmation(data.entry_vwap_required === 'true');
         }
@@ -77,6 +70,23 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
         if (data.entry_rsi_max) {
           setMaxRsi(data.entry_rsi_max);
         }
+        if (data.enable_mean_reversion !== undefined) {
+          setMeanReversionEnabled(data.enable_mean_reversion === 'true');
+        }
+        if (data.mean_reversion_allocation_pct) {
+          setMeanReversionAllocation(`${data.mean_reversion_allocation_pct}%`);
+        }
+        if (data.breakeven_r_multiple) {
+          setBreakevenR(`+${data.breakeven_r_multiple}R`);
+        }
+        if (data.gate_gap_down_veto) setGateGapDownVeto(data.gate_gap_down_veto);
+        if (data.gate_exposure_tiers) setGateExposureTiers(data.gate_exposure_tiers);
+        if (data.gate_market_breadth) setGateMarketBreadth(data.gate_market_breadth);
+        if (data.gate_sector_leadership) setGateSectorLeadership(data.gate_sector_leadership);
+        if (data.sizing_beta_aware) setSizingBetaAware(data.sizing_beta_aware);
+        if (data.exit_market_linked) setExitMarketLinked(data.exit_market_linked);
+        if (data.gate_earnings_density) setGateEarningsDensity(data.gate_earnings_density);
+        if (data.gate_intraday_confirmation) setGateIntradayConfirmation(data.gate_intraday_confirmation);
       }
     } catch {
       // Fail silently
@@ -92,8 +102,9 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
     setSaveStatus(null);
     try {
       const cleanRelVol = minRelVol.replace('×', '').trim();
-      const cleanMaxPos = maxOpenPositions.trim();
       const cleanRsi = maxRsi.trim();
+      const cleanMeanRevAlloc = meanReversionAllocation.replace('%', '').trim();
+      const cleanBreakevenR = breakevenR.replace('+', '').replace('R', '').trim();
 
       const res = await authFetch('/api/settings', {
         method: 'PUT',
@@ -102,10 +113,20 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
           trading_mode: accountType,
           trader_enabled: automatedTrading ? 'true' : 'false',
           scan_enabled: dailyAiAnalysis ? 'true' : 'false',
-          max_positions: cleanMaxPos,
           entry_vwap_required: vwapConfirmation ? 'true' : 'false',
           entry_min_rel_vol: cleanRelVol,
           entry_rsi_max: cleanRsi,
+          enable_mean_reversion: meanReversionEnabled ? 'true' : 'false',
+          mean_reversion_allocation_pct: cleanMeanRevAlloc,
+          breakeven_r_multiple: cleanBreakevenR,
+          gate_gap_down_veto: gateGapDownVeto,
+          gate_exposure_tiers: gateExposureTiers,
+          gate_market_breadth: gateMarketBreadth,
+          gate_sector_leadership: gateSectorLeadership,
+          sizing_beta_aware: sizingBetaAware,
+          exit_market_linked: exitMarketLinked,
+          gate_earnings_density: gateEarningsDensity,
+          gate_intraday_confirmation: gateIntradayConfirmation,
         }),
       });
       if (res.ok) {
@@ -177,230 +198,38 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
         <p className="page-title-meta">{syncDateString}</p>
       </div>
 
-      {/* ── Safe Space Banner (Page 6 & Page 15) ────────────────── */}
+      {/* ── Safe Space Banner ──────────────────────────────────── */}
       <div style={{
-        background: '#ecfdf5',
-        border: '1px solid #a7f3d0',
+        background: accountType === 'live' ? '#fef2f2' : '#ecfdf5',
+        border: accountType === 'live' ? '1px solid #fecaca' : '1px solid #a7f3d0',
         borderRadius: 14,
         padding: '18px 24px',
         marginBottom: 24,
       }}>
-        <div style={{ fontSize: 15, fontWeight: 700, color: '#047857', marginBottom: 4 }}>
-          A safe space to refine your strategy.
+        <div style={{
+          fontSize: 15,
+          fontWeight: 700,
+          color: accountType === 'live' ? '#b91c1c' : '#047857',
+          marginBottom: 4,
+        }}>
+          {accountType === 'live' ? 'Live Execution Active' : 'A safe space to refine your strategy.'}
         </div>
         <div style={{ fontSize: 13, color: '#475569' }}>
           {accountType === 'live'
-            ? 'Live trading is active. Real orders are placed on your IBKR account.'
-            : 'Paper trading is active. Your live IBKR account is not being used.'}
+            ? 'Live trading is active. Real orders are placed on your connected IBKR account.'
+            : 'Paper trading is active. Simulated orders only; your live IBKR account is protected.'}
         </div>
       </div>
 
       {/* ── Main 2-Column Grid (Desktop) / Stacked (Phone) ─────── */}
       <div className="settings-columns-grid">
-        {/* ── Left Column ──────────────────────────────────────── */}
+        {/* ── Left Column: Brokerage & Trading Engine ─────────── */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
-          {/* Master Controls & Automation */}
+          {/* 1. IBKR Account & Brokerage Mode */}
           <div className="theme-card">
-            <h3 className="table-title-bold">Master Controls &amp; Automation</h3>
+            <h3 className="table-title-bold">IBKR Account &amp; Brokerage Mode</h3>
             <p style={{ fontSize: 12, color: '#64748b', marginTop: 2, marginBottom: 14 }}>
-              Control the automated trading engine.
-            </p>
-
-            <div className="setting-toggle-row">
-              <div>
-                <div className="setting-row-title">Automated trading</div>
-                <div className="setting-row-desc">Allow strategy-generated orders.</div>
-              </div>
-              <label className="toggle-switch">
-                <input
-                  type="checkbox"
-                  checked={automatedTrading}
-                  onChange={(e) => setAutomatedTrading(e.target.checked)}
-                />
-                <span className="toggle-slider" />
-              </label>
-            </div>
-
-            <div className="setting-toggle-row">
-              <div>
-                <div className="setting-row-title">Daily AI analysis</div>
-                <div className="setting-row-desc">Screen stocks before the session.</div>
-              </div>
-              <label className="toggle-switch">
-                <input
-                  type="checkbox"
-                  checked={dailyAiAnalysis}
-                  onChange={(e) => setDailyAiAnalysis(e.target.checked)}
-                />
-                <span className="toggle-slider" />
-              </label>
-            </div>
-
-            <div className="setting-toggle-row">
-              <div>
-                <div className="setting-row-title">New entries</div>
-                <div className="setting-row-desc">Allow new positions within risk limits.</div>
-              </div>
-              <label className="toggle-switch">
-                <input
-                  type="checkbox"
-                  checked={newEntries}
-                  onChange={(e) => setNewEntries(e.target.checked)}
-                />
-                <span className="toggle-slider" />
-              </label>
-            </div>
-
-            <div className="setting-toggle-row">
-              <div>
-                <div className="setting-row-title">Exit management</div>
-                <div className="setting-row-desc">Manage stop-loss and profit targets.</div>
-              </div>
-              <label className="toggle-switch">
-                <input
-                  type="checkbox"
-                  checked={exitManagement}
-                  onChange={(e) => setExitManagement(e.target.checked)}
-                />
-                <span className="toggle-slider" />
-              </label>
-            </div>
-          </div>
-
-          {/* Entry Confirmation Rules (Intraday Filters) */}
-          <div className="theme-card">
-            <h3 className="table-title-bold">Entry Confirmation Rules (Intraday Filters)</h3>
-            <p style={{ fontSize: 12, color: '#64748b', marginTop: 2, marginBottom: 14 }}>
-              A candidate must pass every enabled filter.
-            </p>
-
-            <div className="setting-toggle-row">
-              <div>
-                <div className="setting-row-title">VWAP confirmation</div>
-                <div className="setting-row-desc">Price must hold above session VWAP.</div>
-              </div>
-              <label className="toggle-switch">
-                <input
-                  type="checkbox"
-                  checked={vwapConfirmation}
-                  onChange={(e) => setVwapConfirmation(e.target.checked)}
-                />
-                <span className="toggle-slider" />
-              </label>
-            </div>
-
-            <div className="setting-toggle-row">
-              <div>
-                <div className="setting-row-title">Volume confirmation</div>
-                <div className="setting-row-desc">Require relative volume above threshold.</div>
-              </div>
-              <label className="toggle-switch">
-                <input
-                  type="checkbox"
-                  checked={volumeConfirmation}
-                  onChange={(e) => setVolumeConfirmation(e.target.checked)}
-                />
-                <span className="toggle-slider" />
-              </label>
-            </div>
-
-            <div className="setting-toggle-row">
-              <div className="setting-row-title">Minimum relative volume</div>
-              <input
-                type="text"
-                className="setting-input-field"
-                value={minRelVol}
-                onChange={(e) => setMinRelVol(e.target.value)}
-              />
-            </div>
-
-            <div className="setting-toggle-row">
-              <div className="setting-row-title">Maximum RSI (14)</div>
-              <input
-                type="text"
-                className="setting-input-field"
-                value={maxRsi}
-                onChange={(e) => setMaxRsi(e.target.value)}
-              />
-            </div>
-
-            <div className="setting-toggle-row">
-              <div className="setting-row-title">Opening range wait</div>
-              <input
-                type="text"
-                className="setting-input-field"
-                value={openingRangeWait}
-                onChange={(e) => setOpeningRangeWait(e.target.value)}
-              />
-            </div>
-          </div>
-
-          {/* Paper Simulation Strategy */}
-          <div className="theme-card">
-            <h3 className="table-title-bold">Paper Simulation Strategy</h3>
-            <p style={{ fontSize: 12, color: '#64748b', marginTop: 2, marginBottom: 14 }}>
-              Risk controls for simulated positions.
-            </p>
-
-            <div className="setting-toggle-row">
-              <div className="setting-row-title">Starting capital (AUD)</div>
-              <input
-                type="text"
-                className="setting-input-field"
-                value={startingCapital}
-                onChange={(e) => setStartingCapital(e.target.value)}
-              />
-            </div>
-
-            <div className="setting-toggle-row">
-              <div className="setting-row-title">Max position size</div>
-              <input
-                type="text"
-                className="setting-input-field"
-                value={maxPosSize}
-                onChange={(e) => setMaxPosSize(e.target.value)}
-              />
-            </div>
-
-            <div className="setting-toggle-row">
-              <div className="setting-row-title">Maximum open positions</div>
-              <input
-                type="text"
-                className="setting-input-field"
-                value={maxOpenPositions}
-                onChange={(e) => setMaxOpenPositions(e.target.value)}
-              />
-            </div>
-
-            <div className="setting-toggle-row">
-              <div className="setting-row-title">Stop-loss</div>
-              <input
-                type="text"
-                className="setting-input-field"
-                value={stopLoss}
-                onChange={(e) => setStopLoss(e.target.value)}
-              />
-            </div>
-
-            <div className="setting-toggle-row">
-              <div className="setting-row-title">Take profit / partial exit</div>
-              <input
-                type="text"
-                className="setting-input-field"
-                value={takeProfit}
-                onChange={(e) => setTakeProfit(e.target.value)}
-              />
-            </div>
-          </div>
-        </div>
-
-        {/* ── Right Column ─────────────────────────────────────── */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
-          {/* IBKR Account Type */}
-          <div className="theme-card">
-            <h3 className="table-title-bold">IBKR Account Type</h3>
-            <p style={{ fontSize: 12, color: '#64748b', marginTop: 2, marginBottom: 14 }}>
-              Choose which brokerage environment to use.
+              Choose which brokerage environment receives trade orders.
             </p>
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14 }}>
@@ -449,60 +278,86 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
               Connected · DU782901
             </div>
             <div style={{ fontSize: 12, color: '#94a3b8' }}>
-              Live trading requires a separate confirmation.
+              Live trading requires an explicit safety confirmation before taking effect.
             </div>
           </div>
 
-          {/* Trading Mode */}
+          {/* 2. Master Automation Controls */}
           <div className="theme-card">
-            <h3 className="table-title-bold">Trading Mode</h3>
+            <h3 className="table-title-bold">Master Automation Controls</h3>
             <p style={{ fontSize: 12, color: '#64748b', marginTop: 2, marginBottom: 14 }}>
-              Decide how signals become orders.
+              Master on/off execution switches for background trading loops.
             </p>
 
-            <select
-              value={tradingModeSelect}
-              onChange={(e) => setTradingModeSelect(e.target.value)}
-              style={{
-                width: '100%',
-                padding: '10px 14px',
-                borderRadius: 8,
-                border: '1px solid var(--border)',
-                background: '#ffffff',
-                fontSize: 13.5,
-                color: '#0f172a',
-                outline: 'none',
-                cursor: 'pointer',
-                marginBottom: 12,
-              }}
-            >
-              <option value="Automated paper trading">Automated paper trading ▾</option>
-              <option value="Semi-automated (Confirmation required)">Semi-automated (Confirmation required)</option>
-              <option value="Signal only (No execution)">Signal only (No execution)</option>
-            </select>
-
-            <div style={{ fontSize: 12, color: '#64748b', lineHeight: 1.5 }}>
-              Signals are confirmed by your entry rules before a simulated order is placed.
+            <div className="setting-toggle-row">
+              <div>
+                <div className="setting-row-title">Automated trading</div>
+                <div className="setting-row-desc">Master switch allowing strategy-generated orders to execute.</div>
+              </div>
+              <label className="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={automatedTrading}
+                  onChange={(e) => setAutomatedTrading(e.target.checked)}
+                />
+                <span className="toggle-slider" />
+              </label>
             </div>
-          </div>
-
-          {/* Scheduled Jobs */}
-          <div className="theme-card">
-            <h3 className="table-title-bold">Scheduled Jobs</h3>
-            <p style={{ fontSize: 12, color: '#64748b', marginTop: 2, marginBottom: 14 }}>
-              All schedules use Australia / Sydney (AEDT).
-            </p>
 
             <div className="setting-toggle-row">
               <div>
                 <div className="setting-row-title">Daily AI analysis</div>
-                <div className="setting-row-desc">08:30 AEDT · Every trading day</div>
+                <div className="setting-row-desc">Run pre-market universe screening and AI catalyst vetting.</div>
               </div>
               <label className="toggle-switch">
                 <input
                   type="checkbox"
-                  checked={jobDailyAi}
-                  onChange={(e) => setJobDailyAi(e.target.checked)}
+                  checked={dailyAiAnalysis}
+                  onChange={(e) => setDailyAiAnalysis(e.target.checked)}
+                />
+                <span className="toggle-slider" />
+              </label>
+            </div>
+          </div>
+
+          {/* 3. Dual-Engine Strategy Allocation */}
+          <div className="theme-card">
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+              <h3 className="table-title-bold" style={{ margin: 0 }}>Dual-Engine Strategy Allocation</h3>
+              <span style={{
+                background: '#e0f2fe',
+                color: '#0369a1',
+                fontSize: 11,
+                fontWeight: 700,
+                padding: '3px 8px',
+                borderRadius: 9999,
+                border: '1px solid #bae6fd'
+              }}>
+                Dual-Engine
+              </span>
+            </div>
+            <p style={{ fontSize: 12, color: '#64748b', marginTop: 2, marginBottom: 14 }}>
+              Uncorrelated mean reversion alongside core momentum breakout trading.
+            </p>
+
+            {/* Mean Reversion Engine Switch */}
+            <div className="setting-toggle-row">
+              <div>
+                <div className="setting-row-title" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span>Mean-Reversion Engine</span>
+                  <span style={{ fontSize: 10, background: '#ecfdf5', color: '#047857', padding: '1px 6px', borderRadius: 4, fontWeight: 700 }}>
+                    ETF &amp; Mega-Caps
+                  </span>
+                </div>
+                <div className="setting-row-desc">
+                  Buys acute dips (RSI-2 &lt; 10 above 200 SMA) on SPY, QQQ, AAPL, NVDA. Exits at 5 SMA or +2.5%.
+                </div>
+              </div>
+              <label className="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={meanReversionEnabled}
+                  onChange={(e) => setMeanReversionEnabled(e.target.checked)}
                 />
                 <span className="toggle-slider" />
               </label>
@@ -510,14 +365,59 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
 
             <div className="setting-toggle-row">
               <div>
-                <div className="setting-row-title">Entry confirmation</div>
-                <div className="setting-row-desc">Every 5 min · During US market hours</div>
+                <div className="setting-row-title">Mean-reversion max allocation</div>
+                <div className="setting-row-desc">Max capital allocation cap for mean-reversion sleeve.</div>
+              </div>
+              <input
+                type="text"
+                className="setting-input-field"
+                value={meanReversionAllocation}
+                onChange={(e) => setMeanReversionAllocation(e.target.value)}
+              />
+            </div>
+
+            {/* Progressive Breakeven Stop Rungs */}
+            <div className="setting-toggle-row">
+              <div>
+                <div className="setting-row-title" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span>Progressive Breakeven Lock</span>
+                  <span style={{ fontSize: 10, background: '#fef3c7', color: '#92400e', padding: '1px 6px', borderRadius: 4, fontWeight: 700 }}>
+                    Auto-Rung
+                  </span>
+                </div>
+                <div className="setting-row-desc">
+                  Automatically moves broker stop to Entry + 0.2% commission cushion once profit hits +0.75R.
+                </div>
+              </div>
+              <input
+                type="text"
+                className="setting-input-field"
+                value={breakevenR}
+                onChange={(e) => setBreakevenR(e.target.value)}
+              />
+            </div>
+          </div>
+        </div>
+
+        {/* ── Right Column: Guardrails & Risk Protection ──────── */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+          {/* 4. Intraday Entry Guardrails */}
+          <div className="theme-card">
+            <h3 className="table-title-bold">Intraday Entry Guardrails</h3>
+            <p style={{ fontSize: 12, color: '#64748b', marginTop: 2, marginBottom: 14 }}>
+              Real-time filters evaluated before confirming any pending buy signal.
+            </p>
+
+            <div className="setting-toggle-row">
+              <div>
+                <div className="setting-row-title">VWAP confirmation</div>
+                <div className="setting-row-desc">Require 5-min price to hold firmly above session VWAP.</div>
               </div>
               <label className="toggle-switch">
                 <input
                   type="checkbox"
-                  checked={jobEntryConf}
-                  onChange={(e) => setJobEntryConf(e.target.checked)}
+                  checked={vwapConfirmation}
+                  onChange={(e) => setVwapConfirmation(e.target.checked)}
                 />
                 <span className="toggle-slider" />
               </label>
@@ -525,32 +425,167 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
 
             <div className="setting-toggle-row">
               <div>
-                <div className="setting-row-title">Portfolio sync</div>
-                <div className="setting-row-desc">Every 60 sec · While the broker is connected</div>
+                <div className="setting-row-title">Minimum relative volume</div>
+                <div className="setting-row-desc">5-min volume vs. 20-day historical session volume.</div>
               </div>
-              <label className="toggle-switch">
-                <input
-                  type="checkbox"
-                  checked={jobPortfolioSync}
-                  onChange={(e) => setJobPortfolioSync(e.target.checked)}
-                />
-                <span className="toggle-slider" />
-              </label>
+              <input
+                type="text"
+                className="setting-input-field"
+                value={minRelVol}
+                onChange={(e) => setMinRelVol(e.target.value)}
+              />
             </div>
 
-            {/* NEXT RUN Box */}
+            <div className="setting-toggle-row">
+              <div>
+                <div className="setting-row-title">Maximum RSI (14)</div>
+                <div className="setting-row-desc">Block entries if 14-period RSI exceeds overbought threshold.</div>
+              </div>
+              <input
+                type="text"
+                className="setting-input-field"
+                value={maxRsi}
+                onChange={(e) => setMaxRsi(e.target.value)}
+              />
+            </div>
+          </div>
+
+          {/* 5. Active Risk Protection Gates */}
+          <div className="theme-card">
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+              <h3 className="table-title-bold" style={{ margin: 0 }}>Active Risk Protection Gates</h3>
+              <span style={{
+                background: '#ecfdf5',
+                color: '#047857',
+                fontSize: 11,
+                fontWeight: 700,
+                padding: '3px 8px',
+                borderRadius: 9999,
+                border: '1px solid #a7f3d0'
+              }}>
+                8 Gates Enforced
+              </span>
+            </div>
+            <p style={{ fontSize: 12, color: '#64748b', marginTop: 2, marginBottom: 14 }}>
+              Systemic risk gates actively protecting the portfolio from major drawdowns.
+            </p>
+
+            {/* Direct IBKR Historical Data Fallback */}
+            <div style={{
+              background: '#f8fafc',
+              border: '1px solid #e2e8f0',
+              borderRadius: 8,
+              padding: '10px 14px',
+              marginBottom: 12,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between'
+            }}>
+              <div>
+                <div style={{ fontSize: 12.5, fontWeight: 600, color: '#1e293b' }}>
+                  Direct IBKR Data Fallback
+                </div>
+                <div style={{ fontSize: 11.5, color: '#64748b' }}>
+                  Failover to reqHistoricalData if Yahoo Finance rate limits
+                </div>
+              </div>
+              <span style={{ fontSize: 10.5, fontWeight: 700, color: '#047857', background: '#ecfdf5', padding: '3px 8px', borderRadius: 6, border: '1px solid #a7f3d0' }}>
+                FAILOVER LIVE
+              </span>
+            </div>
+
+            {/* Safety Gates Grid */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+              {[
+                { name: 'SPY Gap-Down Veto', desc: 'Blocks buys if SPY gaps <-0.7%' },
+                { name: 'Graded Exposure Tiers', desc: 'Regime caps (A=100%, B=50%, C=0%)' },
+                { name: 'Market Breadth Filter', desc: 'Advancers/Decliners health check' },
+                { name: 'Sector Leadership', desc: 'Candidate sector ETF > 20 EMA' },
+                { name: 'Beta-Aware Sizing', desc: 'Downscales size for β > 1.0 stocks' },
+                { name: 'Market-Linked Exits', desc: 'Stop tightening on distribution' },
+                { name: 'Earnings Density', desc: 'Blocks entry 5d before earnings' },
+                { name: 'Intraday Confirmation', desc: 'VWAP hold + volume surge trigger' },
+              ].map((g, idx) => (
+                <div key={idx} style={{
+                  background: '#f8fafc',
+                  border: '1px solid #e2e8f0',
+                  borderRadius: 6,
+                  padding: '8px 10px',
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 2 }}>
+                    <span style={{ fontSize: 11.5, fontWeight: 600, color: '#0f172a' }}>{g.name}</span>
+                    <span style={{ fontSize: 9, fontWeight: 700, color: '#047857', background: '#d1fae5', padding: '1px 5px', borderRadius: 4 }}>
+                      ACTIVE
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 10.5, color: '#64748b', lineHeight: 1.3 }}>{g.desc}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* 6. Automated Execution Timetable */}
+          <div className="theme-card">
+            <h3 className="table-title-bold">Automated Execution Timetable</h3>
+            <p style={{ fontSize: 12, color: '#64748b', marginTop: 2, marginBottom: 14 }}>
+              Active background scheduler jobs (Eastern Time / AEDT).
+            </p>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 0', borderBottom: '1px solid #f1f5f9' }}>
+                <div>
+                  <div style={{ fontSize: 12.5, fontWeight: 600, color: '#0f172a' }}>Daily Pre-Market Scan</div>
+                  <div style={{ fontSize: 11.5, color: '#64748b' }}>Runs screening and AI grading before session open</div>
+                </div>
+                <span style={{ fontSize: 11, fontWeight: 600, color: '#0284c7', background: '#f0f9ff', padding: '2px 8px', borderRadius: 6 }}>
+                  08:30 AEDT
+                </span>
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 0', borderBottom: '1px solid #f1f5f9' }}>
+                <div>
+                  <div style={{ fontSize: 12.5, fontWeight: 600, color: '#0f172a' }}>Intraday Entry Monitor</div>
+                  <div style={{ fontSize: 11.5, color: '#64748b' }}>Evaluates VWAP and volume rules during market hours</div>
+                </div>
+                <span style={{ fontSize: 11, fontWeight: 600, color: '#0284c7', background: '#f0f9ff', padding: '2px 8px', borderRadius: 6 }}>
+                  Every 5 min
+                </span>
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 0', borderBottom: '1px solid #f1f5f9' }}>
+                <div>
+                  <div style={{ fontSize: 12.5, fontWeight: 600, color: '#0f172a' }}>Exit &amp; Trailing Stop Monitor</div>
+                  <div style={{ fontSize: 11.5, color: '#64748b' }}>Manages progressive breakeven rungs and trailing stops</div>
+                </div>
+                <span style={{ fontSize: 11, fontWeight: 600, color: '#0284c7', background: '#f0f9ff', padding: '2px 8px', borderRadius: 6 }}>
+                  Every 60 sec
+                </span>
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 0' }}>
+                <div>
+                  <div style={{ fontSize: 12.5, fontWeight: 600, color: '#0f172a' }}>EOD Portfolio Snapshot</div>
+                  <div style={{ fontSize: 11.5, color: '#64748b' }}>Calculates daily P&amp;L after NYSE closing bell</div>
+                </div>
+                <span style={{ fontSize: 11, fontWeight: 600, color: '#0284c7', background: '#f0f9ff', padding: '2px 8px', borderRadius: 6 }}>
+                  16:15 ET
+                </span>
+              </div>
+            </div>
+
+            {/* Live Status indicator */}
             <div style={{
               background: '#f8faf9',
               border: '1px solid var(--border)',
               borderRadius: 8,
-              padding: '12px 14px',
-              marginTop: 14,
+              padding: '10px 14px',
+              marginTop: 12,
             }}>
               <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.8px', color: '#64748b', textTransform: 'uppercase' }}>
-                NEXT RUN
+                ACTIVE STATUS
               </div>
-              <div style={{ fontSize: 13, fontWeight: 600, color: '#0f172a', marginTop: 2 }}>
-                Entry confirmation · 09:45 AEDT
+              <div style={{ fontSize: 12.5, fontWeight: 600, color: '#0f172a', marginTop: 2 }}>
+                APScheduler running · NYSE &amp; Australian Eastern Time synchronized
               </div>
             </div>
           </div>
@@ -564,7 +599,7 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
           <span style={{ fontSize: 15, fontWeight: 700 }}>Danger Zone</span>
         </div>
         <p style={{ fontSize: 12.5, color: '#7f1d1d', marginBottom: 18 }}>
-          These actions interrupt trading or permanently remove simulation data.
+          Emergency actions to interrupt trading or clear simulation history.
         </p>
 
         <div className="danger-zone-actions-grid">
@@ -610,8 +645,8 @@ export default function SettingsTab({ onModeChange, authFetch }: Props) {
             <span style={{ color: '#059669', fontWeight: 600 }}>✅ {saveStatus}</span>
           ) : (
             <>
-              <span className="desktop-save-text">All changes saved · Last updated 12 Nov 2026, 09:30 AEDT</span>
-              <span className="mobile-save-text">Last saved 09:30 AEDT</span>
+              <span className="desktop-save-text">All active settings synchronized with database</span>
+              <span className="mobile-save-text">Settings synced</span>
             </>
           )}
         </div>

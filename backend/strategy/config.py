@@ -16,15 +16,15 @@ VALID_MODES = ("off", "shadow", "enforce")
 
 # Default system settings and thresholds
 DEFAULT_CONFIG = {
-    # Feature flags (three-mode: off | shadow | enforce)
-    "gate_intraday_confirmation": "shadow",
-    "gate_gap_down_veto":         "shadow",
-    "gate_exposure_tiers":        "shadow",
-    "gate_market_breadth":        "shadow",
-    "gate_sector_leadership":     "shadow",
-    "sizing_beta_aware":          "shadow",
-    "exit_market_linked":         "shadow",
-    "gate_earnings_density":      "shadow",
+    # Feature flags (three-mode: off | shadow | enforce) — active enforcement enabled
+    "gate_intraday_confirmation": "enforce",
+    "gate_gap_down_veto":         "enforce",
+    "gate_exposure_tiers":        "enforce",
+    "gate_market_breadth":        "enforce",
+    "gate_sector_leadership":     "enforce",
+    "sizing_beta_aware":          "enforce",
+    "exit_market_linked":         "enforce",
+    "gate_earnings_density":      "enforce",
 
     # Configurable thresholds
     "gap_down_threshold_pct":     0.7,   # SPY opening gap % below prior close to veto (e.g. 0.7%)
@@ -33,6 +33,11 @@ DEFAULT_CONFIG = {
     "tier_b_score_bump":          5.0,   # Score threshold bump for Tier B (e.g. 70 -> 75)
     "vix_stress_level":           25.0,  # VIX level triggering caution / Tier C (default 25.0)
     "vix_spike_threshold_pct":    20.0,  # VIX 3-session spike threshold (default 20.0%)
+
+    # Dual-Engine Architecture & Progressive Stops
+    "enable_mean_reversion":      True,  # Enable Mean Reversion sleeve for ETFs/large-caps
+    "mean_reversion_allocation_pct": 40.0, # Target % allocation for mean-reversion sleeve
+    "breakeven_r_multiple":       0.75,  # Progressive stop step: +0.75R moves stop to breakeven + 0.2%
 }
 
 
@@ -75,7 +80,9 @@ def _load_from_db(db, cfg: dict) -> dict:
         if val is None:
             continue
 
-        if isinstance(default_val, float):
+        if isinstance(default_val, bool):
+            cfg[key] = str(val).strip().lower() in ("true", "1", "yes")
+        elif isinstance(default_val, float):
             try:
                 cfg[key] = float(val)
             except (ValueError, TypeError):

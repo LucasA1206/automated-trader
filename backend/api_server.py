@@ -181,6 +181,17 @@ class SettingsBulkUpdate(BaseModel):
     entry_pullback_max_pct: Optional[str] = None
     entry_vwap_required: Optional[str] = None
     entry_adx_min: Optional[str] = None
+    enable_mean_reversion: Optional[str] = None
+    mean_reversion_allocation_pct: Optional[str] = None
+    breakeven_r_multiple: Optional[str] = None
+    gate_intraday_confirmation: Optional[str] = None
+    gate_gap_down_veto: Optional[str] = None
+    gate_exposure_tiers: Optional[str] = None
+    gate_market_breadth: Optional[str] = None
+    gate_sector_leadership: Optional[str] = None
+    sizing_beta_aware: Optional[str] = None
+    exit_market_linked: Optional[str] = None
+    gate_earnings_density: Optional[str] = None
 
 
 def _sync_strategy_settings(db: Session, account_type: str) -> None:
@@ -295,11 +306,15 @@ def get_portfolio(db: Session = Depends(get_db)):
         ).all()
         partial_by_ticker = {t.ticker: t.realised_partial_pnl or 0.0 for t in open_trades}
         status_by_ticker  = {t.ticker: t.status for t in open_trades}
+        engine_by_ticker  = {t.ticker: getattr(t, "strategy_engine", "momentum") or "momentum" for t in open_trades}
+        be_by_ticker      = {t.ticker: bool(getattr(t, "breakeven_moved", False)) for t in open_trades}
 
         for pos in positions:
             ticker = pos["ticker"]
             pos["realised_partial_pnl"] = round(partial_by_ticker.get(ticker, 0.0), 2)
             pos["trade_status"] = status_by_ticker.get(ticker, "open")
+            pos["strategy_engine"] = engine_by_ticker.get(ticker, "momentum")
+            pos["breakeven_moved"] = be_by_ticker.get(ticker, False)
 
         return {
             "connected": True,
@@ -359,6 +374,8 @@ def get_trades(
                 "spy_return_pct": t.spy_return_pct,
                 "expected_return_pct": t.expected_return_pct,
                 "alpha_pct": t.alpha_pct,
+                "strategy_engine": getattr(t, "strategy_engine", "momentum") or "momentum",
+                "breakeven_moved": bool(getattr(t, "breakeven_moved", False)),
             }
             for t in trades
         ],
@@ -999,6 +1016,10 @@ def sell_single_stock(body: SellStockRequest, db: Session = Depends(get_db)):
                 trade.pnl_pct = round(pnl_pct, 2)
                 trade.fees = round((trade.fees or 0.0) + sell_fees, 4)
                 db.commit()
+
+                # Cancel the native IBKR stop order so it doesn't leave an orphaned short order
+                if trade.stop_order_id:
+                    client.cancel_stop_order(trade.stop_order_id, ticker)
 
         level = "INFO" if result.get("success") else "ERROR"
         msg = (

@@ -40,6 +40,8 @@ logger = logging.getLogger(__name__)
 # Constants per blueprint Section 9
 INITIAL_STOP_ATR_MULTIPLIER_DEFAULT = 1.75  # 1.5–2× range; use 1.75 by default
 INITIAL_STOP_ATR_MULTIPLIER_STRONG  = 1.50  # Tighter when ADX > 25
+PROGRESSIVE_BREAKEVEN_R = 0.75      # Move stop to breakeven + 0.2% cushion when price hits +0.75R
+COMMISSION_CUSHION_PCT = 0.002     # +0.2% above entry to guarantee commission coverage
 PARTIAL_EXIT_R_MULTIPLE = 1.5   # Sell 50% at 1.5R
 TRAIL_ATR_MULTIPLIER = 2.0      # Chandelier: highest_high - 2× ATR
 MA_TREND_BREAK_WINDOW = 20      # 20-day SMA for trend break
@@ -219,6 +221,28 @@ def check_exit_conditions(
             shares_to_sell=live_shares,
             details=f"Earnings within {EARNINGS_BLACKOUT_TRADING_DAYS} trading days — exiting to avoid binary catalyst",
         )
+
+    # ── 3b. Progressive +0.75R Breakeven Lock ────────────────────────────────
+    # Once trade reaches +0.75R, move stop to entry + 0.2% cushion to lock in a risk-free trade
+    breakeven_moved = getattr(trade, "breakeven_moved", False)
+    if status == "open" and not breakeven_moved and entry and effective_stop and entry > effective_stop:
+        r_unit = entry - effective_stop
+        breakeven_target = entry + (PROGRESSIVE_BREAKEVEN_R * r_unit)
+        if current_price >= breakeven_target:
+            cushioned_stop = round(entry * (1.0 + COMMISSION_CUSHION_PCT), 2)
+            current_active_stop = stop or effective_stop
+            if cushioned_stop > current_active_stop:
+                return ExitSignal(
+                    action="hold",
+                    reason="breakeven_update",
+                    urgency="immediate",
+                    new_stop_price=cushioned_stop,
+                    details=(
+                        f"Price ${current_price:.2f} reached +0.75R target ${breakeven_target:.2f} "
+                        f"({pct_change:+.2f}%). Moving stop to breakeven + 0.2% cushion (${cushioned_stop:.2f}) "
+                        f"to eliminate trade risk."
+                    ),
+                )
 
     # ── 4. 1.5R partial exit ─────────────────────────────────────────────────
     if status == "open" and not partial_sold and partial_target:

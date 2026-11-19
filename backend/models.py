@@ -53,6 +53,11 @@ class Trade(Base):
     # Sector at entry (for risk engine sector-cap gate)
     sector = Column(String(50), nullable=True)
 
+    # Strategy engine: 'momentum' (default) | 'mean_reversion'
+    strategy_engine = Column(String(30), default="momentum", nullable=True)
+    # Progressive +0.75R breakeven stop flag: True once stop has moved to breakeven + cushion
+    breakeven_moved = Column(Boolean, default=False, nullable=True)
+
     # ── Phase 5 Alpha & Confirmation Logging ─────────────────────────────────
     spy_price_at_entry = Column(Float, nullable=True)
     spy_price_at_exit = Column(Float, nullable=True)
