@@ -9,7 +9,7 @@ services:
       - TWS_USERID=${IB_USER}
       - TWS_PASSWORD=${IB_PASS}
       - TRADING_MODE=${TRADING_MODE:-paper}      # paper | live
-      - VNC_SERVER_PASSWORD=${VNC_PASSWORD:-blitz123}
+      - VNC_SERVER_PASSWORD=${VNC_PASSWORD}
     ports:
       - "4001:4001"    # Live trading API port
       - "4002:4002"    # Paper trading API port
@@ -35,25 +35,29 @@ services:
     environment:
       - IB_HOST=ib-gateway
       - IB_PORT=4002
-      - DATABASE_URL=postgresql://blitz:blitz123@postgres:5432/blitztrader
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-blitz}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-blitztrader}
+      - JWT_SECRET=${JWT_SECRET}
+      - IB_USER=${IB_USER}
+      - IB_PASS=${IB_PASS}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - NEWS_API_KEY=${NEWS_API_KEY}
+      - FINNHUB_API_KEY=${FINNHUB_API_KEY}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000}
     volumes:
       - ./backend:/app    # Hot reload for dev
-    command: uvicorn api_server:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn api_server:app --host 0.0.0.0 --port 8000
 
   # ─── PostgreSQL ─────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     restart: always
     environment:
-      - POSTGRES_USER=blitz
-      - POSTGRES_PASSWORD=blitz123
-      - POSTGRES_DB=blitztrader
+      - POSTGRES_USER=${POSTGRES_USER:-blitz}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Database password required}
+      - POSTGRES_DB=${POSTGRES_DB:-blitztrader}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
 
 volumes:
   postgres_data:

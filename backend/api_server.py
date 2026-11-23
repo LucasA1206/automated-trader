@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -16,7 +16,9 @@ from database import get_db, init_db, get_setting, set_setting, SessionLocal
 from models import Trade, SystemLog, Setting, AIPick, AccountSnapshot, ScanResult, TradeJournalEntry
 from scheduler import create_scheduler, get_next_job_times
 from trader import IBKRClient
-from auth import require_auth, validate_credentials, create_access_token
+from auth import require_auth, require_admin, validate_credentials, create_access_token, set_auth_cookie, clear_auth_cookie
+from security import SecurityHeadersMiddleware, rate_limit_endpoint, get_client_ip
+from pydantic import Field, validator
 from jobs import start_persistent_keepalive, stop_persistent_keepalive, job_manual_scan
 
 # ─── Logging ───────────────────────────────────────────────────────────────
@@ -147,12 +149,26 @@ ALLOWED_ORIGINS: list[str] = (
     if _raw_origins else ["*"]
 )
 
+# Add defense-in-depth Security Headers
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Strict CORS: never permit wildcard with credentials
+is_production = os.getenv("ENVIRONMENT", "production").lower() == "production"
+if "*" in ALLOWED_ORIGINS:
+    if is_production:
+        logger.warning("[Security] Wildcard '*' in ALLOWED_ORIGINS with credentials is invalid/unsafe in production. Restricting.")
+        effective_origins = ["https://www.blitz-trader.com"]
+    else:
+        effective_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+else:
+    effective_origins = ALLOWED_ORIGINS
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=effective_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"],
 )
 
 
@@ -236,16 +252,60 @@ def _build_margin_upgrade_alert(db: Session, trading_mode: str, account_type: st
 
 
 # ─── Auth ─────────────────────────────────────────────────────────────────
-@app.post("/api/auth/login")
-def login(body: LoginRequest):
-    """Validates IBKR credentials and returns a JWT access token."""
+@app.post(
+    "/api/auth/login",
+    dependencies=[Depends(rate_limit_endpoint(max_requests=5, window_seconds=60))],
+)
+def login(body: LoginRequest, request: Request, response: Response, db: Session = Depends(get_db)):
+    """Validates admin credentials, issues HttpOnly cookie and Bearer access token."""
+    client_ip = get_client_ip(request)
     if not validate_credentials(body.username, body.password):
+        # Audit log failed authentication attempt
+        logger.warning("[SecurityAudit] Failed login attempt for user '%s' from IP %s", body.username, client_ip)
+        try:
+            db.add(SystemLog(
+                timestamp=datetime.now(timezone.utc),
+                level="WARNING",
+                category="auth",
+                message=f"🚨 Failed login attempt for user '{body.username}' from IP {client_ip}",
+            ))
+            db.commit()
+        except Exception:
+            pass
+
         raise HTTPException(
             status_code=401,
             detail="Invalid username or password",
         )
-    token = create_access_token(body.username)
-    return {"access_token": token, "token_type": "bearer"}
+
+    # Issue token and set hardened cookie
+    token = create_access_token(body.username, role="admin")
+    set_auth_cookie(response, token)
+
+    logger.info("[SecurityAudit] Successful login for admin '%s' from IP %s", body.username, client_ip)
+    try:
+        db.add(SystemLog(
+            timestamp=datetime.now(timezone.utc),
+            level="INFO",
+            category="auth",
+            message=f"🔑 Admin user '{body.username}' logged in successfully from IP {client_ip}",
+        ))
+        db.commit()
+    except Exception:
+        pass
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "role": "admin",
+    }
+
+
+@app.post("/api/auth/logout")
+def logout(response: Response):
+    """Clears session authentication cookie."""
+    clear_auth_cookie(response)
+    return {"status": "ok", "message": "Logged out successfully"}
 
 
 # ─── Health (public — Railway health checks) ────────────────────────────────
@@ -712,7 +772,7 @@ def get_settings(db: Session = Depends(get_db)):
     return settings
 
 
-@app.put("/api/settings", dependencies=[Depends(require_auth)])
+@app.put("/api/settings", dependencies=[Depends(require_admin)])
 def update_settings(body: SettingsBulkUpdate, db: Session = Depends(get_db)):
     """Updates one or more settings."""
     updates = body.dict(exclude_none=True)
@@ -765,7 +825,7 @@ def update_settings(body: SettingsBulkUpdate, db: Session = Depends(get_db)):
 
 
 # ─── Manual Triggers ───────────────────────────────────────────────────────
-@app.post("/api/scan", dependencies=[Depends(require_auth)])
+@app.post("/api/scan", dependencies=[Depends(require_admin)])
 def trigger_scan(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """Manually triggers the morning scan & buy job in the background.
 
@@ -1205,7 +1265,7 @@ def trigger_snapshot(background_tasks: BackgroundTasks):
     return {"status": "triggered", "message": "NetLiq snapshot job started in background."}
 
 
-@app.post("/api/reset-pnl-history", dependencies=[Depends(require_auth)])
+@app.post("/api/reset-pnl-history", dependencies=[Depends(require_admin)])
 def reset_pnl_history(db: Session = Depends(get_db), confirm: bool = False):
     """
     Deletes ALL AccountSnapshot records so the P&L chart can start fresh.
