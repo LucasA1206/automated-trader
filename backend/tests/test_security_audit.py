@@ -17,11 +17,16 @@ sys.modules["apscheduler.triggers.cron"] = MagicMock()
 
 from fastapi.testclient import TestClient
 from api_server import app
+from database import init_db
 import auth
 from security import rate_limiter
 
 
 class TestSecurityHardening(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        init_db()
 
     def setUp(self):
         self.client = TestClient(app)
