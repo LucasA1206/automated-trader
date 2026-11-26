@@ -87,6 +87,8 @@ class RiskEngine:
         size_multiplier: float = 1.0,
         tier: str = "A",
         beta_scalar: float = 1.0,
+        derisk_level: int = 0,
+        derisk_size_multiplier: float = 1.0,
     ) -> dict:
         """
         Compute position size per blueprint Section 7:
@@ -116,8 +118,19 @@ class RiskEngine:
                 "size_multiplier": size_multiplier,
             }
 
-        # Base risk allocation scaled by tier multiplier and beta scalar
-        effective_mult = max(0.0, size_multiplier) * max(0.1, min(1.0, beta_scalar))
+        # Enforce strictly protective de-risk ladder multiplier (clamped [0.0, 1.0])
+        clamped_derisk_mult = min(1.0, max(0.0, float(derisk_size_multiplier)))
+        if int(derisk_level) >= 2 or clamped_derisk_mult <= 0.0:
+            return {
+                "error": f"De-risk Level {derisk_level} — no new entries allowed",
+                "shares": 0,
+                "tier": tier,
+                "size_multiplier": 0.0,
+                "derisk_level": int(derisk_level),
+            }
+
+        # Base risk allocation scaled by tier multiplier, beta scalar, and de-risk multiplier
+        effective_mult = max(0.0, min(1.0, size_multiplier)) * max(0.1, min(1.0, beta_scalar)) * clamped_derisk_mult
         base_risk_pct = (risk_pct / 100) * effective_mult
         if classification == "marginal":
             base_risk_pct *= 0.5  # Half size for marginal setups
@@ -167,6 +180,9 @@ class RiskEngine:
         weekly_pnl_pct: float,
         regime: str,
         black_swan_day: bool = False,
+        dq_paused: Optional[tuple[bool, str]] = None,
+        db=None,
+        derisk_level: Optional[int] = None,
     ) -> tuple[bool, str]:
         """
         Run all mandatory circuit breaker checks before allowing a new entry.
@@ -174,6 +190,32 @@ class RiskEngine:
         Returns: (allowed: bool, reason: str)
         If allowed=False, reason explains which circuit breaker triggered.
         """
+        # ── Gate -2: De-risking ladder hard gate ──────────────────────────────
+        eff_derisk_level = derisk_level
+        if eff_derisk_level is None and db is not None:
+            try:
+                from strategy.derisk_engine import get_derisk_state
+                eff_derisk_level = get_derisk_state(db).get("level", 0)
+            except Exception as exc:
+                logger.error("[RiskEngine] Failed to check de-risk level: %s", exc)
+                return False, "derisk_check_error: fail-safe block"
+        if eff_derisk_level is not None and int(eff_derisk_level) >= 2:
+            return False, f"derisk_level_{int(eff_derisk_level)}: new entries halted by de-risking ladder"
+
+        # ── Gate -1: Critical Data-Quality / Reconciliation Pause ─────────────
+        if dq_paused is not None:
+            if dq_paused[0]:
+                return False, f"data_quality_pause: {dq_paused[1]}"
+        elif db is not None:
+            try:
+                from strategy.alerting import is_dq_critical_paused
+                is_paused, pause_reason = is_dq_critical_paused(db)
+                if is_paused:
+                    return False, f"data_quality_pause: {pause_reason}"
+            except Exception as exc:
+                logger.error("[RiskEngine] Failed to check DQ pause state: %s", exc)
+                return False, "data_quality_pause: fail-safe block on DQ check error"
+
         # ── Gate 0: Black-swan day ────────────────────────────────────────────
         if black_swan_day:
             return False, "black_swan_day: SPY moved >3% — all new entries suspended"
@@ -281,6 +323,8 @@ class RiskEngine:
         daily_pnl_pct: float,
         weekly_pnl_pct: float,
         regime: str,
+        dq_paused: Optional[tuple[bool, str]] = None,
+        db=None,
     ) -> dict:
         """
         Return a complete risk state snapshot for the API and UI.
@@ -293,6 +337,30 @@ class RiskEngine:
         hard_suspended, suspend_reason = self.check_trading_suspended(
             account_equity, peak_equity, weekly_pnl_pct
         )
+
+        is_dq_paused = False
+        dq_pause_reason = None
+        if dq_paused is not None:
+            is_dq_paused, dq_pause_reason = dq_paused[0], (dq_paused[1] if dq_paused[0] else None)
+        elif db is not None:
+            try:
+                from strategy.alerting import is_dq_critical_paused
+                p, r = is_dq_critical_paused(db)
+                is_dq_paused = p
+                dq_pause_reason = r if p else None
+            except Exception:
+                pass
+
+        derisk_level = 0
+        derisk_label = "Normal"
+        if db is not None:
+            try:
+                from strategy.derisk_engine import get_derisk_state
+                ds = get_derisk_state(db)
+                derisk_level = int(ds.get("level", 0))
+                derisk_label = ds.get("label", "Normal")
+            except Exception:
+                pass
 
         sectors = {}
         for p in open_positions:
@@ -312,9 +380,19 @@ class RiskEngine:
             "daily_pnl_pct": round(daily_pnl_pct, 3),
             "weekly_pnl_pct": round(weekly_pnl_pct, 3),
             "regime": regime,
-            "new_entries_allowed": not hard_suspended and drawdown_pct < DRAWDOWN_WARN_PCT and (regime not in ("risk_off", "unavailable", "unknown") and bool(regime)),
+            "new_entries_allowed": (
+                not hard_suspended
+                and not is_dq_paused
+                and derisk_level < 2
+                and drawdown_pct < DRAWDOWN_WARN_PCT
+                and (regime not in ("risk_off", "unavailable", "unknown") and bool(regime))
+            ),
             "hard_suspended": hard_suspended,
             "suspension_reason": suspend_reason if hard_suspended else None,
+            "dq_paused": is_dq_paused,
+            "dq_pause_reason": dq_pause_reason,
+            "derisk_level": derisk_level,
+            "derisk_label": derisk_label,
             "sector_breakdown": sectors,
             "limits": {
                 "max_portfolio_heat_pct": MAX_PORTFOLIO_HEAT_PCT,

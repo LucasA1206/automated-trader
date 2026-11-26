@@ -378,6 +378,31 @@ class IBKRClient:
             logger.error(f"Failed to fetch positions: {e}")
             return []
 
+    def get_open_orders(self) -> list[dict]:
+        """Returns all open orders currently active in IBKR."""
+        try:
+            if not self.ib.isConnected():
+                self.connect()
+            self.ib.reqAllOpenOrders()
+            self.ib.sleep(0.5)
+            open_trades = self.ib.openTrades() or []
+            result = []
+            for ot in open_trades:
+                result.append({
+                    "ticker": getattr(ot.contract, "symbol", None),
+                    "action": getattr(ot.order, "action", None),
+                    "order_type": getattr(ot.order, "orderType", None),
+                    "total_quantity": safe_float(getattr(ot.order, "totalQuantity", 0)),
+                    "aux_price": safe_float(getattr(ot.order, "auxPrice", 0)),
+                    "lmt_price": safe_float(getattr(ot.order, "lmtPrice", 0)),
+                    "order_id": str(getattr(ot.order, "orderId", "")),
+                    "status": getattr(getattr(ot, "orderStatus", None), "status", ""),
+                })
+            return result
+        except Exception as e:
+            logger.error("Failed to fetch open orders: %s", e)
+            return []
+
     def place_buy_order(self, ticker: str, budget: float) -> dict:
         """
         Places a market buy order for the given ticker using the specified dollar budget.

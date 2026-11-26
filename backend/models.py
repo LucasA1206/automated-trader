@@ -211,7 +211,132 @@ class ShadowEvaluation(Base):
     hypothetical_pnl = Column(Float, nullable=True)  # e.g. $0 if blocked
     hypothetical_pnl_pct = Column(Float, nullable=True)
     details = Column(Text, nullable=True)
+    # ── Feature 4: Forward Hypothetical Outcome & Near-Miss Tracking ──────────
+    is_near_miss = Column(Boolean, default=False, nullable=False)
+    hypothetical_action = Column(String(40), nullable=True)  # block | resize_0.5x | near_miss_score | near_miss_filter
+    entry_price = Column(Float, nullable=True)
+    stop_price = Column(Float, nullable=True)
+    partial_target_price = Column(Float, nullable=True)
+    trailing_stop_price = Column(Float, nullable=True)
+    high_watermark = Column(Float, nullable=True)
+    partial_taken = Column(Boolean, default=False, nullable=False)
+    market_state_json = Column(Text, nullable=True)
+    outcome_status = Column(String(20), default="open", nullable=False)  # open | resolved
+    exit_reason = Column(String(50), nullable=True)
+    exit_price = Column(Float, nullable=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     def __repr__(self):
         return f"<ShadowEvaluation {self.ticker} gate={self.gate_name} would_block={self.would_have_blocked}>"
+
+
+class SystemAlert(Base):
+    """
+    In-app alerts emitted by data-quality monitors, position reconciliation,
+    de-risking ladder, and critical failures. Supports deduplication and
+    operator acknowledgement.
+    """
+    __tablename__ = "system_alerts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    alert_key = Column(String(120), nullable=False, index=True)
+    severity = Column(String(20), default="info", nullable=False)  # info | warning | critical
+    category = Column(String(30), nullable=False, index=True)     # data_quality | reconciliation | derisk | report | system
+    title = Column(String(200), nullable=False)
+    message = Column(Text, nullable=False)
+    details_json = Column(Text, nullable=True)
+    acknowledged = Column(Boolean, default=False, nullable=False)
+    acknowledged_at = Column(DateTime(timezone=True), nullable=True)
+    acknowledged_by = Column(String(100), nullable=True)
+    resolved = Column(Boolean, default=False, nullable=False)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    def __repr__(self):
+        return f"<SystemAlert id={self.id} [{self.severity}] {self.alert_key}>"
+
+
+class DataHealthCheck(Base):
+    """
+    Time-series log of data-quality and reconciliation check results.
+    """
+    __tablename__ = "data_health_checks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    check_name = Column(String(80), nullable=False, index=True)
+    status = Column(String(20), nullable=False)  # ok | warning | critical
+    summary = Column(Text, nullable=False)
+    details_json = Column(Text, nullable=True)
+    checked_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    def __repr__(self):
+        return f"<DataHealthCheck {self.check_name} status={self.status}>"
+
+
+class DeRiskState(Base):
+    """
+    Singleton state row for the Automatic De-Risking Ladder (Feature 1).
+    Levels:
+      0 = Normal
+      1 = Caution (0.5x size, +score bump)
+      2 = Pause (no new entries; exits still managed)
+      3 = Flatten & Halt (close all positions, manual re-enable required)
+    """
+    __tablename__ = "derisk_state"
+
+    id = Column(Integer, primary_key=True, index=True)
+    level = Column(Integer, default=0, nullable=False)
+    reason = Column(Text, nullable=True)
+    trigger_metrics_json = Column(Text, nullable=True)
+    escalated_at = Column(DateTime(timezone=True), nullable=True)
+    deescalated_at = Column(DateTime(timezone=True), nullable=True)
+    deescalated_by = Column(String(100), nullable=True)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    def __repr__(self):
+        return f"<DeRiskState level={self.level}>"
+
+
+class DeRiskEvent(Base):
+    """
+    Immutable audit log of every de-risk ladder transition (automatic escalations
+    and manual operator de-escalations).
+    """
+    __tablename__ = "derisk_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    from_level = Column(Integer, nullable=False)
+    to_level = Column(Integer, nullable=False)
+    action_type = Column(String(30), nullable=False)  # escalate | manual_deescalate
+    trigger = Column(String(120), nullable=False)
+    details = Column(Text, nullable=True)
+    actor = Column(String(100), default="system", nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    def __repr__(self):
+        return f"<DeRiskEvent {self.from_level}->{self.to_level} ({self.action_type})>"
+
+
+class WeeklyReport(Base):
+    """
+    Persisted weekly performance, data-quality, and shadow-tracking report
+    generated automatically (default: Saturday morning) or on demand.
+    Observational only.
+    """
+    __tablename__ = "weekly_reports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    period_start = Column(Date, nullable=False, index=True)
+    period_end = Column(Date, nullable=False, index=True)
+    total_trades = Column(Integer, default=0, nullable=False)
+    strategy_return_pct = Column(Float, default=0.0, nullable=False)
+    spy_return_pct = Column(Float, default=0.0, nullable=False)
+    alpha_pct = Column(Float, default=0.0, nullable=False)
+    derisk_level = Column(Integer, default=0, nullable=False)
+    report_json = Column(Text, nullable=False)
+    summary_text = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    def __repr__(self):
+        return f"<WeeklyReport {self.period_start}..{self.period_end} trades={self.total_trades}>"

@@ -131,6 +131,39 @@ def _finnhub_rate_check() -> None:
         time.sleep(1.0)
 
 
+def _finnhub_get(url: str, timeout: int = 10) -> requests.Response:
+    """Rate-limited Finnhub GET request with API health latency/error tracking."""
+    _finnhub_rate_check()
+    t0 = time.monotonic()
+    rate_limited = False
+    try:
+        resp = _session.get(url, timeout=timeout)
+        latency_ms = (time.monotonic() - t0) * 1000.0
+        if resp.status_code == 429:
+            rate_limited = True
+        resp.raise_for_status()
+        try:
+            from strategy.data_quality import api_health_tracker
+            api_health_tracker.record_call("finnhub", success=True, latency_ms=latency_ms)
+        except Exception:
+            pass
+        return resp
+    except Exception as exc:
+        latency_ms = (time.monotonic() - t0) * 1000.0
+        try:
+            from strategy.data_quality import api_health_tracker
+            api_health_tracker.record_call(
+                "finnhub",
+                success=False,
+                latency_ms=latency_ms,
+                rate_limited=rate_limited or ("429" in str(exc)),
+                error=str(exc),
+            )
+        except Exception:
+            pass
+        raise
+
+
 def _get_finnhub_api_key():
     import os
     from dotenv import load_dotenv
@@ -742,17 +775,12 @@ def fetch_fundamentals(ticker: str) -> Optional[dict]:
     def _fetch():
         api_key = _get_finnhub_api_key()
 
-        # Rate-limit each individual API call
-        _finnhub_rate_check()
-        resp_prof = _session.get(f"https://finnhub.io/api/v1/stock/profile2?symbol={ticker}&token={api_key}", timeout=10)
-        resp_prof.raise_for_status()
+        resp_prof = _finnhub_get(f"https://finnhub.io/api/v1/stock/profile2?symbol={ticker}&token={api_key}", timeout=10)
         profile = resp_prof.json()
         if not profile:
             raise ValueError(f"No profile info for {ticker}")
 
-        _finnhub_rate_check()
-        resp_fin = _session.get(f"https://finnhub.io/api/v1/stock/metric?symbol={ticker}&metric=all&token={api_key}", timeout=10)
-        resp_fin.raise_for_status()
+        resp_fin = _finnhub_get(f"https://finnhub.io/api/v1/stock/metric?symbol={ticker}&metric=all&token={api_key}", timeout=10)
         financials = resp_fin.json()
         raw_metrics = financials.get('metric', {}) if financials else {}
 
@@ -912,10 +940,7 @@ def fetch_next_earnings_date(ticker: str) -> Optional[date]:
         # Look 60 days ahead for upcoming earnings
         date_from = today.strftime("%Y-%m-%d")
         date_to   = (today + _td(days=60)).strftime("%Y-%m-%d")
-        _finnhub_rate_check()
-        
-        resp = _session.get(f"https://finnhub.io/api/v1/calendar/earnings?from={date_from}&to={date_to}&symbol={ticker}&token={api_key}", timeout=10)
-        resp.raise_for_status()
+        resp = _finnhub_get(f"https://finnhub.io/api/v1/calendar/earnings?from={date_from}&to={date_to}&symbol={ticker}&token={api_key}", timeout=10)
         cal = resp.json()
         
         earnings_list = cal.get("earningsCalendar", []) if cal else []

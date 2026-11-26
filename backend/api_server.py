@@ -13,7 +13,11 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from database import get_db, init_db, get_setting, set_setting, SessionLocal
-from models import Trade, SystemLog, Setting, AIPick, AccountSnapshot, ScanResult, TradeJournalEntry
+from models import (
+    Trade, SystemLog, Setting, AIPick, AccountSnapshot,
+    ScanResult, TradeJournalEntry, SystemAlert, DataHealthCheck,
+    DeRiskState, DeRiskEvent, WeeklyReport,
+)
 from scheduler import create_scheduler, get_next_job_times
 from trader import IBKRClient
 from auth import require_auth, require_admin, validate_credentials, create_access_token, set_auth_cookie, clear_auth_cookie
@@ -1434,6 +1438,9 @@ def get_shadow_report(db: Session = Depends(get_db)):
             "avg_pnl_pct": round(avg_ret, 2),
         }
 
+    from strategy.shadow_tracker import compute_shadow_summary
+    tracker_summary = compute_shadow_summary(db, cfg)
+
     return {
         "active_modes": {
             "intraday_confirmation": cfg.get("gate_intraday_confirmation", "shadow"),
@@ -1453,7 +1460,299 @@ def get_shadow_report(db: Session = Depends(get_db)):
             "tier_a": _calc_stats([t for t in closed_trades if (t.market_tier_at_entry or "A") == "A"]),
             "tier_b": _calc_stats([t for t in closed_trades if (t.market_tier_at_entry or "A") == "B"]),
         },
+        "shadow_tracker": tracker_summary,
     }
+
+
+# ─── Self-Monitoring & Data Health Endpoints (Feature 3) ──────────────────
+
+@app.get("/api/monitoring/data-health", dependencies=[Depends(require_auth)])
+def get_data_health(db: Session = Depends(get_db)):
+    """
+    Returns current status of all 7 data-quality & reconciliation checks,
+    recent check history, API health stats, active alerts, and critical pause state.
+    """
+    import json as _json
+    from strategy.alerting import is_dq_critical_paused
+    from strategy.data_quality import api_health_tracker
+
+    check_names = [
+        "metric_coverage",
+        "score_distribution",
+        "regime_inputs",
+        "price_sanity",
+        "api_health",
+        "cross_source_spot_check",
+        "position_reconciliation",
+    ]
+    latest_checks = {}
+    for name in check_names:
+        row = (
+            db.query(DataHealthCheck)
+            .filter(DataHealthCheck.check_name == name)
+            .order_by(DataHealthCheck.checked_at.desc())
+            .first()
+        )
+        if row:
+            try:
+                details = _json.loads(row.details_json or "{}")
+            except Exception:
+                details = {}
+            latest_checks[name] = {
+                "check_name": row.check_name,
+                "status": row.status,
+                "summary": row.summary,
+                "details": details,
+                "checked_at": row.checked_at.isoformat() if row.checked_at else None,
+            }
+        else:
+            latest_checks[name] = {
+                "check_name": name,
+                "status": "unknown",
+                "summary": "Not yet run.",
+                "details": {},
+                "checked_at": None,
+            }
+
+    history_rows = (
+        db.query(DataHealthCheck)
+        .order_by(DataHealthCheck.checked_at.desc())
+        .limit(30)
+        .all()
+    )
+    history = [
+        {
+            "id": r.id,
+            "check_name": r.check_name,
+            "status": r.status,
+            "summary": r.summary,
+            "checked_at": r.checked_at.isoformat() if r.checked_at else None,
+        }
+        for r in history_rows
+    ]
+
+    active_alerts = (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.acknowledged == False,  # noqa: E712
+            SystemAlert.resolved == False,  # noqa: E712
+        )
+        .order_by(SystemAlert.created_at.desc())
+        .limit(50)
+        .all()
+    )
+
+    paused, pause_reason = is_dq_critical_paused(db)
+
+    return {
+        "dq_critical_paused": paused,
+        "dq_pause_reason": pause_reason if paused else None,
+        "latest_checks": latest_checks,
+        "api_stats": api_health_tracker.get_stats(),
+        "active_alerts": [
+            {
+                "id": a.id,
+                "alert_key": a.alert_key,
+                "severity": a.severity,
+                "category": a.category,
+                "title": a.title,
+                "message": a.message,
+                "acknowledged": a.acknowledged,
+                "resolved": a.resolved,
+                "created_at": a.created_at.isoformat() if a.created_at else None,
+            }
+            for a in active_alerts
+        ],
+        "history": history,
+    }
+
+
+@app.get("/api/monitoring/alerts", dependencies=[Depends(require_auth)])
+def get_monitoring_alerts(
+    severity: Optional[str] = None,
+    acknowledged: Optional[bool] = None,
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """Returns alert history with optional severity and acknowledged filters."""
+    q = db.query(SystemAlert)
+    if severity:
+        q = q.filter(SystemAlert.severity == severity.lower())
+    if acknowledged is not None:
+        q = q.filter(SystemAlert.acknowledged == acknowledged)
+    rows = q.order_by(SystemAlert.created_at.desc()).limit(limit).all()
+    return {
+        "alerts": [
+            {
+                "id": a.id,
+                "alert_key": a.alert_key,
+                "severity": a.severity,
+                "category": a.category,
+                "title": a.title,
+                "message": a.message,
+                "acknowledged": a.acknowledged,
+                "acknowledged_by": a.acknowledged_by,
+                "acknowledged_at": a.acknowledged_at.isoformat() if a.acknowledged_at else None,
+                "resolved": a.resolved,
+                "resolved_at": a.resolved_at.isoformat() if a.resolved_at else None,
+                "created_at": a.created_at.isoformat() if a.created_at else None,
+            }
+            for a in rows
+        ]
+    }
+
+
+@app.post("/api/monitoring/alerts/{alert_id}/acknowledge")
+def ack_monitoring_alert(
+    alert_id: int,
+    user: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Acknowledge a monitoring alert (admin only). Lifts critical pause if no other critical alerts remain."""
+    from strategy.alerting import acknowledge_alert
+    res = acknowledge_alert(db, alert_id, username=user.get("sub", "admin"))
+    if res is None:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return res
+
+
+@app.post("/api/monitoring/run-health-check", dependencies=[Depends(require_admin)])
+def trigger_health_check(background_tasks: BackgroundTasks):
+    """Trigger an immediate data-quality & position reconciliation pass."""
+    from jobs import job_data_quality_monitor
+    background_tasks.add_task(job_data_quality_monitor)
+    return {"status": "started", "message": "Data-quality & reconciliation check started in background."}
+
+
+# ─── Automatic De-Risking Ladder Endpoints (Feature 1) ────────────────────
+
+class DeEscalateRequest(BaseModel):
+    target_level: int = Field(..., ge=0, le=2)
+    reason: str = Field(default="Operator manual review confirmed", max_length=300)
+
+
+@app.get("/api/risk/derisk-status", dependencies=[Depends(require_auth)])
+def get_derisk_status(db: Session = Depends(get_db)):
+    """
+    Returns current de-risk ladder state, active baseline metadata, live metrics,
+    and transition audit history.
+    """
+    from strategy.config import get_system_config
+    from strategy.baselines import get_active_baseline
+    from strategy.derisk_engine import get_derisk_state, compute_live_performance_metrics
+    from jobs import _get_peak_equity, _compute_weekly_pnl_pct
+
+    cfg = get_system_config(db)
+    baseline = get_active_baseline(cfg)
+    state = get_derisk_state(db, cfg)
+
+    latest_snap = db.query(AccountSnapshot).order_by(AccountSnapshot.date.desc()).first()
+    peak_eq = _get_peak_equity(db)
+    curr_eq = float(latest_snap.net_liq_usd) if latest_snap else peak_eq
+    weekly_pnl = _compute_weekly_pnl_pct(db, curr_eq)
+
+    live_metrics = compute_live_performance_metrics(
+        db=db,
+        account_equity=curr_eq,
+        peak_equity=peak_eq,
+        daily_pnl_pct=0.0,
+        weekly_pnl_pct=weekly_pnl,
+        min_sample_trades=int(cfg.get("derisk_min_sample_trades", 20)),
+    )
+
+    events = (
+        db.query(DeRiskEvent)
+        .order_by(DeRiskEvent.created_at.desc())
+        .limit(25)
+        .all()
+    )
+
+    return {
+        "state": state,
+        "baseline": baseline,
+        "live_metrics": live_metrics,
+        "events": [
+            {
+                "id": e.id,
+                "from_level": e.from_level,
+                "to_level": e.to_level,
+                "action_type": e.action_type,
+                "trigger": e.trigger,
+                "details": e.details,
+                "actor": e.actor,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+            }
+            for e in events
+        ],
+    }
+
+
+@app.post("/api/risk/de-escalate")
+def post_derisk_deescalate(
+    body: DeEscalateRequest,
+    user: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Manually de-escalate the de-risk ladder (admin confirmation required).
+    De-escalation is never automatic.
+    """
+    from strategy.derisk_engine import manual_deescalate
+    try:
+        updated = manual_deescalate(
+            db=db,
+            target_level=body.target_level,
+            username=user.get("sub", "admin"),
+            reason=body.reason,
+        )
+        return {"status": "ok", "state": updated}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ─── Weekly Performance Reports Endpoints (Feature 2) ─────────────────────
+
+@app.get("/api/monitoring/weekly-reports", dependencies=[Depends(require_auth)])
+def get_weekly_reports(
+    limit: int = Query(12, ge=1, le=52),
+    db: Session = Depends(get_db),
+):
+    """Returns stored weekly performance reports (most recent first)."""
+    import json as _json
+    rows = (
+        db.query(WeeklyReport)
+        .order_by(WeeklyReport.period_end.desc(), WeeklyReport.id.desc())
+        .limit(limit)
+        .all()
+    )
+    reports = []
+    for r in rows:
+        try:
+            payload = _json.loads(r.report_json or "{}")
+        except Exception:
+            payload = {}
+        reports.append({
+            "id": r.id,
+            "period_start": r.period_start.isoformat() if r.period_start else None,
+            "period_end": r.period_end.isoformat() if r.period_end else None,
+            "total_trades": r.total_trades,
+            "strategy_return_pct": r.strategy_return_pct,
+            "spy_return_pct": r.spy_return_pct,
+            "alpha_pct": r.alpha_pct,
+            "derisk_level": r.derisk_level,
+            "summary_text": r.summary_text,
+            "report": payload,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        })
+    return {"reports": reports}
+
+
+@app.post("/api/monitoring/weekly-reports/generate", dependencies=[Depends(require_admin)])
+def trigger_weekly_report(db: Session = Depends(get_db)):
+    """Generate and persist a weekly performance report immediately (admin only)."""
+    from strategy.weekly_report import generate_weekly_report
+    report = generate_weekly_report(db, deliver_alert=True)
+    return {"status": "ok", "report": report}
 
 
 # ─── Entrypoint ───────────────────────────────────────────────────────────

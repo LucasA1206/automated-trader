@@ -9,13 +9,17 @@ import TradeHistoryTab from '@/components/TradeHistoryTab';
 import SystemLogsTab from '@/components/SystemLogsTab';
 import SettingsTab from '@/components/SettingsTab';
 import AIAnalysisTab from '@/components/AIAnalysisTab';
+import DataHealthTab from '@/components/DataHealthTab';
+import WeeklyReportsTab from '@/components/WeeklyReportsTab';
 
-export type Tab = 'portfolio' | 'trades' | 'ai-analysis' | 'logs' | 'settings';
+export type Tab = 'portfolio' | 'trades' | 'ai-analysis' | 'monitoring' | 'reports' | 'logs' | 'settings';
 
 const tabTitles: Record<Tab, string> = {
   portfolio: 'Portfolio',
   trades: 'Trade History',
   'ai-analysis': 'AI Stock Analysis',
+  monitoring: 'Data Health & Alerts',
+  reports: 'Weekly Reports',
   logs: 'System Logs',
   settings: 'Settings',
 };
@@ -119,6 +123,12 @@ export default function Home() {
           )}
           {activeTab === 'ai-analysis' && (
             <AIAnalysisTab authFetch={authFetch} tradingMode={tradingMode} />
+          )}
+          {activeTab === 'monitoring' && (
+            <DataHealthTab authFetch={authFetch} />
+          )}
+          {activeTab === 'reports' && (
+            <WeeklyReportsTab authFetch={authFetch} />
           )}
           {activeTab === 'logs' && (
             <SystemLogsTab authFetch={authFetch} tradingMode={tradingMode} />

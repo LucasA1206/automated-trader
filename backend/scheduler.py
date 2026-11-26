@@ -32,6 +32,8 @@ def create_scheduler() -> BackgroundScheduler:
         job_entry_monitor,
         job_exit_monitor,
         job_eod_snapshot,
+        job_data_quality_monitor,
+        job_weekly_report,
     )
 
     scheduler = BackgroundScheduler(timezone=ET)
@@ -103,6 +105,40 @@ def create_scheduler() -> BackgroundScheduler:
         name="EOD NetLiq Snapshot (16:15 ET)",
         replace_existing=True,
         misfire_grace_time=300,
+    )
+
+    # 09:30–16:00 ET, every 5 min, Mon-Fri — Data-Quality & Position Reconciliation Monitor
+    scheduler.add_job(
+        func=job_data_quality_monitor,
+        trigger=CronTrigger(
+            day_of_week="mon-fri",
+            hour="9-15",
+            minute="*/5",
+            timezone=ET,
+        ),
+        id="data_quality_monitor",
+        name="Data-Quality & Stop Reconciliation (every 5 min)",
+        replace_existing=True,
+        misfire_grace_time=60,
+        max_instances=1,
+    )
+
+    # Weekly Performance Report (default: Saturday 09:00 ET, configurable)
+    from strategy.config import get_system_config
+    cfg = get_system_config()
+    scheduler.add_job(
+        func=job_weekly_report,
+        trigger=CronTrigger(
+            day_of_week=str(cfg.get("weekly_report_day", "sat")),
+            hour=int(cfg.get("weekly_report_hour", 9)),
+            minute=int(cfg.get("weekly_report_minute", 0)),
+            timezone=ET,
+        ),
+        id="weekly_report",
+        name="Weekly Performance Report",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        max_instances=1,
     )
 
     return scheduler

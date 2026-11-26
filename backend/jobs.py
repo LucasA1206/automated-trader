@@ -457,6 +457,12 @@ def job_pre_market_scan():
         clear_all_caches()
         regime_data = compute_regime_status()
 
+        try:
+            from strategy.data_quality import check_regime_inputs
+            check_regime_inputs(db, regime_data, is_market_open=is_market_open())
+        except Exception as dq_exc:
+            logger.error("[PreMarketScan] Data-quality regime check error: %s", dq_exc)
+
         if regime_data is None:
             log_event(db, "scan",
                       "❌ Regime data unavailable — cannot proceed safely. No trade today. "
@@ -553,6 +559,12 @@ def job_pre_market_scan():
                 + (" …" if len(no_data_tickers) > 10 else "")
             )
 
+        try:
+            from strategy.data_quality import check_api_health
+            check_api_health(db, no_data_count=len(no_data_tickers), total_universe=len(tickers))
+        except Exception as dq_exc:
+            logger.error("[PreMarketScan] Data-quality API health check error: %s", dq_exc)
+
 
         if not shortlist:
             log_event(db, "scan",
@@ -628,6 +640,24 @@ def job_pre_market_scan():
         log_event(db, "scan",
                   f"Scoring done: {len(high_conviction)} high-conviction (≥{SCORE_HIGH_CONVICTION}), "
                   f"{len(marginal)} marginal ({SCORE_MARGINAL}-{SCORE_HIGH_CONVICTION-0.1}), {len(no_trade_list)} no-trade (<{SCORE_MARGINAL}).")
+
+        # ── Data-Quality Monitoring (Feature 3) ──────────────────────────────
+        try:
+            from strategy.data_quality import (
+                check_metric_coverage,
+                check_score_distribution,
+                check_price_sanity,
+            )
+            check_metric_coverage(db, all_scored, config=cfg)
+            check_score_distribution(db, all_scored, config=cfg)
+            ohlcv_map = {
+                c["ticker"]: c["df"]
+                for c in shortlist
+                if isinstance(c, dict) and c.get("ticker") and c.get("df") is not None
+            }
+            check_price_sanity(db, ohlcv_map=ohlcv_map, open_positions=open_positions, config=cfg, is_market_open=is_market_open())
+        except Exception as dq_exc:
+            logger.error("[PreMarketScan] Data-quality scoring monitor error: %s", dq_exc)
 
         # ── Diagnostic: full per-metric breakdown for every scored candidate ─────────
         for c in all_scored[:20]:
@@ -755,6 +785,60 @@ def job_pre_market_scan():
             if len(staged_candidates) < before_len:
                 log_event(db, "scan", f"⛔ Sector gate (enforce) filtered out {before_len - len(staged_candidates)} laggard candidates.")
 
+        # ── Feature 4: Shadow-Mode & Near-Miss Logging (Observational Only) ───
+        try:
+            from strategy.shadow_tracker import record_shadow_decision
+            mkt_state = {
+                "regime": regime,
+                "tier": tier_data.get("tier"),
+                "vix": regime_data.get("vix"),
+                "spy_price": regime_data.get("spy_price"),
+                "breadth_pct": breadth_data.get("breadth_pct") if breadth_data else None,
+            }
+            # Log near-miss score candidates (50.0 <= score < 55.0)
+            nm_floor = float(cfg.get("shadow_near_miss_score_floor", 50.0))
+            for nm in [c for c in no_trade_list if nm_floor <= float(c.get("composite_score", 0)) < SCORE_MARGINAL][:5]:
+                record_shadow_decision(
+                    db=db,
+                    ticker=nm["ticker"],
+                    gate_name="near_miss_score",
+                    mode="near_miss",
+                    would_have_blocked=True,
+                    hypothetical_action="near_miss_score",
+                    entry_price=nm.get("price"),
+                    atr_abs=nm.get("atr_abs"),
+                    market_state=mkt_state,
+                    details=f"Score {nm.get('composite_score')} in near-miss band [{nm_floor}, {SCORE_MARGINAL})",
+                    is_near_miss=True,
+                )
+            # Log shadow-mode gates on staged candidates
+            for sc in staged_candidates:
+                if cfg.get("gate_gap_down_veto") == "shadow" and gap_veto.get("would_veto"):
+                    record_shadow_decision(
+                        db=db, ticker=sc["ticker"], gate_name="gap_veto", mode="shadow",
+                        would_have_blocked=True, hypothetical_action="block",
+                        entry_price=sc.get("price"), atr_abs=sc.get("atr_abs"),
+                        market_state=mkt_state, details=gap_veto.get("reason"),
+                    )
+                if cfg.get("gate_sector_leadership") == "shadow" and not sc.get("sector_gate_allowed", True):
+                    record_shadow_decision(
+                        db=db, ticker=sc["ticker"], gate_name="sector_gate", mode="shadow",
+                        would_have_blocked=True, hypothetical_action="block",
+                        entry_price=sc.get("price"), atr_abs=sc.get("atr_abs"),
+                        market_state=mkt_state, details=f"Sector rank {sc.get('sector_rank')}",
+                    )
+                if cfg.get("gate_exposure_tiers") == "shadow" and tier_data.get("hypothetical_tier") in ("B", "C"):
+                    htier = tier_data.get("hypothetical_tier")
+                    record_shadow_decision(
+                        db=db, ticker=sc["ticker"], gate_name=f"tier_{htier.lower()}", mode="shadow",
+                        would_have_blocked=(htier == "C"),
+                        hypothetical_action="block" if htier == "C" else f"resize_{tier_data.get('hypothetical_size_multiplier')}x",
+                        entry_price=sc.get("price"), atr_abs=sc.get("atr_abs"),
+                        market_state=mkt_state, details=tier_data.get("summary"),
+                    )
+        except Exception as sh_exc:
+            logger.error("[PreMarketScan] Shadow tracking error: %s", sh_exc)
+
         # ── Step 6b: Dual-Engine Mean Reversion Sleeve Scan ───────────────────
         mr_enabled = get_setting(db, "enable_mean_reversion", "true").lower() == "true"
         if mr_enabled:
@@ -858,6 +942,18 @@ def job_entry_monitor():
         if not is_market_open():
             return
 
+        from strategy.alerting import is_dq_critical_paused
+        dq_paused, dq_reason = is_dq_critical_paused(db)
+        if dq_paused:
+            logger.warning("[EntryMonitor] New entries paused due to critical data-quality alert: %s", dq_reason)
+            return
+
+        from strategy.derisk_engine import get_derisk_state
+        derisk_state = get_derisk_state(db)
+        if int(derisk_state.get("level", 0)) >= 2:
+            logger.warning("[EntryMonitor] New entries halted by de-risk Level %d (%s)", derisk_state.get("level"), derisk_state.get("reason"))
+            return
+
         ensure_pending_candidates_loaded(db)
 
         with _pending_candidates_lock:
@@ -910,6 +1006,20 @@ def job_entry_monitor():
             mode=cfg.get("gate_intraday_confirmation", "shadow"),
         )
         log_event(db, "scan", f"⚡ SPY Intraday Confirmation: {spy_confirm['details']}")
+
+        if cfg.get("gate_intraday_confirmation") == "shadow" and spy_confirm.get("would_block"):
+            try:
+                from strategy.shadow_tracker import record_shadow_decision
+                for c in candidates[:5]:
+                    record_shadow_decision(
+                        db=db, ticker=c["ticker"], gate_name="intraday_confirm", mode="shadow",
+                        would_have_blocked=True, hypothetical_action="block",
+                        entry_price=c.get("price"), atr_abs=c.get("atr_abs"),
+                        market_state={"spy_confirm": spy_confirm},
+                        details=spy_confirm.get("details"),
+                    )
+            except Exception as sh_exc:
+                logger.error("[EntryMonitor] Shadow tracking error: %s", sh_exc)
 
         if not spy_confirm["confirmed"]:
             log_event(db, "scan", f"🛑 Intraday confirmation gate active (enforce) — halting entries this cycle.", "WARNING")
@@ -1549,6 +1659,20 @@ def job_manual_entry_monitor(force: bool = False) -> dict:
         )
         log_event(db, "scan", f"⚡ SPY Intraday Confirmation: {spy_confirm['details']}")
 
+        if cfg.get("gate_intraday_confirmation") == "shadow" and spy_confirm.get("would_block"):
+            try:
+                from strategy.shadow_tracker import record_shadow_decision
+                for c in candidates[:5]:
+                    record_shadow_decision(
+                        db=db, ticker=c["ticker"], gate_name="intraday_confirm", mode="shadow",
+                        would_have_blocked=True, hypothetical_action="block",
+                        entry_price=c.get("price"), atr_abs=c.get("atr_abs"),
+                        market_state={"spy_confirm": spy_confirm},
+                        details=spy_confirm.get("details"),
+                    )
+            except Exception as sh_exc:
+                logger.error("[EntryMonitor] Shadow tracking error: %s", sh_exc)
+
         if not spy_confirm["confirmed"]:
             log_event(db, "scan", f"🛑 Intraday confirmation gate active (enforce) — halting entries this cycle.", "WARNING")
             client.disconnect()
@@ -1699,4 +1823,123 @@ def job_manual_entry_monitor(force: bool = False) -> dict:
         }
     finally:
         db.close()
+
+
+_last_spot_check_date = None
+
+
+def job_data_quality_monitor():
+    """
+    Runs every 5 minutes during market hours (09:30-16:00 ET, Mon-Fri).
+    Executes:
+      - Position & broker-side stop-order reconciliation (DB vs IBKR)
+      - Regime input freshness & validity check
+      - API health evaluation
+      - Daily cross-source price spot check (once per trading day)
+    Wrapped safely so monitor failures never crash the trading pipeline.
+    """
+    global _last_spot_check_date
+    db = SessionLocal()
+    try:
+        mkt_open = is_market_open()
+        from strategy.config import get_system_config
+        from strategy.data_quality import (
+            check_regime_inputs,
+            check_api_health,
+            reconcile_positions_and_stops,
+            run_cross_source_spot_check,
+        )
+        cfg = get_system_config(db)
+
+        # 1. Regime input check
+        try:
+            from strategy.data_layer import compute_regime_status
+            regime_data = compute_regime_status()
+            check_regime_inputs(db, regime_data, config=cfg, is_market_open=mkt_open)
+        except Exception as exc:
+            logger.error("[DQMonitor] Regime check error: %s", exc)
+
+        # 2. API health check
+        try:
+            check_api_health(db, config=cfg)
+        except Exception as exc:
+            logger.error("[DQMonitor] API health check error: %s", exc)
+
+        # 3. Position & broker-side stop reconciliation
+        trading_mode = get_setting(db, "trading_mode", "paper")
+        client = IBKRClient(trading_mode=trading_mode)
+        try:
+            if client.connect(retries=2, delay=2):
+                reconcile_positions_and_stops(db, client, config=cfg, is_market_open=mkt_open)
+                client.disconnect()
+            else:
+                if mkt_open:
+                    from strategy.alerting import emit_alert
+                    emit_alert(
+                        db,
+                        alert_key="dq:ibkr_disconnected",
+                        severity="warning",
+                        category="reconciliation",
+                        title="IBKR Disconnected During Reconciliation",
+                        message="Could not connect to IB Gateway for position & stop reconciliation.",
+                    )
+        except Exception as exc:
+            logger.error("[DQMonitor] Position reconciliation error: %s", exc)
+
+        # 4. Evaluate Automatic De-Risking Ladder (Feature 1)
+        try:
+            from strategy.derisk_engine import evaluate_derisk_ladder
+            latest_snap = db.query(AccountSnapshot).order_by(AccountSnapshot.date.desc()).first()
+            peak_eq = _get_peak_equity(db)
+            curr_eq = float(latest_snap.net_liq_usd) if latest_snap else peak_eq
+            weekly_pnl = _compute_weekly_pnl_pct(db, curr_eq)
+            dr_state = evaluate_derisk_ladder(
+                db=db,
+                account_equity=curr_eq,
+                peak_equity=peak_eq,
+                daily_pnl_pct=0.0,
+                weekly_pnl_pct=weekly_pnl,
+                config=cfg,
+            )
+            if dr_state.get("should_flatten"):
+                logger.critical("[DQMonitor] De-risk Level 3 triggered — executing flatten & halt via execution layer!")
+                sell_all_ibkr(reason="derisk_level_3_flatten_and_halt")
+        except Exception as exc:
+            logger.error("[DQMonitor] De-risk evaluation error: %s", exc)
+
+        # 5. Daily cross-source spot check & shadow forward-outcome update (once per calendar day)
+        today = datetime.now(timezone.utc).date()
+        if _last_spot_check_date != today:
+            try:
+                open_trades = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
+                sample_tickers = [t.ticker for t in open_trades[:3]]
+                run_cross_source_spot_check(db, sample_tickers=sample_tickers, config=cfg)
+                from strategy.shadow_tracker import update_open_shadow_outcomes
+                update_open_shadow_outcomes(db, config=cfg)
+                _last_spot_check_date = today
+            except Exception as exc:
+                logger.error("[DQMonitor] Cross-source spot check / shadow update error: %s", exc)
+
+    except Exception as exc:
+        logger.exception("[DQMonitor] Unhandled error: %s", exc)
+    finally:
+        db.close()
+
+
+def job_weekly_report():
+    """
+    Scheduled weekly job (default: Saturday 09:00 ET).
+    Generates the observational weekly performance report, stores it in DB,
+    and delivers an in-app alert.
+    """
+    db = SessionLocal()
+    try:
+        from strategy.weekly_report import generate_weekly_report
+        report = generate_weekly_report(db, deliver_alert=True)
+        logger.info("[WeeklyReport] Generated report #%s: %s", report.get("id"), report.get("summary_text"))
+    except Exception as exc:
+        logger.exception("[WeeklyReport] Failed to generate weekly report: %s", exc)
+    finally:
+        db.close()
+
 

@@ -228,6 +228,31 @@ def prepare_entry_order(
         stop_price = compute_initial_stop(limit_price, atr, adx)
         partial_target = compute_partial_target(limit_price, stop_price)
 
+    # ── De-risk ladder score & size enforcement ──────────────────────────────
+    derisk_level = 0
+    derisk_size_mult = 1.0
+    derisk_score_bump = 0.0
+    if db is not None:
+        try:
+            from strategy.derisk_engine import get_derisk_state
+            ds = get_derisk_state(db)
+            derisk_level = int(ds.get("level", 0))
+            derisk_size_mult = float(ds.get("size_multiplier", 1.0))
+            derisk_score_bump = max(0.0, float(ds.get("score_bump", 0.0)))
+        except Exception as exc:
+            logger.error("[Entry] Failed to read de-risk state: %s", exc)
+            return None
+
+    if derisk_level >= 2:
+        logger.warning("[Entry] %s blocked by de-risk Level %d", ticker, derisk_level)
+        return None
+
+    if derisk_score_bump > 0 and candidate.get("strategy_engine") != "mean_reversion":
+        min_required = 55.0 + derisk_score_bump
+        if score < min_required:
+            logger.info("[Entry] %s blocked by Level 1 de-risk score bump (score=%.1f < %.1f)", ticker, score, min_required)
+            return None
+
     # ── Position sizing ───────────────────────────────────────────────────────
     tier = candidate.get("tier", "A")
     size_mult = float(candidate.get("size_multiplier", 1.0))
@@ -243,6 +268,8 @@ def prepare_entry_order(
         size_multiplier=size_mult,
         tier=tier,
         beta_scalar=beta_scalar,
+        derisk_level=derisk_level,
+        derisk_size_multiplier=derisk_size_mult,
     )
 
     if size.get("error") or size.get("shares", 0) < 1:
@@ -280,6 +307,7 @@ def prepare_entry_order(
         weekly_pnl_pct=weekly_pnl_pct,
         regime=regime,
         black_swan_day=black_swan,
+        db=db,
     )
 
     if not allowed:

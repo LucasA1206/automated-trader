@@ -114,6 +114,28 @@ def init_db():
     except Exception:
         pass
 
+    # Feature 4: ShadowEvaluation forward tracking columns
+    for col_def in [
+        "is_near_miss BOOLEAN DEFAULT FALSE NOT NULL",
+        "hypothetical_action VARCHAR(40)",
+        "entry_price FLOAT",
+        "stop_price FLOAT",
+        "partial_target_price FLOAT",
+        "trailing_stop_price FLOAT",
+        "high_watermark FLOAT",
+        "partial_taken BOOLEAN DEFAULT FALSE NOT NULL",
+        "market_state_json TEXT",
+        "outcome_status VARCHAR(20) DEFAULT 'open' NOT NULL",
+        "exit_reason VARCHAR(50)",
+        "exit_price FLOAT",
+        "resolved_at TIMESTAMP",
+    ]:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(f"ALTER TABLE shadow_evaluations ADD COLUMN {col_def}"))
+        except Exception:
+            pass
+
     # Sector at entry (for risk engine sector-cap gate)
     try:
         with engine.begin() as conn:

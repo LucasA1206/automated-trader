@@ -38,6 +38,59 @@ DEFAULT_CONFIG = {
     "enable_mean_reversion":      True,  # Enable Mean Reversion sleeve for ETFs/large-caps
     "mean_reversion_allocation_pct": 40.0, # Target % allocation for mean-reversion sleeve
     "breakeven_r_multiple":       0.75,  # Progressive stop step: +0.75R moves stop to breakeven + 0.2%
+
+    # Data-Quality Monitoring & Alerting (Feature 3)
+    "dq_metric_coverage_min_pct":         80.0,  # Alert if any active metric's coverage < 80%
+    "dq_max_achievable_score_min":        75.0,  # Critical alert if available metric weights < 75%
+    "dq_score_collapse_max_threshold":    60.0,  # Alert if max composite score < 60
+    "dq_score_collapse_consecutive_scans": 3,    # Consecutive depressed scans before critical alert
+    "dq_regime_max_age_minutes":          120,   # Max age (minutes) for regime inputs
+    "dq_price_jump_max_pct":              50.0,  # Single-bar price jump sanity threshold (%)
+    "dq_held_stale_minutes":              30,    # Max age (minutes) for held position quotes
+    "dq_api_error_rate_threshold_pct":    20.0,  # API error rate alert threshold (%)
+    "dq_api_min_calls_for_rate":          5,     # Minimum calls before evaluating error rate
+    "dq_no_data_spike_threshold_pct":     50.0,  # Alert if no_data rejections exceed % of universe
+    "dq_cross_source_tolerance_pct":      2.0,   # Cross-source price discrepancy tolerance (%)
+    "alert_cooldown_minutes":             60,    # Deduplication cooldown for repeated alerts
+
+    # Backtest Baselines & De-Risking Ladder (Feature 1)
+    # Note: No static backtest/Monte Carlo baseline file exists yet; using conservative
+    # blueprint defaults until a real backtest baseline is generated and saved.
+    "baseline_source":                    "blueprint_conservative_defaults",
+    "baseline_date":                      "2026-11-26",
+    "baseline_max_drawdown_pct":          8.0,   # Blueprint 8% drawdown halt (Level 2 pause)
+    "baseline_hard_stop_drawdown_pct":    15.0,  # Blueprint 15% full-stop (Level 3 flatten & halt)
+    "baseline_daily_loss_pct":            3.0,   # Blueprint 3% daily loss limit
+    "baseline_weekly_loss_pct":           6.0,   # Blueprint 6% weekly loss limit
+    "baseline_longest_losing_streak_p90": 5,     # 90th percentile expected losing streak
+    "baseline_win_rate_min_pct":          40.0,  # Lower bound of expected win-rate range
+    "baseline_win_rate_max_pct":          65.0,  # Upper bound of expected win-rate range
+    "baseline_weekly_return_mean_pct":    0.5,   # Expected weekly return mean (%)
+    "baseline_weekly_return_std_pct":     2.5,   # Expected weekly return std dev (%)
+    "baseline_trades_per_week_min":       2.0,   # Expected min weekly trade frequency
+    "baseline_trades_per_week_max":       4.0,   # Expected max weekly trade frequency
+
+    # De-risking ladder parameters
+    "derisk_level1_size_multiplier":      0.5,   # Level 1 Caution size multiplier
+    "derisk_level1_score_bump":           5.0,   # Level 1 Caution minimum score bump
+    "derisk_level1_dd_fraction":          0.625, # Trigger Level 1 at 62.5% of 8% DD (= 5.0% DD)
+    # Minimum sample size before statistical divergence triggers fire:
+    # At 2-4 trades/week, 20 closed trades represents ~5-10 weeks of live data,
+    # avoiding overreaction to small-sample variance.
+    "derisk_min_sample_trades":           20,
+    "derisk_divergence_min_avg_ret_pct":  -0.5,  # Trigger Level 1 if 20-trade avg return < -0.5%
+
+    # Shadow-Mode Tracking & Evidence Rubric (Feature 4)
+    "shadow_min_sample_size":             20,    # Min resolved decisions before non-insufficient rating
+    "shadow_strong_min_sample_size":      40,    # Min resolved decisions for 'strong' evidence rating
+    "shadow_near_miss_score_floor":       50.0,  # Candidates scoring [50, 55) logged as near-misses
+    "shadow_max_hold_days":               21,    # Calendar days before hypothetical time exit
+
+    # Weekly Performance Report (Feature 2)
+    "weekly_report_day":                  "sat", # Day of week for scheduled report (mon..sun)
+    "weekly_report_hour":                 9,     # Hour (ET) for scheduled report
+    "weekly_report_minute":               0,     # Minute (ET) for scheduled report
+    "weekly_report_min_bucket_trades":    10,    # Label buckets with < N trades as 'insufficient data'
 }
 
 
@@ -93,12 +146,15 @@ def _load_from_db(db, cfg: dict) -> dict:
             except (ValueError, TypeError):
                 cfg[key] = default_val
         elif isinstance(default_val, str):
-            clean_val = str(val).strip().lower()
-            if clean_val in VALID_MODES:
-                cfg[key] = clean_val
+            if default_val in VALID_MODES:
+                clean_val = str(val).strip().lower()
+                if clean_val in VALID_MODES:
+                    cfg[key] = clean_val
+                else:
+                    logger.warning("[Config] Invalid mode '%s' for setting '%s', keeping '%s'",
+                                   val, key, default_val)
+                    cfg[key] = default_val
             else:
-                logger.warning("[Config] Invalid mode '%s' for setting '%s', keeping '%s'",
-                               val, key, default_val)
-                cfg[key] = default_val
+                cfg[key] = str(val).strip()
 
     return cfg
