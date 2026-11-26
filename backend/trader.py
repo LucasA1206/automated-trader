@@ -856,8 +856,9 @@ class IBKRClient:
     def modify_stop_order(self, ticker: str, stop_order_id: str, new_stop_price: float, shares: int) -> dict:
         """
         Modifies an existing native stop order at IBKR (e.g. for market-linked tightening or chandelier trail).
-        Submits an updated StopOrder with the same orderId or cancels & replaces if needed.
-        Ensures tick rounding to avoid Warning 110.
+        Uses reqAllOpenOrders() so orders created by prior clientIds are visible.
+        Always cancels any duplicate/orphaned SELL stop orders for `ticker` so
+        orders never stack up to IBKR's 15-order-per-side limit (Error 201).
         """
         try:
             if not self.ib.isConnected():
@@ -868,20 +869,41 @@ class IBKRClient:
 
             new_stop_price = round_to_tick(new_stop_price)
 
-            # Locate existing open stop order
-            open_trades = self.ib.openTrades()
+            # Query ALL open orders across all clientIds (openTrades() only sees current clientId)
+            open_trades = self.ib.reqAllOpenOrders() or []
+            self.ib.sleep(0.5)
+
+            sell_stops = [
+                ot for ot in open_trades
+                if getattr(ot.contract, "symbol", None) == ticker
+                and str(getattr(ot.order, "action", "")).upper() == "SELL"
+                and str(getattr(ot.order, "orderType", "")).upper() in ("STP", "STP LMT", "TRAIL")
+                and str(getattr(getattr(ot, "orderStatus", None), "status", "")).lower()
+                not in ("cancelled", "inactive", "filled")
+            ]
+
+            current_cid = getattr(self.ib.client, "clientId", None)
             target_trade = None
-            for ot in open_trades:
-                if str(ot.order.orderId) == str(stop_order_id):
+            for ot in sell_stops:
+                if str(ot.order.orderId) == str(stop_order_id) and getattr(ot.order, "clientId", None) == current_cid:
                     target_trade = ot
                     break
 
             if target_trade is not None:
+                # Cancel any duplicate sell stops other than target_trade
+                for ot in sell_stops:
+                    if ot is not target_trade:
+                        try:
+                            self.ib.cancelOrder(ot.order)
+                            logger.info("Cancelled duplicate stop order %s for %s.", ot.order.orderId, ticker)
+                        except Exception as cancel_exc:
+                            logger.warning("Failed cancelling duplicate stop for %s: %s", ticker, cancel_exc)
+
                 order = target_trade.order
                 order.auxPrice = new_stop_price
                 order.totalQuantity = shares
                 logger.info("Modifying existing native stop %s for %s to $%.2f", stop_order_id, ticker, new_stop_price)
-                trade = self.ib.placeOrder(contract, order)
+                self.ib.placeOrder(contract, order)
                 self.ib.sleep(0.5)
                 return {
                     "success": True,
@@ -891,8 +913,22 @@ class IBKRClient:
                     "modified": True,
                 }
             else:
-                logger.info("Stop %s not found in open orders; placing new native stop for %s @ $%.2f",
-                            stop_order_id, ticker, new_stop_price)
+                # Order was placed by another clientId or missing — cancel ALL existing
+                # sell stop orders for this ticker before placing the single replacement stop.
+                cancelled_count = 0
+                for ot in sell_stops:
+                    try:
+                        self.ib.cancelOrder(ot.order)
+                        cancelled_count += 1
+                    except Exception as cancel_exc:
+                        logger.warning("Failed cancelling prior stop for %s: %s", ticker, cancel_exc)
+                if cancelled_count > 0:
+                    self.ib.sleep(0.5)
+                    logger.info(
+                        "Cancelled %d prior sell stop order(s) for %s before placing replacement stop @ $%.2f",
+                        cancelled_count, ticker, new_stop_price,
+                    )
+
                 res = self.place_stop_order(ticker, shares, new_stop_price)
                 return res
 
@@ -985,6 +1021,40 @@ class IBKRClient:
         except Exception as exc:
             logger.warning("cancel_stop_order failed for %s (order_id=%s): %s", ticker, order_id, exc)
             return False
+
+    def cancel_all_orders_for_ticker(self, ticker: str) -> int:
+        """
+        Cancels ALL open/working orders associated with `ticker` across all
+        clientIds (stops, trailing stops, limits, etc.).
+        Called whenever a stock is completely sold so no orphaned orders remain.
+        """
+        try:
+            if not self.ib.isConnected():
+                self.connect()
+            open_orders = self.ib.reqAllOpenOrders() or []
+            self.ib.sleep(0.5)
+
+            cancelled = 0
+            for ot in open_orders:
+                if getattr(ot.contract, "symbol", None) != ticker:
+                    continue
+                status = str(getattr(getattr(ot, "orderStatus", None), "status", "")).lower()
+                if status in ("cancelled", "filled", "inactive"):
+                    continue
+                try:
+                    self.ib.cancelOrder(ot.order)
+                    cancelled += 1
+                except Exception as exc:
+                    logger.warning("cancel_all_orders_for_ticker(%s) failed for order %s: %s",
+                                   ticker, getattr(ot.order, "orderId", "?"), exc)
+
+            if cancelled > 0:
+                self.ib.sleep(0.5)
+                logger.info("Cancelled %d open order(s) associated with %s.", cancelled, ticker)
+            return cancelled
+        except Exception as exc:
+            logger.warning("cancel_all_orders_for_ticker failed for %s: %s", ticker, exc)
+            return 0
 
     def cancel_all_open_orders(self) -> int:
         """

@@ -1081,9 +1081,8 @@ def sell_single_stock(body: SellStockRequest, db: Session = Depends(get_db)):
                 trade.fees = round((trade.fees or 0.0) + sell_fees, 4)
                 db.commit()
 
-                # Cancel the native IBKR stop order so it doesn't leave an orphaned short order
-                if trade.stop_order_id:
-                    client.cancel_stop_order(trade.stop_order_id, ticker)
+                # Cancel ALL open IBKR orders associated with this ticker now that it is sold
+                client.cancel_all_orders_for_ticker(ticker)
 
         level = "INFO" if result.get("success") else "ERROR"
         msg = (

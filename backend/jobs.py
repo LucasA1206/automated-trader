@@ -1272,9 +1272,11 @@ def job_exit_monitor():
                 if proposed_stop > current_active_stop:
                     if exit_market_mode == "enforce":
                         trade.stop_price = proposed_stop
-                        db.commit()
                         if trade.stop_order_id:
-                            client.modify_stop_order(ticker, trade.stop_order_id, proposed_stop, live_shares)
+                            mod_res = client.modify_stop_order(ticker, trade.stop_order_id, proposed_stop, live_shares)
+                            if mod_res.get("success") and mod_res.get("order_id"):
+                                trade.stop_order_id = str(mod_res["order_id"])
+                        db.commit()
                         log_event(db, "sell", f"🛡️ {ticker}: market-linked stop tightened from ${current_active_stop:.2f} to ${proposed_stop:.2f} [enforce]")
                         log_trade_event(db, trade.id, "stop_update", f"Market-linked stop tightened to ${proposed_stop:.2f}", stop_price=proposed_stop)
                     else:
@@ -1288,9 +1290,11 @@ def job_exit_monitor():
                 elif signal.reason == "breakeven_update":
                     trade.breakeven_moved = True
 
-                db.commit()
                 if trade.stop_order_id:
-                    client.modify_stop_order(ticker, trade.stop_order_id, signal.new_stop_price, live_shares)
+                    mod_res = client.modify_stop_order(ticker, trade.stop_order_id, signal.new_stop_price, live_shares)
+                    if mod_res.get("success") and mod_res.get("order_id"):
+                        trade.stop_order_id = str(mod_res["order_id"])
+                db.commit()
 
                 logger.info("[ExitMonitor] %s: %s to $%.4f", ticker, signal.reason, signal.new_stop_price)
                 log_event(db, "sell", f"🛡️ {ticker}: {signal.details}")
@@ -1330,12 +1334,15 @@ def job_exit_monitor():
 
                     remaining_shares = live_shares - shares_to_sell
                     if trade.stop_order_id and remaining_shares > 0:
-                        client.modify_stop_order(
+                        mod_res = client.modify_stop_order(
                             ticker,
                             trade.stop_order_id,
                             signal.new_stop_price or trade.stop_price,
                             remaining_shares,
                         )
+                        if mod_res.get("success") and mod_res.get("order_id"):
+                            trade.stop_order_id = str(mod_res["order_id"])
+                            db.commit()
 
                     log_event(db, "sell",
                               f"💰 {ticker}: partial exit filled @ ${sell_price:.4f} | "
@@ -1361,6 +1368,13 @@ def job_exit_monitor():
                 db.commit()
 
                 result = client.place_sell_order(ticker, live_shares)
+                if not result["success"] and ("15 orders" in str(result.get("error", "")) or "Error 201" in str(result.get("error", ""))):
+                    # Clear working orders on this contract that blocked the exit and retry once
+                    cancelled = client.cancel_all_orders_for_ticker(ticker)
+                    if cancelled > 0:
+                        log_event(db, "sell", f"🧹 {ticker}: cleared {cancelled} working order(s) after Error 201; retrying exit.", "WARNING")
+                        result = client.place_sell_order(ticker, live_shares)
+
                 if result["success"]:
                     sell_price = result["price"]
                     buy_price  = trade.buy_price or 0
@@ -1398,9 +1412,8 @@ def job_exit_monitor():
 
                     db.commit()
 
-                    # Cancel the native IBKR stop order so it doesn't leave an orphaned short order
-                    if trade.stop_order_id:
-                        client.cancel_stop_order(trade.stop_order_id, ticker)
+                    # Cancel ALL open IBKR orders associated with this ticker now that it is sold
+                    client.cancel_all_orders_for_ticker(ticker)
 
                     emoji = "🟢" if total_pnl >= 0 else "🔴"
                     log_event(db, "sell",
@@ -1571,8 +1584,8 @@ def job_deferred_sell_single(ticker: str, trading_mode: str = "paper") -> None:
                 trade.fees = round((trade.fees or 0.0) + sell_fees, 4)
                 db.commit()
 
-                if trade.stop_order_id:
-                    client.cancel_stop_order(trade.stop_order_id, ticker)
+                # Cancel ALL open IBKR orders associated with this ticker now that it is sold
+                client.cancel_all_orders_for_ticker(ticker)
 
             log_event(db, "sell", f"✅ Deferred sell executed: sold {live_shares} shares of {ticker} @ ${sell_price:.2f}")
         else:
