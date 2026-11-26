@@ -93,8 +93,8 @@ _nasdaq_ticker_cache: list[str] = []
 _nasdaq_ticker_fetched_at: datetime | None = None
 _NASDAQ_CACHE_TTL_HOURS = 24  # Refresh at most once per day
 
-# Symbols with these single-char suffixes are warrants, rights, preferred shares etc.
-_SPECIAL_SUFFIX_CHARS = set("WRUPQZ")
+# Symbols with these single-char suffixes are warrants, rights, preferred shares, baby bonds/notes (L) etc.
+_SPECIAL_SUFFIX_CHARS = set("WRUPQZL")
 
 
 def _parse_nasdaqtrader_file(text: str, source_label: str) -> list[str]:

@@ -49,7 +49,7 @@ class TestEndToEndSelfMonitoringDryRun(unittest.TestCase):
             "regime": "risk_on",
             "is_valid": True,
             "spy_price": 510.0,
-            "spy_sma200": 480.0,
+            "spy_sma_200": 480.0,
             "vix": 15.2,
             "spy_day_return_pct": 0.45,
         }

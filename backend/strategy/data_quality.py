@@ -391,7 +391,7 @@ def check_regime_inputs(
             if regime_data.get("is_valid") is False or regime_data.get("regime") in ("unavailable", "unknown", None):
                 issues.append(f"regime marked invalid ({regime_data.get('regime')})")
 
-            required_nums = ["spy_price", "spy_sma200", "vix", "spy_day_return_pct"]
+            required_nums = ["spy_price", "spy_sma_200", "vix", "spy_day_return_pct"]
             for field in required_nums:
                 val = regime_data.get(field)
                 if val is None:
@@ -851,6 +851,9 @@ def reconcile_positions_and_stops(
                 })
 
         # Verify broker-side stop orders for all IBKR open positions
+        # Distinguish 3 states: live | queued_outside_hours | missing
+        queued_stops = []
+        fractional_unprotected = []
         for ticker, qty in ibkr_by_ticker.items():
             if qty <= 0:
                 continue
@@ -859,14 +862,26 @@ def reconcile_positions_and_stops(
                 if o.get("ticker") == ticker
                 and str(o.get("action", "")).upper() == "SELL"
                 and str(o.get("order_type", "")).upper() in ("STP", "STP LMT", "TRAIL")
-                and str(o.get("status", "")).lower() not in ("cancelled", "inactive", "filled")
+                and str(o.get("status", "")).lower() not in ("cancelled", "apicancelled", "inactive", "filled")
             ]
             covered_qty = sum(float(o.get("total_quantity") or 0) for o in stop_orders)
-            if not stop_orders or covered_qty < qty - 0.01:
+            if stop_orders and covered_qty >= qty - 0.01:
+                has_presubmitted = any(str(o.get("status", "")).lower() == "presubmitted" for o in stop_orders)
+                if not is_market_open and has_presubmitted:
+                    queued_stops.append({"ticker": ticker, "position_shares": qty, "stop_state": "queued_outside_hours"})
+            elif qty < 1.0:
+                # IBKR does not support GTC native STP orders on fractional < 1 share positions
+                fractional_unprotected.append({
+                    "ticker": ticker,
+                    "position_shares": qty,
+                    "issue": "fractional_unprotected_by_native_stop",
+                })
+            else:
                 missing_stops.append({
                     "ticker": ticker,
                     "position_shares": qty,
                     "stop_covered_shares": covered_qty,
+                    "stop_state": "missing",
                 })
 
         status = "ok"
@@ -900,9 +915,22 @@ def reconcile_positions_and_stops(
         else:
             resolve_alert_by_key(db, "dq:missing_broker_stop")
 
+        if fractional_unprotected and status == "ok":
+            status = "warning"
+            emit_alert(
+                db,
+                alert_key="dq:fractional_stop_warning",
+                severity="warning",
+                category="reconciliation",
+                title="Fractional Position Without Native Broker Stop",
+                message=f"Fractional <1 share position(s) monitored via software exit only: {fractional_unprotected}",
+                details={"fractional_unprotected": fractional_unprotected},
+            )
+
         summary = (
             f"Reconciled {len(all_tickers)} position(s): DB={len(db_by_ticker)}, "
-            f"IBKR={len(ibkr_by_ticker)}, mismatches={len(mismatches)}, missing_stops={len(missing_stops)}."
+            f"IBKR={len(ibkr_by_ticker)}, mismatches={len(mismatches)}, "
+            f"missing_stops={len(missing_stops)}, queued_stops={len(queued_stops)}."
         )
         res = {
             "check_name": "position_reconciliation",
@@ -911,6 +939,8 @@ def reconcile_positions_and_stops(
             "ibkr_positions": len(ibkr_by_ticker),
             "mismatches": mismatches,
             "missing_stops": missing_stops,
+            "queued_stops": queued_stops,
+            "fractional_unprotected": fractional_unprotected,
             "summary": summary,
         }
         _record_check(db, "position_reconciliation", status, summary, res)
@@ -929,3 +959,41 @@ def reconcile_positions_and_stops(
         except Exception:
             pass
         return {"check_name": "position_reconciliation", "status": "warning", "summary": f"Monitor error: {exc}"}
+
+
+def repair_missing_stops(db, ibkr_client, is_market_open: bool = True) -> dict:
+    """
+    Idempotent repair routine for genuinely missing broker-side stops on
+    whole-share open positions. Only places stops during open market hours.
+    """
+    from models import Trade
+    from strategy.alerting import emit_alert
+
+    if not is_market_open:
+        return {"repaired": [], "skipped": "market_closed"}
+
+    rec = reconcile_positions_and_stops(db, ibkr_client, is_market_open=True)
+    repaired = []
+    for m in rec.get("missing_stops", []):
+        ticker = m["ticker"]
+        qty = int(m["position_shares"])
+        if qty < 1:
+            continue
+        trade = db.query(Trade).filter(Trade.ticker == ticker, Trade.status.in_(["open", "sold_half"])).first()
+        stop_px = float(trade.stop_price) if (trade and trade.stop_price) else None
+        if stop_px and stop_px > 0:
+            res = ibkr_client.place_stop_order(ticker, qty, stop_px)
+            if res.get("success") and trade:
+                trade.stop_order_id = str(res.get("order_id", ""))
+                db.commit()
+                repaired.append({"ticker": ticker, "shares": qty, "stop_price": stop_px, "order_id": trade.stop_order_id})
+                emit_alert(
+                    db,
+                    alert_key=f"dq:stop_repaired:{ticker}",
+                    severity="info",
+                    category="reconciliation",
+                    title=f"Repaired Missing Stop Order: {ticker}",
+                    message=f"Placed GTC stop for {qty} shares @ ${stop_px:.2f} (order_id={trade.stop_order_id}).",
+                    cooldown_minutes=0,
+                )
+    return {"repaired": repaired}

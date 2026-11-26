@@ -340,3 +340,29 @@ class WeeklyReport(Base):
 
     def __repr__(self):
         return f"<WeeklyReport {self.period_start}..{self.period_end} trades={self.total_trades}>"
+
+
+class PendingExitIntent(Base):
+    """
+    Persisted idempotent exit intent for open positions (Phase 1).
+    Prevents duplicate exit orders and avoids retrying closed-market exits
+    every 5 minutes on holidays/weekends.
+    """
+    __tablename__ = "pending_exit_intents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    trade_id = Column(Integer, nullable=False, index=True)
+    ticker = Column(String(10), nullable=False, index=True)
+    reason = Column(String(50), nullable=False)
+    details = Column(Text, nullable=True)
+    shares = Column(Float, nullable=False)
+    status = Column(String(20), default="pending", nullable=False)  # pending | submitted | filled | failed | cancelled
+    order_id = Column(String(50), nullable=True)
+    attempt_count = Column(Integer, default=0, nullable=False)
+    last_error = Column(Text, nullable=True)
+    last_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    def __repr__(self):
+        return f"<PendingExitIntent {self.ticker} reason={self.reason} status={self.status}>"

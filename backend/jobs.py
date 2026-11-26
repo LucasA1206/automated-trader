@@ -93,25 +93,14 @@ def stop_persistent_keepalive() -> None:
 # ---------------------------------------------------------------------------
 
 def is_market_open() -> bool:
-    """Return True if NYSE is currently open (Mon–Fri, 09:30–16:00 ET)."""
-    now_et = datetime.now(_ET)
-    if now_et.weekday() >= 5:
-        return False
-    open_time  = now_et.replace(hour=_MARKET_OPEN_HOUR, minute=_MARKET_OPEN_MINUTE, second=0, microsecond=0)
-    close_time = now_et.replace(hour=_MARKET_CLOSE_HOUR, minute=0, second=0, microsecond=0)
-    return open_time <= now_et < close_time
+    """Return True if NYSE is currently open (Mon–Fri, 09:30–16:00 ET, respecting holidays & early closes)."""
+    from strategy.market_calendar import is_nyse_market_open
+    return is_nyse_market_open()
 
 
 def seconds_until_market_open() -> float:
-    if is_market_open():
-        return 0
-    now_et = datetime.now(_ET)
-    candidate = now_et.replace(hour=_MARKET_OPEN_HOUR, minute=_MARKET_OPEN_MINUTE, second=0, microsecond=0)
-    if candidate <= now_et:
-        candidate += timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate += timedelta(days=1)
-    return max((candidate - now_et).total_seconds(), 0)
+    from strategy.market_calendar import seconds_until_next_open
+    return seconds_until_next_open()
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +436,12 @@ def job_pre_market_scan():
             log_event(db, "scan", "Trader globally disabled — skipping pre-market scan.")
             return
 
+        from strategy.market_calendar import get_session_info
+        session_info = get_session_info(datetime.now(_ET).date())
+        if not session_info["is_trading_day"]:
+            log_event(db, "scan", f"📅 {session_info['reason']}. Pre-market scan skipped.")
+            return
+
         trading_mode = get_setting(db, "trading_mode", "paper")
         scan_date = datetime.now(timezone.utc).date()
 
@@ -479,9 +474,6 @@ def job_pre_market_scan():
                   f"📊 Regime: {regime.upper()} | {regime_data['details']}")
 
         if regime in ("risk_off", "unavailable", "unknown") or not regime_data.get("is_valid", True):
-            log_event(db, "scan",
-                      f"🛑 Market is {regime.upper()} — no new entries today. "
-                      f"({regime_data['details']})")
             from strategy.journal import log_no_trade_day, log_scan_result
             log_no_trade_day(db, regime, regime_data["details"])
             log_scan_result(db, scan_date, regime, regime_data["details"], 0, 0, 0,
@@ -1170,6 +1162,9 @@ def job_entry_monitor():
 # Job 3: Exit Monitor (09:30–16:00 ET, every 5 min)
 # ---------------------------------------------------------------------------
 
+_last_market_linked_alert_active = False
+
+
 def job_exit_monitor():
     """
     Checks all open positions against all Section 9 exit rules:
@@ -1181,19 +1176,18 @@ def job_exit_monitor():
       - ATR expansion exit (volatility regime change)
       - Pre-event exit (earnings within 2 trading days)
 
-    IMPORTANT: Exit checks run regardless of circuit breaker state.
-    The risk engine only gates NEW entries — existing positions always
-    have their exits monitored.
+    IMPORTANT: Exit checks run regardless of circuit breaker or de-risk state.
+    If an exit signal triggers while the market is closed, a PendingExitIntent
+    is queued (idempotent, logged once) and submitted when the regular session opens.
     """
+    global _last_market_linked_alert_active
     db = SessionLocal()
     try:
         trader_enabled = get_setting(db, "trader_enabled", "true")
         if trader_enabled.lower() != "true":
             return
 
-        if not is_market_open():
-            return
-
+        mkt_open = is_market_open()
         trading_mode = get_setting(db, "trading_mode", "paper")
         open_trades = db.query(Trade).filter(Trade.status.in_(["open", "sold_half"])).all()
 
@@ -1216,19 +1210,25 @@ def job_exit_monitor():
         account = client.get_account_summary()
         account_equity = account.get("NetLiquidation", 0)
 
+        from models import PendingExitIntent
         from strategy.exit_engine import check_exit_conditions
         from strategy.journal import log_trade_event
         from strategy.market_state import check_market_linked_exit_trigger
         from strategy.config import get_system_config
         from strategy.data_layer import fetch_ohlcv
+        from strategy.alerting import emit_alert
         cfg = get_system_config(db)
 
-        # Market-linked exit condition check (Phase 4)
+        # Market-linked exit condition check (log once per state change)
         spy_hist = fetch_ohlcv("SPY", period="60d")
         market_exit_check = check_market_linked_exit_trigger(spy_hist)
         exit_market_mode = cfg.get("exit_market_linked", "shadow")
         if market_exit_check["trigger"]:
-            log_event(db, "risk", f"📉 Market-linked exit alert ({exit_market_mode}): {'; '.join(market_exit_check['reasons'])}")
+            if not _last_market_linked_alert_active:
+                log_event(db, "risk", f"📉 Market-linked exit alert ({exit_market_mode}): {'; '.join(market_exit_check['reasons'])}")
+                _last_market_linked_alert_active = True
+        else:
+            _last_market_linked_alert_active = False
 
         for trade in open_trades:
             ticker = trade.ticker
@@ -1236,7 +1236,8 @@ def job_exit_monitor():
             if pos is None:
                 continue
 
-            live_shares = int(pos.get("shares", 0))
+            raw_shares = float(pos.get("shares", 0))
+            live_shares = int(raw_shares) if raw_shares.is_integer() else round(raw_shares, 4)
             current_price = pos.get("current_price", 0)
 
             if live_shares == 0 or current_price <= 0:
@@ -1246,6 +1247,17 @@ def job_exit_monitor():
             db.refresh(trade)
             if trade.status not in ("open", "sold_half"):
                 continue
+
+            # Check for existing pending/submitted exit intent
+            active_intent = (
+                db.query(PendingExitIntent)
+                .filter(
+                    PendingExitIntent.trade_id == trade.id,
+                    PendingExitIntent.status.in_(["pending", "submitted"]),
+                )
+                .order_by(PendingExitIntent.created_at.desc())
+                .first()
+            )
 
             if getattr(trade, "strategy_engine", "momentum") == "mean_reversion":
                 from strategy.mean_reversion_engine import check_mean_reversion_exit
@@ -1262,11 +1274,17 @@ def job_exit_monitor():
                     account_equity=account_equity,
                 )
 
-            # Market-linked stop tightening (Phase 4):
+            # If a pending exit intent already exists, honor it on next open
+            if active_intent is not None and signal.action != "full_exit":
+                signal.action = "full_exit"
+                signal.reason = active_intent.reason
+                signal.details = active_intent.details or "Pending exit intent queued for market open"
+
+            # Market-linked stop tightening (Phase 4): only modify stops when market is open & whole shares
             # If SPY broke 50 SMA or 10-day low, tighten stop to min(current_stop, current_price - 1.0 * ATR)
             # NEVER loosen an existing stop: candidate_tightened = current_price - (1.0 * atr)
             # new_stop = max(current_stop, candidate_tightened)
-            if market_exit_check["trigger"] and trade.atr_at_entry and trade.atr_at_entry > 0:
+            if mkt_open and live_shares >= 1 and market_exit_check["trigger"] and trade.atr_at_entry and trade.atr_at_entry > 0:
                 proposed_stop = current_price - (1.0 * trade.atr_at_entry)
                 current_active_stop = trade.stop_price or 0.0
                 if proposed_stop > current_active_stop:
@@ -1360,22 +1378,83 @@ def job_exit_monitor():
 
             # ── Full exit (stop, trail, MA, time, ATR expansion, pre-event) ──
             if signal.action == "full_exit":
-                log_event(db, "sell",
-                          f"🔴 {ticker}: {signal.reason} — {signal.details}")
+                # If market is closed, persist a single idempotent PendingExitIntent and do not submit/spam
+                if not mkt_open:
+                    if active_intent is None:
+                        intent = PendingExitIntent(
+                            trade_id=trade.id,
+                            ticker=ticker,
+                            reason=signal.reason,
+                            details=signal.details,
+                            shares=live_shares,
+                            status="pending",
+                        )
+                        db.add(intent)
+                        db.commit()
+                        log_event(db, "sell", f"⏳ {ticker}: {signal.reason} queued as pending exit intent for next market open — {signal.details}")
+                    continue
 
+                # Market is open: check idempotency (is an exit sell order already working in IBKR?)
+                in_flight_order = client.has_active_sell_order(ticker)
+                if in_flight_order is not None:
+                    if active_intent is None:
+                        active_intent = PendingExitIntent(
+                            trade_id=trade.id, ticker=ticker, reason=signal.reason,
+                            details=signal.details, shares=live_shares, status="submitted",
+                            order_id=in_flight_order.get("order_id"),
+                        )
+                        db.add(active_intent)
+                    else:
+                        active_intent.status = "submitted"
+                        active_intent.order_id = in_flight_order.get("order_id")
+                    db.commit()
+                    continue
+
+                if active_intent is None:
+                    active_intent = PendingExitIntent(
+                        trade_id=trade.id, ticker=ticker, reason=signal.reason,
+                        details=signal.details, shares=live_shares, status="pending",
+                    )
+                    db.add(active_intent)
+                    db.commit()
+                    db.refresh(active_intent)
+
+                max_retries = int(cfg.get("exit_max_retries", 3))
+                if active_intent.attempt_count >= max_retries:
+                    continue
+
+                log_event(db, "sell", f"🔴 {ticker}: {signal.reason} — {signal.details}")
                 prev_status = trade.status
                 trade.status = "closing"
                 db.commit()
 
-                result = client.place_sell_order(ticker, live_shares)
-                if not result["success"] and ("15 orders" in str(result.get("error", "")) or "Error 201" in str(result.get("error", ""))):
-                    # Clear working orders on this contract that blocked the exit and retry once
-                    cancelled = client.cancel_all_orders_for_ticker(ticker)
-                    if cancelled > 0:
-                        log_event(db, "sell", f"🧹 {ticker}: cleared {cancelled} working order(s) after Error 201; retrying exit.", "WARNING")
-                        result = client.place_sell_order(ticker, live_shares)
+                # No double-sell: cancel any existing protective stop orders before submitting exit
+                client.cancel_all_orders_for_ticker(ticker)
 
-                if result["success"]:
+                slippage_pct = float(cfg.get("exit_limit_slippage_pct", 0.5))
+                retry_step_pct = float(cfg.get("exit_retry_step_pct", 0.5))
+                wait_secs = int(cfg.get("exit_fill_wait_seconds", 15))
+                eff_slippage = slippage_pct + (active_intent.attempt_count * retry_step_pct)
+                lmt_px = round(current_price * (1.0 - eff_slippage / 100.0), 4)
+
+                active_intent.attempt_count += 1
+                active_intent.last_attempt_at = datetime.now(timezone.utc)
+                db.commit()
+
+                result = client.place_sell_order(
+                    ticker, live_shares, limit_price=lmt_px, wait_seconds=wait_secs
+                )
+                if result.get("success") and result.get("in_flight"):
+                    active_intent.status = "submitted"
+                    active_intent.order_id = result.get("order_id")
+                    trade.status = prev_status
+                    db.commit()
+                    log_event(db, "sell", f"⏳ {ticker}: exit order {result.get('order_id')} in-flight ({result.get('status')}).")
+                    continue
+
+                if result.get("success"):
+                    active_intent.status = "filled"
+                    active_intent.order_id = result.get("order_id")
                     sell_price = result["price"]
                     buy_price  = trade.buy_price or 0
                     partial_already = trade.realised_partial_pnl or 0.0
@@ -1424,10 +1503,21 @@ def job_exit_monitor():
                                     signal.details, stop_price=trade.stop_price)
                 else:
                     trade.status = prev_status  # Revert
+                    active_intent.last_error = str(result.get("error", ""))
+                    if active_intent.attempt_count >= max_retries:
+                        active_intent.status = "failed"
+                        emit_alert(
+                            db,
+                            alert_key=f"exit_failed:{ticker}",
+                            severity="critical",
+                            category="system",
+                            title=f"Exit Order Failed After {max_retries} Attempts: {ticker}",
+                            message=f"{signal.reason}: {result.get('error')}",
+                        )
                     db.commit()
                     log_event(db, "sell",
                               f"❌ {ticker}: exit order failed ({signal.reason}): "
-                              f"{result.get('error')}. Retrying next cycle.", "ERROR")
+                              f"{result.get('error')}. Attempt {active_intent.attempt_count}/{max_retries}.", "ERROR")
 
         # Reconcile any stale DB records
         live_tickers = {p["ticker"] for p in live_positions}
@@ -1453,7 +1543,12 @@ def job_eod_snapshot() -> None:
     """
     Captures a daily end-of-day NetLiquidation snapshot.
     Also used by the risk engine to track peak equity for drawdown circuit breakers.
+    Skips non-trading days (holidays / weekends).
     """
+    from strategy.market_calendar import is_nyse_trading_day
+    if not is_nyse_trading_day():
+        return
+
     db = SessionLocal()
     try:
         trading_mode = get_setting(db, "trading_mode", "paper")

@@ -220,9 +220,6 @@ def init_db():
             existing = db.query(Setting).filter(Setting.key == key).first()
             if not existing:
                 db.add(Setting(key=key, value=value))
-            elif key in gate_keys and existing.value == "shadow":
-                # Upgrade legacy shadow defaults to active enforcement
-                existing.value = "enforce"
         db.commit()
     finally:
         db.close()

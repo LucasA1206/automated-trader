@@ -1001,10 +1001,10 @@ def _is_valid_vix_dict(d: Optional[dict]) -> bool:
 
 
 def _is_valid_spy_dict(d: Optional[dict]) -> bool:
-    """Validate that SPY regime dict contains all required fields with no NaNs."""
+    """Validate that SPY regime dict contains all required fields (including sma_200) with no NaNs."""
     if not d or not isinstance(d, dict):
         return False
-    required = ["price", "sma_50", "above_sma_200", "day_return_pct"]
+    required = ["price", "sma_50", "sma_200", "above_sma_200", "day_return_pct"]
     for k in required:
         v = d.get(k)
         if v is None:
@@ -1015,7 +1015,7 @@ def _is_valid_spy_dict(d: Optional[dict]) -> bool:
     if not isinstance(price, (int, float)) or price <= 0:
         return False
     sma_200 = d.get("sma_200")
-    if sma_200 is not None and (not isinstance(sma_200, (int, float)) or math.isnan(sma_200) or sma_200 <= 0):
+    if not isinstance(sma_200, (int, float)) or sma_200 <= 0:
         return False
     return True
 
@@ -1122,10 +1122,10 @@ def fetch_spy_regime() -> Optional[dict]:
             if hist is None or hist.empty:
                 raise ValueError(f"Insufficient {s} history")
             closes = hist["Close"].dropna()
-            if len(closes) < 50:
-                raise ValueError(f"Insufficient valid {s} history")
+            if len(closes) < 200:
+                raise ValueError(f"Insufficient {s} history for 200-day SMA ({len(closes)} bars < 200)")
             sma_50  = float(closes.rolling(50).mean().iloc[-1])
-            sma_200 = float(closes.rolling(200).mean().iloc[-1]) if len(closes) >= 200 else None
+            sma_200 = float(closes.rolling(200).mean().iloc[-1])
             current = float(closes.iloc[-1])
             prev    = float(closes.iloc[-2]) if len(closes) >= 2 else current
             opens   = hist["Open"].dropna() if "Open" in hist.columns else pd.Series()
@@ -1133,19 +1133,18 @@ def fetch_spy_regime() -> Optional[dict]:
             if math.isnan(open_px) or open_px <= 0:
                 open_px = current
             day_return_pct = ((current - prev) / prev * 100) if prev > 0 else 0.0
-            if math.isnan(current) or math.isnan(day_return_pct) or math.isnan(sma_50):
+            if math.isnan(current) or math.isnan(day_return_pct) or math.isnan(sma_50) or math.isnan(sma_200):
                 raise ValueError(f"NaN value detected in {s} price history")
-            if sma_200 is not None and math.isnan(sma_200):
-                raise ValueError(f"NaN value detected in {s} 200-day SMA")
             return {
                 "price": round(current, 2),
                 "open": round(open_px, 2),
                 "prior_close": round(prev, 2),
                 "sma_50": round(sma_50, 2),
-                "sma_200": round(sma_200, 2) if sma_200 else None,
-                "above_sma_200": (current > sma_200) if sma_200 else False,
+                "sma_200": round(sma_200, 2),
+                "above_sma_200": current > sma_200,
                 "above_sma_50": current > sma_50,
                 "day_return_pct": round(day_return_pct, 2),
+                "bar_count": len(closes),
                 "source": s,
             }
 
@@ -1378,6 +1377,8 @@ def compute_regime_status(spy: Optional[dict] = None, vix: Optional[dict] = None
         "spy_prior_close": spy.get("prior_close", spy_price),
         "spy_sma_50": spy.get("sma_50"),
         "spy_sma_200": spy_sma_200,
+        "spy_bar_count": spy.get("bar_count"),
+        "spy_source": spy.get("source", "unknown"),
         "spy_above_200": spy_above_200,
         "spy_above_50": spy.get("above_sma_50", True),
         "spy_day_return_pct": spy_day_return,

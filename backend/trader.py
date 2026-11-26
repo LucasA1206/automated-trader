@@ -1022,6 +1022,38 @@ class IBKRClient:
             logger.warning("cancel_stop_order failed for %s (order_id=%s): %s", ticker, order_id, exc)
             return False
 
+    def has_active_sell_order(self, ticker: str) -> Optional[dict]:
+        """
+        Check IBKR open orders across all clientIds for an already-working
+        non-stop SELL exit order (MKT / LMT) for `ticker`.
+        """
+        try:
+            if not self.ib.isConnected():
+                self.connect()
+            open_orders = self.ib.reqAllOpenOrders() or []
+            self.ib.sleep(0.3)
+            for ot in open_orders:
+                if getattr(ot.contract, "symbol", None) != ticker:
+                    continue
+                action = str(getattr(ot.order, "action", "")).upper()
+                otype = str(getattr(ot.order, "orderType", "")).upper()
+                status = str(getattr(getattr(ot, "orderStatus", None), "status", ""))
+                if (
+                    action == "SELL"
+                    and otype in ("MKT", "LMT")
+                    and status in ("PendingSubmit", "PreSubmitted", "Submitted", "PartiallyFilled")
+                ):
+                    return {
+                        "order_id": str(getattr(ot.order, "orderId", "")),
+                        "order_type": otype,
+                        "status": status,
+                        "shares": safe_float(getattr(ot.order, "totalQuantity", 0)),
+                    }
+            return None
+        except Exception as exc:
+            logger.warning("has_active_sell_order failed for %s: %s", ticker, exc)
+            return None
+
     def cancel_all_orders_for_ticker(self, ticker: str) -> int:
         """
         Cancels ALL open/working orders associated with `ticker` across all
@@ -1187,15 +1219,22 @@ class IBKRClient:
                 "bracket_error":       str(e),
             }
 
-    def place_sell_order(self, ticker: str, shares: float) -> dict:
+    def place_sell_order(
+        self,
+        ticker: str,
+        shares: float,
+        limit_price: Optional[float] = None,
+        wait_seconds: int = 15,
+    ) -> dict:
         """
-        Places a market SELL order (long position close) for the given ticker.
+        Places a SELL exit order (marketable limit when `limit_price` is given,
+        otherwise market) for long positions, or routes shorts to buy-to-cover.
+        Supports both whole and fractional shares.
 
-        If `shares` is negative this is a short position — the method
-        automatically routes to place_buy_to_cover_order() so the caller
-        never has to distinguish between the two cases.
-
-        Returns fill price.
+        Uses IBKR order state machine:
+          - Filled -> success=True, filled=True
+          - PendingSubmit / PreSubmitted / Submitted / PartiallyFilled -> success=True, in_flight=True
+          - Cancelled / ApiCancelled / Inactive / Error -> success=False
         """
         # Short-position guard: negative shares means we are short — close by buying.
         if shares < 0:
@@ -1207,9 +1246,9 @@ class IBKRClient:
             return self.place_buy_to_cover_order(ticker, abs(shares))
 
         try:
-            shares = int(shares)
-            if shares <= 0:
-                msg = f"Invalid share quantity for {ticker}: resolved={shares}"
+            qty = int(shares) if float(shares).is_integer() else round(float(shares), 4)
+            if qty <= 0:
+                msg = f"Invalid share quantity for {ticker}: resolved={qty}"
                 logger.error(msg)
                 return {"success": False, "ticker": ticker, "error": msg}
 
@@ -1219,33 +1258,73 @@ class IBKRClient:
             contract = Stock(ticker, "SMART", "USD")
             self.ib.qualifyContracts(contract)
 
-            order = MarketOrder("SELL", shares)
-            order.tif = "DAY"  # Prevent IBKR order-preset TIF override (Error 10349)
+            rejection_errors = []
+
+            def _on_err(reqId, errorCode, errorString, errContract):
+                if errorCode in (201, 202, 203, 103, 110, 399):
+                    rejection_errors.append(f"Error {errorCode}: {errorString}")
+
+            self.ib.errorEvent += _on_err
+
+            # Fractional quantities on IBKR cannot use LMT in some presets; use MKT for < 1 share
+            use_limit = limit_price is not None and limit_price > 0 and qty >= 1
+            if use_limit:
+                lmt_px = round_to_tick(float(limit_price))
+                order = LimitOrder("SELL", qty, lmt_px)
+            else:
+                order = MarketOrder("SELL", qty)
+            order.tif = "DAY"
             trade = self.ib.placeOrder(contract, order)
 
-
-            # Wait up to 30 seconds for fill (same logic as place_buy_order).
             filled = False
-            terminal_statuses = {"Cancelled", "Inactive"}
-            for _ in range(60):   # 60 × 0.5 s = 30 s max
+            terminal_statuses = {"Cancelled", "ApiCancelled", "Inactive"}
+            in_flight_statuses = {"PendingSubmit", "PreSubmitted", "Submitted", "PartiallyFilled"}
+            polls = max(2, int(wait_seconds * 2))
+            for _ in range(polls):
                 self.ib.sleep(0.5)
                 status = trade.orderStatus.status
                 if status == "Filled":
                     filled = True
                     break
-                if status in terminal_statuses:
+                if status in terminal_statuses or rejection_errors:
                     break
 
-            if not filled:
-                status = trade.orderStatus.status
+            self.ib.errorEvent -= _on_err
+
+            status = trade.orderStatus.status
+            if status in terminal_statuses or rejection_errors:
                 log_messages = [f"{entry.status}: {entry.message}" for entry in trade.log if entry.message]
-                log_details = "; ".join(log_messages) if log_messages else "No specific log message"
-                if status not in terminal_statuses and status != "Filled":
-                    try:
-                        self.ib.cancelOrder(order)
-                    except Exception:
-                        pass
-                return {"success": False, "ticker": ticker, "error": f"Order did not fill. Status: {status} ({log_details})"}
+                log_details = "; ".join(log_messages + rejection_errors) or "Order rejected"
+                return {
+                    "success": False,
+                    "filled": False,
+                    "in_flight": False,
+                    "status": status,
+                    "ticker": ticker,
+                    "order_id": str(getattr(trade.order, "orderId", "")),
+                    "error": f"Order rejected/cancelled. Status: {status} ({log_details})",
+                }
+
+            if not filled:
+                if status in in_flight_statuses:
+                    return {
+                        "success": True,
+                        "filled": False,
+                        "in_flight": True,
+                        "status": status,
+                        "ticker": ticker,
+                        "shares": qty,
+                        "order_id": str(getattr(trade.order, "orderId", "")),
+                    }
+                return {
+                    "success": False,
+                    "filled": False,
+                    "in_flight": False,
+                    "status": status,
+                    "ticker": ticker,
+                    "order_id": str(getattr(trade.order, "orderId", "")),
+                    "error": f"Order did not fill. Status: {status}",
+                }
 
             fill_price = 0.0
             fees = 0.0
@@ -1257,7 +1336,6 @@ class IBKRClient:
                     if getattr(f, 'commissionReport', None) and getattr(f.commissionReport, 'commission', None) is not None
                 )
             else:
-                # Fallback: request delayed price
                 self.ib.reqMarketDataType(3)
                 mkt = self.ib.reqMktData(contract, "", True, False)
                 self.ib.sleep(2)
@@ -1266,11 +1344,15 @@ class IBKRClient:
 
             return {
                 "success": True,
+                "filled": True,
+                "in_flight": False,
+                "status": "Filled",
                 "ticker": ticker,
-                "shares": int(shares),
+                "shares": qty,
                 "price": round(fill_price, 4),
                 "fees": round(fees, 4),
-                "total_proceeds": round(fill_price * shares, 2),
+                "total_proceeds": round(fill_price * qty, 2),
+                "order_id": str(getattr(trade.order, "orderId", "")),
             }
         except Exception as e:
             logger.error(f"Sell order failed for {ticker}: {e}")

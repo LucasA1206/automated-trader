@@ -91,6 +91,12 @@ DEFAULT_CONFIG = {
     "weekly_report_hour":                 9,     # Hour (ET) for scheduled report
     "weekly_report_minute":               0,     # Minute (ET) for scheduled report
     "weekly_report_min_bucket_trades":    10,    # Label buckets with < N trades as 'insufficient data'
+
+    # Exit Execution & Marketable Limit Parameters (Phase 1)
+    "exit_limit_slippage_pct":            0.5,   # Marketable limit sell cushion below current/bid price (%)
+    "exit_fill_wait_seconds":             15,    # Seconds to wait before considering order in-flight/re-evaluating
+    "exit_max_retries":                   3,     # Bounded retries for rejected/cancelled live exits
+    "exit_retry_step_pct":                0.5,   # Additional limit cushion per retry (%)
 }
 
 
